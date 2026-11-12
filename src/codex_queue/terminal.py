@@ -11,7 +11,7 @@ import time
 from typing import NamedTuple
 import unicodedata
 
-from .arguments import ArgumentParser
+from .arguments import ArgumentParser, parser_candidates
 from .cli import QueueError, git_root, main, make_parser
 from .language import language, status_label, tr
 from .store import get_setting, open_queue, saved_language, settings
@@ -108,6 +108,9 @@ def completion(parser, line):
     if any(char in prefix for char in ("'", '"')):
         return start, []
 
+    help_topic = words[:1] == ["help"] and not prefix.startswith("-")
+    if help_topic:
+        words = words[1:]
     positional = False
     value_expected = False
     for word in words:
@@ -132,24 +135,11 @@ def completion(parser, line):
         choices = {name: action.help for name, action in options.items()}
     else:
         choices = {} if positional else {name: help_text for name, (_, help_text) in commands.items()}
-        if not words:
+        if not words and not help_topic:
             choices["q"] = tr("Close the interactive screen", "対話画面を閉じる")
     return start, [
-        Suggestion(name, help_text or "") for name, help_text in choices.items()
-        if not name.startswith("_") and name.startswith(prefix)
+        Suggestion(name, help_text or "") for name, help_text in choices.items() if name.startswith(prefix)
     ]
-
-
-def parser_candidates(parser):
-    commands = {}
-    options = {}
-    for action in parser._actions:
-        if isinstance(action, argparse._SubParsersAction):
-            descriptions = {action.choices[entry.dest]: entry.help for entry in action._choices_actions}
-            commands.update((name, (child, descriptions.get(child))) for name, child in action.choices.items())
-        elif action.help != argparse.SUPPRESS:
-            options.update((name, action) for name in action.option_strings)
-    return commands, options
 
 
 def field(label, default=""):
@@ -349,7 +339,7 @@ def fill_project(db, argv):
 
 
 def prepare(argv):
-    if not argv or "-h" in argv or "--help" in argv:
+    if not argv or argv[0] == "help" or "-h" in argv or "--help" in argv:
         return argv
     if argv[0] == "task" and len(argv) > 1:
         argv = argv[1:]
@@ -440,14 +430,16 @@ def queue_view():
 
 def screen():
     message = ""
+    showing_help = False
     try:
         while True:
             language.set(saved_language())
             if os.name == "nt":
-                line = windows_input(make_parser(), message)
+                line = windows_input(make_parser(), message, show_queue=not showing_help)
             else:
                 clear()
-                print(queue_view())
+                if not showing_help:
+                    print(queue_view())
                 if message:
                     print(message)
                 print("add / edit / rm / ls / project / start / pause / stop / sync / q")
@@ -457,6 +449,7 @@ def screen():
                 return 0
             try:
                 argv = prepare(tokens(line))
+                showing_help = bool(argv and argv[0] == "help")
                 if not argv:
                     message = ""
                     continue
@@ -540,7 +533,9 @@ def prompt_frame(view, message, line, candidates, selected, size, offset):
     width = max(0, columns - 1)
     body = list(wrap_rows(view, width))
     if message:
-        body += ["", *wrap_rows(message, width)]
+        if body:
+            body.append("")
+        body.extend(wrap_rows(message, width))
     footer = []
     if rows >= 4:
         if candidates:
@@ -578,16 +573,16 @@ def draw_prompt(view, message, line, candidates, selected, size, offset, vt):
     return page, offset, max_offset
 
 
-def windows_input(parser, message):
+def windows_input(parser, message, show_queue=True):
     with virtual_terminal() as vt:
-        return read_windows_prompt(parser, message, vt)
+        return read_windows_prompt(parser, message, vt, show_queue)
 
 
-def read_windows_prompt(parser, message, vt):
+def read_windows_prompt(parser, message, vt, show_queue):
     import msvcrt
 
     line = ""
-    view = queue_view()
+    view = queue_view() if show_queue else ""
     selected = 0
     start, candidates = completion(parser, line)
     size = shutil.get_terminal_size()
@@ -631,7 +626,7 @@ def read_windows_prompt(parser, message, vt):
             time.sleep(0.03)
         if time.monotonic() >= refresh_at:
             refresh_at = time.monotonic() + 0.2
-            current = queue_view()
+            current = queue_view() if show_queue else ""
             current_size = shutil.get_terminal_size()
             if current != view or current_size != size:
                 view = current

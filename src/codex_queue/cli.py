@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 
 from .actions import queue_control, task_action, wake
-from .arguments import ArgumentParser
+from .arguments import ArgumentParser, parser_candidates
 from .language import LANGUAGES, language, status_label, tr
 from .runtime import register_schedule, setup
 from .store import DEFAULTS, get_setting, open_queue, saved_language, settings, update, write
@@ -328,12 +328,39 @@ def make_parser():
             action.add_argument("answer")
         elif name == "done":
             action.add_argument("--note", help=tr("Completion note", "完了メモ"))
+    help_command = commands.add_parser("help", help=tr("Show command help", "コマンドのヘルプを表示"))
+    help_command.add_argument("topic", nargs="*", metavar="COMMAND",
+                              help=tr("Command or subcommand", "コマンドまたはサブコマンド"))
     worker = commands.add_parser("_worker")
     worker.add_argument("--scheduled", action="store_true")
     worker.add_argument("--data-dir", help=argparse.SUPPRESS)
     from .nextcloud import add_commands
     add_commands(commands)
     return parser
+
+
+def command_help_rows(parser, prefix=""):
+    commands, _ = parser_candidates(parser)
+    for name, (child, description) in commands.items():
+        path = prefix + name
+        yield path, description or ""
+        yield from command_help_rows(child, path + " ")
+
+
+def show_command_help(parser, topic):
+    if not topic:
+        print(tr("Commands", "コマンド一覧"))
+        for command, description in command_help_rows(parser):
+            print(f"  {command}: {description}")
+        print(tr("Use cq help COMMAND for options.", "オプションを確認するには cq help COMMAND を実行してください。"))
+        return
+    target = parser
+    for name in topic:
+        commands, _ = parser_candidates(target)
+        if name not in commands:
+            parser.error(tr("Unknown command: {command}", "不明なコマンド：{command}", command=" ".join(topic)))
+        target, _ = commands[name]
+    target.print_help()
 
 
 def main(argv=None, interactive=True):
@@ -347,6 +374,9 @@ def main(argv=None, interactive=True):
 def run_cli(argv, interactive):
     parser = make_parser()
     args = parser.parse_args(argv)
+    if args.command == "help":
+        show_command_help(parser, args.topic)
+        return 0
     if args.command is None:
         import sys
         if interactive and sys.stdin.isatty() and sys.stdout.isatty():

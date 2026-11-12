@@ -12,7 +12,7 @@ from unittest.mock import patch
 from codex_queue.cli import make_parser
 from codex_queue.language import language
 from codex_queue.store import SCHEMA
-from codex_queue.terminal import Suggestion, command_text, completion, draw_prompt, prompt_frame, queue_view, windows_input
+from codex_queue.terminal import Suggestion, command_text, completion, draw_prompt, prompt_frame, queue_view, screen, windows_input
 
 
 class SuggestionTest(unittest.TestCase):
@@ -30,6 +30,23 @@ class SuggestionTest(unittest.TestCase):
         self.assertEqual([Suggestion("--priority", "Task priority")], completion(self.parser, "task edit 42 --pri")[1])
         self.assertEqual([Suggestion("resolve", "Resolve a completion conflict")], completion(self.parser, "/nextcloud re")[1])
         self.assertNotIn("_worker", [candidate.name for candidate in completion(self.parser, "/")[1]])
+
+    def test_help_completes_nested_topics(self):
+        self.assertEqual([Suggestion("help", "Show command help")], completion(self.parser, "/he")[1])
+        self.assertEqual([Suggestion("add", "Register a Git repository")], completion(self.parser, "/help project a")[1])
+
+    @unittest.skipUnless(os.name == "nt", "Windows console input")
+    def test_screen_shows_slash_help_above_the_input(self):
+        token = language.set("en")
+        try:
+            with patch("codex_queue.terminal.saved_language", return_value="en"), patch(
+                "codex_queue.cli.saved_language", return_value="en",
+            ), patch("codex_queue.terminal.windows_input", side_effect=["/help project add", "q"]) as prompt:
+                self.assertEqual(0, screen())
+            self.assertIn("--path", prompt.call_args.args[1])
+            self.assertFalse(prompt.call_args.kwargs["show_queue"])
+        finally:
+            language.reset(token)
 
     def test_blank_input_has_no_candidates_but_slash_opens_them(self):
         for line in ("", "   ", "\t"):
@@ -152,6 +169,15 @@ class QueueViewTest(unittest.TestCase):
                 self.assertIn(label, help_ja)
             self.assertIn("位置引数:", cq("--help"))
             self.assertNotIn("show this help message", help_ja)
+            all_commands = cq("help")
+            self.assertIn("コマンド一覧", all_commands)
+            self.assertIn("add: タスクを追加", all_commands)
+            self.assertIn("task list: タスクを一覧表示", all_commands)
+            self.assertIn("nextcloud resolve:", all_commands)
+            self.assertNotIn("_worker", all_commands)
+            self.assertIn("--language", cq("help", "settings"))
+            self.assertIn("--keep-remote", cq("help", "nextcloud", "resolve"))
+            cq("help", "_worker", code=2)
             cq("config", "--language", "de", code=2)
             self.assertIn("language: ja", cq("config"))
             self.assertIn("language: en", cq("config", "--language", "en"))
