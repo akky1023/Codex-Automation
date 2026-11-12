@@ -3,11 +3,12 @@ from collections import deque
 from datetime import datetime
 import json
 import os
+import re
 import shlex
 import shutil
 import time
 
-from .cli import QueueError, git_root, main
+from .cli import QueueError, git_root, main, make_parser
 from .store import get_setting, open_queue, settings
 from .worker import attempt_folder, latest_attempt
 
@@ -74,6 +75,64 @@ def tokens(line):
     if os.name == "nt":
         lexer.escape = ""
     return list(lexer)
+
+
+def command_text(line):
+    return line.lstrip().removeprefix("/")
+
+
+def completion(parser, line):
+    """Return the replaceable suffix and its candidates for the current input."""
+    match = re.search(r"[^\s]*$", line)
+    start = match.start()
+    prefix = match.group()
+    if not line[:start].strip() and prefix.startswith("/"):
+        start += 1
+        prefix = prefix[1:]
+    try:
+        words = tokens(command_text(line[:start]))
+    except ValueError:
+        return start, []
+    if any(char in prefix for char in ("'", '"')):
+        return start, []
+
+    positional = False
+    value_expected = False
+    for word in words:
+        if value_expected:
+            value_expected = False
+            continue
+        if word == "--":
+            return start, []
+        commands, options = parser_candidates(parser)
+        flag, equals, _ = word.partition("=")
+        if flag in options:
+            value_expected = not equals and options[flag].nargs != 0
+        elif not positional and word in commands:
+            parser = commands[word]
+        else:
+            positional = True
+
+    if value_expected:
+        return start, []
+    commands, options = parser_candidates(parser)
+    choices = options if prefix.startswith("-") else commands if not positional else {}
+    if not words and not prefix.startswith("-"):
+        choices = [*choices, "q"]
+    return start, [
+        name for name in choices if not name.startswith("_") and name.startswith(prefix)
+    ]
+
+
+def parser_candidates(parser):
+    commands = {}
+    options = {}
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            commands.update(action.choices)
+        elif action.help != argparse.SUPPRESS:
+            options.update((name, action) for name in action.option_strings)
+    return commands, options
 
 
 def field(label, default=""):
@@ -345,17 +404,15 @@ def queue_view():
 
 def screen():
     message = ""
+    parser = make_parser()
     try:
         while True:
-            clear()
-            print(queue_view())
-            if message:
-                print(message)
-            print("add / edit / rm / ls / project / start / pause / stop / sync / q")
             if os.name == "nt":
-                line = windows_input(message)
+                line = windows_input(parser, message)
             else:
+                draw_prompt(queue_view(), message, "", [], 0, show_input=False)
                 line = input("cq> ")
+            line = command_text(line)
             if line.strip() in ("q", "quit", "exit"):
                 return 0
             try:
@@ -388,12 +445,35 @@ def screen():
         return 0
 
 
-def windows_input(message):
+def draw_prompt(view, message, line, candidates, selected, show_input=True):
+    clear()
+    print(view)
+    if message:
+        print(message)
+    if candidates:
+        page = min(5, max(1, shutil.get_terminal_size().lines - 6))
+        first = max(0, selected - page + 1)
+        print("Suggestions (Up/Down to select, Tab to complete, Esc to hide)")
+        for index, candidate in enumerate(candidates[first:first + page], first):
+            marker = ">" if index == selected else " "
+            print(f"{marker} {candidate}")
+    elif not show_input:
+        print("add / edit / rm / ls / project / start / pause / stop / sync / q")
+    if show_input:
+        print("cq> " + line, end="", flush=True)
+
+
+def windows_input(parser, message):
     import msvcrt
+
     line = ""
-    last = queue_view()
-    print("cq> ", end="", flush=True)
+    view = queue_view()
+    selected = 0
+    start, candidates = completion(parser, line)
+    draw_prompt(view, message, line, candidates, selected)
+    refresh_at = time.monotonic() + 0.2
     while True:
+        redraw = False
         if msvcrt.kbhit():
             key = keys()
             if key in ("\r", "\n"):
@@ -403,19 +483,31 @@ def windows_input(message):
                 raise KeyboardInterrupt
             if key == "\x1a":
                 raise EOFError
-            if key == "\b" and line:
-                line = line[:-1]
-                print("\b \b", end="", flush=True)
-            elif len(key) == 1 and key.isprintable():
-                line += key
-                print(key, end="", flush=True)
+            if key == "\x1b" and candidates:
+                candidates = []
+                redraw = True
+            elif key in ("up", "down") and candidates:
+                selected = (selected + (1 if key == "down" else -1)) % len(candidates)
+                redraw = True
+            else:
+                previous = line
+                if key == "\t" and candidates:
+                    line = line[:start] + candidates[selected] + " "
+                elif key == "\b" and line:
+                    line = line[:-1]
+                elif len(key) == 1 and key.isprintable():
+                    line += key
+                if line != previous:
+                    start, candidates = completion(parser, line)
+                    selected = 0
+                    redraw = True
         else:
-            time.sleep(0.2)
+            time.sleep(0.03)
+        if time.monotonic() >= refresh_at:
+            refresh_at = time.monotonic() + 0.2
             current = queue_view()
-            if current != last:
-                last = current
-                clear()
-                print(current)
-                if message:
-                    print(message)
-                print("cq> " + line, end="", flush=True)
+            if current != view:
+                view = current
+                redraw = True
+        if redraw:
+            draw_prompt(view, message, line, candidates, selected)
