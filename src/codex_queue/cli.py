@@ -16,6 +16,9 @@ from .text_layout import print_wrapped
 from .worker import latest_attempt, run_worker
 
 
+BRANCH_MODES = ("per-task", "current")
+
+
 class QueueError(Exception):
     pass
 
@@ -273,7 +276,7 @@ def project_arguments(parser):
     parser.add_argument("--name", help=tr("Project name", "プロジェクト名"))
     parser.add_argument("--path", help=tr("Repository path", "リポジトリのパス"))
     parser.add_argument("--prompt", help=tr("Project instructions", "プロジェクトの共通指示"))
-    parser.add_argument("--branch", choices=["per-task", "current"], help=tr("Branch mode", "ブランチ運用"))
+    parser.add_argument("--branch", choices=BRANCH_MODES, help=tr("Branch mode", "ブランチ運用"))
     parser.add_argument("--base", help=tr("Base branch", "開始元ブランチ"))
 
 
@@ -297,7 +300,7 @@ def make_parser():
     config = commands.add_parser("config", aliases=["settings"], help=tr("Manage queue defaults", "キューの設定を管理"))
     config.add_argument("--parallel", type=positive, help=tr("Maximum concurrent tasks", "同時に実行するタスク数の上限"))
     config.add_argument("--priority", type=int, choices=range(1, 10), metavar="1-9", help=tr("Default task priority", "タスクの既定の優先度"))
-    config.add_argument("--branch", choices=["per-task", "current"], help=tr("Default branch mode", "既定のブランチ運用"))
+    config.add_argument("--branch", choices=BRANCH_MODES, help=tr("Default branch mode", "既定のブランチ運用"))
     config.add_argument("--base", help=tr("Default base branch", "既定の開始元ブランチ"))
     config.add_argument("--on-abort", choices=["pause", "continue"], help=tr("Queue behavior after an abort", "タスク中止後のキューの動作"))
     config.add_argument("--sync", choices=["auto", "manual"], help=tr("Nextcloud sync mode", "Nextcloud の同期方式"))

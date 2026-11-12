@@ -2,6 +2,7 @@ import argparse
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from collections import deque
 from datetime import datetime
+from functools import partial
 import json
 from io import StringIO
 import os
@@ -12,7 +13,7 @@ import time
 from typing import NamedTuple
 
 from .arguments import ArgumentParser, parser_candidates
-from .cli import QueueError, git_root, main, make_parser
+from .cli import BRANCH_MODES, QueueError, git_root, main, make_parser
 from .language import language, status_label, tr
 from .store import get_setting, open_queue, saved_language, settings
 from .text_layout import fit, print_wrapped, terminal_width, wrap_rows
@@ -99,15 +100,66 @@ def command_text(line):
 class Suggestion(NamedTuple):
     name: str
     help: str = ""
+    insertion: str | None = None
+
+
+COMPLETION_WORD = re.compile(r"""(?:[^\s'"]+|"[^"]*(?:"|$)|'[^']*(?:'|$))+""")
+PROJECT_BASE_VALUES = ("inherit", "unset")
+
+
+def path_suggestions(prefix, directories_only, quote=True):
+    folder, name = os.path.split(prefix)
+    try:
+        with os.scandir(folder or ".") as entries:
+            matches = []
+            for entry in entries:
+                if not os.path.normcase(entry.name).startswith(os.path.normcase(name)):
+                    continue
+                directory = entry.is_dir()
+                if directory or (not directories_only and entry.is_file()):
+                    matches.append((entry.name, directory))
+    except OSError:
+        return []
+    candidates = []
+    for name, directory in sorted(matches, key=lambda match: match[0].casefold()):
+        display = name + (os.sep if directory else "")
+        path = os.path.join(folder, display)
+        if not quote:
+            insertion = path
+        elif os.name == "nt":
+            insertion = f'"{path}"' if any(char.isspace() or char == "'" for char in path) else path
+        else:
+            insertion = shlex.quote(path)
+        label = tr("Directory", "フォルダー") if directory else tr("File", "ファイル")
+        candidates.append(Suggestion(display, label, insertion if directory else insertion + " "))
+    return candidates
+
+
+def value_suggestions(action, prefix, project):
+    try:
+        words = tokens(prefix)
+    except ValueError:
+        # A quoted value can still be in the middle of being typed.
+        words = [prefix[1:]] if prefix.startswith(("'", '"')) else []
+    value = words[0] if words else prefix
+    if action.dest in ("path", "prompt_file"):
+        return path_suggestions(value, directories_only=action.dest == "path")
+    choices = action.choices
+    if action.dest == "base":
+        choices = PROJECT_BASE_VALUES if project else ("unset",)
+    return [
+        Suggestion(str(choice)) for choice in choices or ()
+        if str(choice).startswith(value)
+    ]
 
 
 def completion(parser, line):
     """Return the replaceable suffix and its candidates for the current input."""
     if not line.strip():
         return len(line), []
-    match = re.search(r"[^\s]*$", line)
-    start = match.start()
-    prefix = match.group()
+    match = next((word for word in COMPLETION_WORD.finditer(line) if word.end() == len(line)), None)
+    start = match.start() if match else len(line)
+    prefix = line[start:]
     if not line[:start].strip() and prefix.startswith("/"):
         start += 1
         prefix = prefix[1:]
@@ -115,32 +167,37 @@ def completion(parser, line):
         words = tokens(command_text(line[:start]))
     except ValueError:
         return start, []
-    if any(char in prefix for char in ("'", '"')):
-        return start, []
-
     help_topic = words[:1] == ["help"] and not prefix.startswith("-")
     if help_topic:
         words = words[1:]
     positional = False
-    value_expected = False
+    value_action = None
     for word in words:
-        if value_expected:
-            value_expected = False
+        if value_action is not None:
+            value_action = None
             continue
         if word == "--":
             return start, []
         commands, options = parser_candidates(parser)
         flag, equals, _ = word.partition("=")
         if flag in options:
-            value_expected = not equals and options[flag].nargs != 0
+            if not equals and options[flag].nargs != 0:
+                value_action = options[flag]
         elif not positional and word in commands:
             parser, _ = commands[word]
         else:
             positional = True
 
-    if value_expected:
-        return start, []
     commands, options = parser_candidates(parser)
+    if not help_topic:
+        project = words[:1] == ["project"]
+        if value_action is not None:
+            return start, value_suggestions(value_action, prefix, project)
+        flag, equals, value = prefix.partition("=")
+        if equals and flag in options and options[flag].nargs != 0:
+            return start + len(flag) + 1, value_suggestions(options[flag], value, project)
+    if any(char in prefix for char in ("'", '"')):
+        return start, []
     if prefix.startswith("-"):
         choices = {name: action.help for name, action in options.items()}
     else:
@@ -155,6 +212,20 @@ def completion(parser, line):
 def field(label, default=""):
     result = screen_input(f"{label} [{default}]: ")
     return default if result == "" else result
+
+
+def project_field(key, label, default):
+    if os.name != "nt" or key not in ("path", "branch", "base"):
+        return field(label, default)
+
+    def complete(prefix):
+        if key == "path":
+            return 0, path_suggestions(prefix, directories_only=True, quote=False)
+        choices = BRANCH_MODES if key == "branch" else PROJECT_BASE_VALUES
+        return 0, [Suggestion(value, insertion=value) for value in choices if value.startswith(prefix)]
+
+    value = windows_input(None, f"{label} [{default}]", show_queue=False, complete=complete)
+    return value or default
 
 
 def multiline(label, default=""):
@@ -350,7 +421,7 @@ def fill_project(db, argv):
         if value is None:
             prompted = True
             current = defaults[key] or ""
-            value = read(label, current)
+            value = project_field(key, label, current) if read is field else read(label, current)
             if value == current:
                 continue
         command = option(command, f"--{key}", value)
@@ -524,7 +595,7 @@ def virtual_terminal():
             kernel.SetConsoleMode(handle, mode.value)
 
 
-def prompt_frame(view, message, line, candidates, selected, size, offset):
+def prompt_frame(view, message, line, candidates, selected, size, offset, form=False):
     columns, rows = size
     width = max(0, columns - 1)
     body = list(wrap_rows(view, width))
@@ -542,6 +613,8 @@ def prompt_frame(view, message, line, candidates, selected, size, offset):
                 marker = ">" if index == selected else " "
                 description = f": {candidate.help}" if candidate.help else ""
                 footer.append(f"{marker} {candidate.name}{description}")
+        elif form:
+            footer.append(tr("Enter accept  Tab complete", "Enter で確定  Tab で補完"))
         else:
             footer.append(tr("Enter run  / commands  PgUp/PgDn scroll", "Enter で実行  / で候補  PgUp/PgDn でスクロール"))
     separator = ["-" * width] if rows >= 4 else []
@@ -557,8 +630,8 @@ def prompt_frame(view, message, line, candidates, selected, size, offset):
     return "\n".join(fit(row, width) for row in lines), available, offset, max_offset
 
 
-def draw_prompt(view, message, line, candidates, selected, size, offset, vt):
-    frame, page, offset, max_offset = prompt_frame(view, message, line, candidates, selected, size, offset)
+def draw_prompt(view, message, line, candidates, selected, size, offset, vt, form=False):
+    frame, page, offset, max_offset = prompt_frame(view, message, line, candidates, selected, size, offset, form)
     if vt:
         body, _, prompt = frame.rpartition("\n")
         upper = body.replace("\n", "\033[K\n") + "\033[K\n" if "\n" in frame else ""
@@ -569,20 +642,22 @@ def draw_prompt(view, message, line, candidates, selected, size, offset, vt):
     return page, offset, max_offset
 
 
-def windows_input(parser, message, show_queue=True, help_argv=None):
+def windows_input(parser, message, show_queue=True, help_argv=None, complete=None):
     with virtual_terminal() as vt:
-        return read_windows_prompt(parser, message, vt, show_queue, help_argv)
+        return read_windows_prompt(parser, message, vt, show_queue, help_argv, complete)
 
 
-def read_windows_prompt(parser, message, vt, show_queue, help_argv):
+def read_windows_prompt(parser, message, vt, show_queue, help_argv, complete):
     import msvcrt
 
     line = ""
+    form = complete is not None
+    suggest = complete if form else partial(completion, parser)
     view = queue_view() if show_queue else ""
     selected = 0
-    start, candidates = completion(parser, line)
+    start, candidates = suggest(line)
     size = shutil.get_terminal_size()
-    page, offset, max_offset = draw_prompt(view, message, line, candidates, selected, size, 0, vt)
+    page, offset, max_offset = draw_prompt(view, message, line, candidates, selected, size, 0, vt, form)
     refresh_at = time.monotonic() + 0.2
     while True:
         redraw = False
@@ -609,13 +684,14 @@ def read_windows_prompt(parser, message, vt, show_queue, help_argv):
             else:
                 previous = line
                 if key == "\t" and candidates:
-                    line = line[:start] + candidates[selected].name + " "
+                    candidate = candidates[selected]
+                    line = line[:start] + (candidate.insertion if candidate.insertion is not None else candidate.name + " ")
                 elif key == "\b" and line:
                     line = line[:-1]
                 elif len(key) == 1 and key.isprintable():
                     line += key
                 if line != previous:
-                    start, candidates = completion(parser, line)
+                    start, candidates = suggest(line)
                     selected = 0
                     redraw = True
         else:
@@ -632,4 +708,4 @@ def read_windows_prompt(parser, message, vt, show_queue, help_argv):
                 size = current_size
                 redraw = True
         if redraw:
-            page, offset, max_offset = draw_prompt(view, message, line, candidates, selected, size, offset, vt)
+            page, offset, max_offset = draw_prompt(view, message, line, candidates, selected, size, offset, vt, form)

@@ -12,7 +12,7 @@ from unittest.mock import patch
 from codex_queue.cli import make_parser
 from codex_queue.language import language
 from codex_queue.store import SCHEMA
-from codex_queue.terminal import Suggestion, command_text, completion, draw_prompt, prompt_frame, queue_view, screen, windows_input
+from codex_queue.terminal import Suggestion, command_text, completion, draw_prompt, fill_project, prompt_frame, queue_view, screen, tokens, windows_input
 from codex_queue.text_layout import text_width, wrap_rows
 
 
@@ -51,6 +51,62 @@ class SuggestionTest(unittest.TestCase):
         self.assertEqual([Suggestion("--priority", "Task priority")], completion(self.parser, "task edit 42 --pri")[1])
         self.assertEqual([Suggestion("resolve", "Resolve a completion conflict")], completion(self.parser, "/nextcloud re")[1])
         self.assertNotIn("_worker", [candidate.name for candidate in completion(self.parser, "/")[1]])
+
+    def test_completes_option_choices_after_a_space_or_equals(self):
+        for line, expected in (
+            ("config --language j", "ja"),
+            ("project edit 3 --branch=per", "per-task"),
+            ("task edit 42 --priority 3", "3"),
+            ("project --base in", "inherit"),
+        ):
+            with self.subTest(line=line):
+                start, choices = completion(self.parser, line)
+                self.assertEqual([Suggestion(expected)], choices)
+                self.assertTrue((line[:start] + choices[0].name).endswith(expected))
+        self.assertEqual([Suggestion("auto"), Suggestion("manual")], completion(self.parser, "config --sync ")[1])
+
+    def test_completes_quoted_paths_and_continues_into_subfolders(self):
+        with TemporaryDirectory(dir=Path.cwd()) as folder:
+            directory = Path(folder) / "Project with spaces"
+            nested = directory / "Nested"
+            nested.mkdir(parents=True)
+            file = Path(folder) / "Project instructions.txt"
+            file.touch()
+            line = f'/project add --path="{Path(folder) / "Project "}'
+            start, choices = completion(self.parser, line)
+            self.assertEqual([directory.name + os.sep], [choice.name for choice in choices])
+            completed = line[:start] + choices[0].insertion
+            self.assertEqual(["project", "add", "--path=" + str(directory) + os.sep], tokens(command_text(completed)))
+            self.assertEqual([nested.name + os.sep], [choice.name for choice in completion(self.parser, completed)[1]])
+            files = completion(self.parser, f'add example --prompt-file "{Path(folder) / "Project i"}')[1]
+            self.assertEqual([file.name], [choice.name for choice in files])
+            self.assertTrue(files[0].insertion.endswith(" "))
+
+    @unittest.skipUnless(os.name == "nt", "Windows console input")
+    def test_project_add_form_completes_path_and_branch_fields(self):
+        with TemporaryDirectory(dir=Path.cwd()) as folder:
+            directory = Path(folder) / "Project folder"
+            directory.mkdir()
+            replies = iter([(str(Path(folder) / "Project "), str(directory) + os.sep),
+                            ("per", "per-task"), ("un", "unset")])
+
+            def complete_field(parser, message, *, show_queue, complete):
+                prefix, expected = next(replies)
+                start, choices = complete(prefix)
+                self.assertEqual(0, start)
+                self.assertEqual([expected], [choice.insertion for choice in choices])
+                self.assertFalse(show_queue)
+                return choices[0].insertion
+
+            with patch("codex_queue.terminal.windows_input", side_effect=complete_field), patch(
+                "codex_queue.terminal.repo_here", return_value=None,
+            ), patch("codex_queue.terminal.field", return_value=""), patch(
+                "codex_queue.terminal.multiline", return_value="",
+            ), patch("codex_queue.terminal.confirmed", side_effect=lambda command, prompted: command):
+                command = fill_project(None, ["project", "add"])
+            self.assertIn(f"--path={directory}{os.sep}", command)
+            self.assertIn("--branch=per-task", command)
+            self.assertIn("--base=unset", command)
 
     def test_help_completes_nested_topics(self):
         self.assertEqual([Suggestion("help", "Show command help")], completion(self.parser, "/he")[1])
