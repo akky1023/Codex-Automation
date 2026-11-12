@@ -1,4 +1,5 @@
 import argparse
+from contextlib import contextmanager
 from collections import deque
 from datetime import datetime
 import json
@@ -7,6 +8,7 @@ import re
 import shlex
 import shutil
 import time
+import unicodedata
 
 from .cli import QueueError, git_root, main, make_parser
 from .store import get_setting, open_queue, settings
@@ -18,7 +20,7 @@ def keys():
         import msvcrt
         key = msvcrt.getwch()
         if key in ("\x00", "\xe0"):
-            return {"H": "up", "P": "down"}.get(msvcrt.getwch(), "")
+            return {"H": "up", "P": "down", "I": "pageup", "Q": "pagedown"}.get(msvcrt.getwch(), "")
         return key
     import sys
     import termios
@@ -83,6 +85,8 @@ def command_text(line):
 
 def completion(parser, line):
     """Return the replaceable suffix and its candidates for the current input."""
+    if not line.strip():
+        return len(line), []
     match = re.search(r"[^\s]*$", line)
     start = match.start()
     prefix = match.group()
@@ -347,13 +351,11 @@ def prepare(argv):
 
 def latest_progress(attempt):
     directory = attempt_folder(attempt)
-    if not directory.is_dir():
-        return ""
-    runs = [p for p in directory.iterdir() if p.is_dir() and p.name.isdecimal()]
-    if not runs:
-        return ""
-    file = max(runs, key=lambda p: int(p.name)) / "events.jsonl"
     try:
+        runs = [p for p in directory.iterdir() if p.is_dir() and p.name.isdecimal()]
+        if not runs:
+            return ""
+        file = max(runs, key=lambda p: int(p.name)) / "events.jsonl"
         with file.open("rb") as stream:
             size = stream.seek(0, os.SEEK_END)
             stream.seek(max(0, size - 65536))
@@ -363,8 +365,16 @@ def latest_progress(attempt):
                 except (ValueError, AttributeError):
                     continue
                 if isinstance(item, dict):
-                    text = item.get("text") or item.get("command")
-                    if isinstance(text, str):
+                    text = item.get("text")
+                    command = item.get("command")
+                    if isinstance(command, str) and command.strip():
+                        action = {
+                            "in_progress": "Running",
+                            "completed": "Finished",
+                            "failed": "Failed",
+                        }.get(item.get("status"), "Command")
+                        text = f"{action}: {command}"
+                    if isinstance(text, str) and text.strip():
                         return " ".join(text.split())[:160]
     except OSError:
         pass
@@ -376,27 +386,39 @@ def queue_view():
         lines = ["Codex Queue", "Automatic execution enabled" if get_setting(db, "enabled") == "1" else "Automatic execution paused"]
         rows = db.execute(
             """SELECT t.*, p.name AS project FROM tasks t JOIN projects p ON p.id=t.project_id
-               WHERE t.status NOT IN ('DONE','ABORTED','REMOVED') ORDER BY t.priority,t.id"""
+               WHERE t.status <> 'REMOVED' ORDER BY (t.status = 'DONE'), t.priority, t.id"""
         )
-        waiting = []
+        running = []
+        tasks = []
         for row in rows:
             status = row["status"]
             label = f"{row['id']}  {row['project']}  {row['name']}"
-            if status in ("QUEUED", "RESUME_QUEUED"):
-                waiting.append(label)
+            if status == "RUNNING":
+                running.append(label)
+                attempt = latest_attempt(db, row["id"])
+                if attempt:
+                    progress = latest_progress(attempt)
+                    if not progress:
+                        progress = (
+                            "Preparing workspace" if attempt["phase"] in ("PREPARING", "CHECKOUT", "READY")
+                            else "Waiting for Codex output"
+                        )
+                    running.append(f"  {attempt['started_at']} UTC  {progress}")
+                else:
+                    running.append("  Preparing workspace")
+                continue
+            tasks.append(f"{status}  {label}")
+            if status in ("QUEUED", "DONE", "ABORTED"):
                 continue
             attempt = latest_attempt(db, row["id"])
-            lines.append(f"{status}  {label}")
             if attempt:
-                if status == "RUNNING":
-                    lines.append(f"  {attempt['started_at']} UTC  {latest_progress(attempt)}")
-                elif attempt["reason"]:
-                    lines.append(f"  {attempt['reason']}")
+                if attempt["reason"]:
+                    tasks.append(f"  {attempt['reason']}")
                 if attempt["retry_at"]:
                     retry = datetime.fromtimestamp(attempt["retry_at"]).astimezone()
-                    lines.append(f"  Retry after {retry.isoformat()}")
-        if waiting:
-            lines.append("Next: " + waiting[0])
+                    tasks.append(f"  Retry after {retry.isoformat()}")
+        lines.extend(["", "In progress", *(running or ["No tasks running"])])
+        lines.extend(["", "Tasks", *(tasks or ["No other tasks"])])
         if error := get_setting(db, "nextcloud_error"):
             lines.append(error)
         return "\n".join(lines)
@@ -410,7 +432,11 @@ def screen():
             if os.name == "nt":
                 line = windows_input(parser, message)
             else:
-                draw_prompt(queue_view(), message, "", [], 0, show_input=False)
+                clear()
+                print(queue_view())
+                if message:
+                    print(message)
+                print("add / edit / rm / ls / project / start / pause / stop / sync / q")
                 line = input("cq> ")
             line = command_text(line)
             if line.strip() in ("q", "quit", "exit"):
@@ -445,32 +471,112 @@ def screen():
         return 0
 
 
-def draw_prompt(view, message, line, candidates, selected, show_input=True):
-    clear()
-    print(view)
+@contextmanager
+def virtual_terminal():
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32")
+    kernel.GetStdHandle.argtypes = [wintypes.DWORD]
+    kernel.GetStdHandle.restype = wintypes.HANDLE
+    kernel.GetConsoleMode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    handle = kernel.GetStdHandle(-11)
+    mode = wintypes.DWORD()
+    enabled = bool(kernel.GetConsoleMode(handle, ctypes.byref(mode))
+                   and kernel.SetConsoleMode(handle, mode.value | 0x0004))
+    try:
+        yield enabled
+    finally:
+        if enabled:
+            kernel.SetConsoleMode(handle, mode.value)
+
+
+def cell_width(char):
+    if unicodedata.category(char) in ("Mn", "Me", "Cf"):
+        return 0
+    return 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+
+
+def fit(text, width, tail=False):
+    result = []
+    for char in reversed(text) if tail else text:
+        size = cell_width(char)
+        if size > width:
+            break
+        width -= size
+        result.append(char)
+    return "".join(reversed(result) if tail else result)
+
+
+def wrap_rows(text, width):
+    for row in text.expandtabs(4).splitlines():
+        row = "".join(char for char in row if unicodedata.category(char) != "Cc")
+        if not row or width < 2:
+            yield fit(row, width)
+            continue
+        while row:
+            fragment = fit(row, width)
+            yield fragment
+            row = row[len(fragment):]
+
+
+def prompt_frame(view, message, line, candidates, selected, size, offset):
+    columns, rows = size
+    width = max(0, columns - 1)
+    body = list(wrap_rows(view, width))
     if message:
-        print(message)
-    if candidates:
-        page = min(5, max(1, shutil.get_terminal_size().lines - 6))
-        first = max(0, selected - page + 1)
-        print("Suggestions (Up/Down to select, Tab to complete, Esc to hide)")
-        for index, candidate in enumerate(candidates[first:first + page], first):
-            marker = ">" if index == selected else " "
-            print(f"{marker} {candidate}")
-    elif not show_input:
-        print("add / edit / rm / ls / project / start / pause / stop / sync / q")
-    if show_input:
-        print("cq> " + line, end="", flush=True)
+        body += ["", *wrap_rows(message, width)]
+    footer = []
+    if rows >= 4:
+        if candidates:
+            footer.append("Up/Down select  Tab complete  Esc hide")
+            page = min(5, rows - 4)
+            first = max(0, selected - page + 1)
+            for index, candidate in enumerate(candidates[first:first + page], first):
+                marker = ">" if index == selected else " "
+                footer.append(f"{marker} {candidate}")
+        else:
+            footer.append("Enter run  / commands  PgUp/PgDn scroll")
+    separator = ["-" * width] if rows >= 4 else []
+    available = max(0, rows - len(footer) - len(separator) - 1)
+    max_offset = max(0, len(body) - available)
+    offset = min(offset, max_offset)
+    visible = body[offset:offset + available]
+    if max_offset and footer:
+        footer[0] += "  |  PgUp/PgDn" if candidates else f"  |  {offset + 1}-{offset + len(visible)}/{len(body)}"
+    prompt = "cq> "
+    visible_input = fit(line, max(0, width - len(prompt)), tail=True)
+    lines = [*visible, *([""] * (available - len(visible))), *footer, *separator, prompt + visible_input]
+    return "\n".join(fit(row, width) for row in lines), available, offset, max_offset
+
+
+def draw_prompt(view, message, line, candidates, selected, size, offset, vt):
+    frame, page, offset, max_offset = prompt_frame(view, message, line, candidates, selected, size, offset)
+    if vt:
+        body, _, prompt = frame.rpartition("\n")
+        upper = body.replace("\n", "\033[K\n") + "\033[K\n" if "\n" in frame else ""
+        print(f"\033[H{upper}\033[97;44m{prompt}\033[K\033[0m", end="", flush=True)
+    else:
+        clear()
+        print(frame, end="", flush=True)
+    return page, offset, max_offset
 
 
 def windows_input(parser, message):
+    with virtual_terminal() as vt:
+        return read_windows_prompt(parser, message, vt)
+
+
+def read_windows_prompt(parser, message, vt):
     import msvcrt
 
     line = ""
     view = queue_view()
     selected = 0
     start, candidates = completion(parser, line)
-    draw_prompt(view, message, line, candidates, selected)
+    size = shutil.get_terminal_size()
+    page, offset, max_offset = draw_prompt(view, message, line, candidates, selected, size, 0, vt)
     refresh_at = time.monotonic() + 0.2
     while True:
         redraw = False
@@ -489,6 +595,11 @@ def windows_input(parser, message):
             elif key in ("up", "down") and candidates:
                 selected = (selected + (1 if key == "down" else -1)) % len(candidates)
                 redraw = True
+            elif key in ("pageup", "pagedown"):
+                direction = 1 if key == "pagedown" else -1
+                new_offset = max(0, min(max_offset, offset + direction * max(1, page - 1)))
+                redraw = offset != new_offset
+                offset = new_offset
             else:
                 previous = line
                 if key == "\t" and candidates:
@@ -506,8 +617,10 @@ def windows_input(parser, message):
         if time.monotonic() >= refresh_at:
             refresh_at = time.monotonic() + 0.2
             current = queue_view()
-            if current != view:
+            current_size = shutil.get_terminal_size()
+            if current != view or current_size != size:
                 view = current
+                size = current_size
                 redraw = True
         if redraw:
-            draw_prompt(view, message, line, candidates, selected)
+            page, offset, max_offset = draw_prompt(view, message, line, candidates, selected, size, offset, vt)
