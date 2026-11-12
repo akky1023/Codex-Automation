@@ -113,6 +113,8 @@ def edit_prompt(prompt):
 
 def project_options(args):
     values = changes(args, "name", "prompt", "branch", "base")
+    if args.branch == "":
+        values["branch"] = None
     if args.base in ("inherit", "unset"):
         values["base"] = None if args.base == "inherit" else ""
     return values
@@ -152,6 +154,8 @@ def manage_project(db, args):
         if action == "edit":
             row = by_id(db, "projects", args.id)
             if args.path is not None:
+                if not args.path:
+                    raise QueueError(tr("Repository path is required.", "リポジトリのパスは必須です。"))
                 root = git_root(args.path)
                 if os.path.normcase(str(root)) != row["path_key"]:
                     if db.execute(
@@ -273,11 +277,12 @@ def task_commands(subparsers):
     subparsers.add_parser("ls", aliases=["list"], help=tr("List tasks", "タスクを一覧表示"))
 
 
-def project_arguments(parser):
+def project_arguments(parser, editing=False):
     parser.add_argument("--name", help=tr("Project name", "プロジェクト名"))
     parser.add_argument("--path", help=tr("Repository path", "リポジトリのパス"))
     parser.add_argument("--prompt", help=tr("Project instructions", "プロジェクトの共通指示"))
-    parser.add_argument("--branch", choices=BRANCH_MODES, help=tr("Branch mode", "ブランチ運用"))
+    parser.add_argument("--branch", choices=(*BRANCH_MODES, "") if editing else BRANCH_MODES,
+                        help=tr("Branch mode", "ブランチ運用"))
     parser.add_argument("--base", help=tr("Base branch", "開始元ブランチ"))
 
 
@@ -295,7 +300,7 @@ def make_parser():
     actions.add_parser("ls", aliases=["list"], help=tr("List projects", "プロジェクトを一覧表示"))
     edit = actions.add_parser("edit", help=tr("Edit a project", "プロジェクトを編集"))
     edit.add_argument("id", type=positive)
-    project_arguments(edit)
+    project_arguments(edit, editing=True)
     remove = actions.add_parser("rm", aliases=["remove"], help=tr("Remove a project", "プロジェクトを削除"))
     remove.add_argument("id", type=positive)
 

@@ -100,7 +100,6 @@ class Suggestion(NamedTuple):
     name: str
     help: str = ""
     insertion: str | None = None
-    submit: bool = False
 
 
 COMPLETION_WORD = re.compile(r"""(?:[^\s'"]+|"[^"]*(?:"|$)|'[^']*(?:'|$))+""")
@@ -226,6 +225,8 @@ def project_field(key, label, default):
 
 
 def form_suggestions(key, prefix):
+    if not prefix:
+        return []
     if key == "path":
         return path_suggestions(prefix, directories_only=True, quote=False)
     choices = {
@@ -236,36 +237,31 @@ def form_suggestions(key, prefix):
     return [Suggestion(value, insertion=value) for value in choices if value.startswith(prefix)]
 
 
-def edit_field(key, label, current, read):
-    if os.name != "nt":
-        return read(label, current)
-
-    keep = Suggestion(tr("Keep unchanged", "変更しない"), insertion="", submit=True)
-
+def edit_field(key, label, current):
     def complete(prefix):
-        candidates = form_suggestions(key, prefix)
-        return 0, [*candidates, keep] if prefix else [keep, *candidates]
+        return 0, form_suggestions(key, prefix)
 
-    if read is multiline:
-        heading = "\n".join((
-            label, current,
-            tr("Type the first line to edit, or press Enter to keep the current text.",
-               "編集する場合は最初の行を入力。現在の指示を保持する場合は Enter。"),
-        ))
-    else:
-        heading = f"{label} [{current}]"
-    value = windows_input(None, heading, show_queue=False, complete=complete)
-    if not value or (read is multiline and value == "."):
-        return current
-    return multiline(label, current, initial=(value,)) if read is multiline else value
+    if os.name == "nt":
+        heading = label + "\n" + tr("Ctrl+U clear", "Ctrl+U で全消去")
+        if key == "prompt":
+            heading += "  |  " + tr("Ctrl+J insert newline", "Ctrl+J で改行")
+        return windows_input(None, heading, show_queue=False, complete=complete, initial=current)
+
+    import readline
+
+    readline.set_pre_input_hook(lambda: readline.insert_text(current))
+    try:
+        return screen_input(label)
+    finally:
+        readline.set_pre_input_hook()
 
 
-def multiline(label, default="", initial=()):
+def multiline(label, default=""):
     print_wrapped(label + " " + tr("(finish with a line containing only .; enter . first to keep current text)",
                                  "（. だけの行で入力終了。最初に . を入力すると現在の内容を保持）"))
-    if default and not initial:
+    if default:
         print_wrapped(default)
-    lines = list(initial)
+    lines = []
     while (line := input()) != ".":
         lines.append(line)
     return "\n".join(lines) if lines else default
@@ -401,9 +397,9 @@ def fill_task(db, argv):
             prompted = True
         command += ["--", answer or ""]
     if action == "edit":
-        for key, label, read in (
-            ("name", tr("Task title", "タスク名"), field), ("prompt", tr("Task instructions", "タスクの指示"), multiline),
-            ("priority", tr("Priority (1-9)", "優先度（1〜9）"), field),
+        for key, label in (
+            ("name", tr("Task title", "タスク名")), ("prompt", tr("Task instructions", "タスクの指示")),
+            ("priority", tr("Priority (1-9)", "優先度（1〜9）")),
         ):
             if key == "prompt" and args.prompt_file is not None:
                 command = option(command, "--prompt-file", args.prompt_file)
@@ -412,7 +408,9 @@ def fill_task(db, argv):
             current = str(task[key])
             if value is None:
                 prompted = True
-                value = edit_field(key, label, current, read)
+                value = edit_field(key, label, current)
+                if key == "priority" and value == "":
+                    value = settings(db)["priority"]
                 if value == current:
                     continue
             command = option(command, f"--{key}", value)
@@ -448,7 +446,8 @@ def fill_project(db, argv):
         if row is None:
             return command
     defaults = dict(row) if row else {"path": str(repo_here() or "."), "name": "", "prompt": "", "branch": "", "base": None}
-    defaults["base"] = "inherit" if defaults["base"] is None else defaults["base"] or "unset"
+    if defaults["base"] is None:
+        defaults["base"] = "inherit"
     prompted = False
     for key, label, read in fields:
         value = getattr(args, key)
@@ -456,7 +455,7 @@ def fill_project(db, argv):
             prompted = True
             current = defaults[key] or ""
             if action == "edit":
-                value = edit_field(key, label, current, read)
+                value = edit_field(key, label, current)
             else:
                 value = project_field(key, label, current) if read is field else read(label, current)
             if value == current:
@@ -594,7 +593,7 @@ def prompt_frame(view, message, line, candidates, selected, size, offset, form=F
     if max_offset and footer:
         footer[0] += "  |  PgUp/PgDn" if candidates else f"  |  {offset + 1}-{offset + len(visible)}/{len(body)}"
     prompt = "cq> "
-    visible_input = fit(line, max(0, width - len(prompt)), tail=True)
+    visible_input = fit(line.replace("\r\n", "\n").replace("\n", "↵"), max(0, width - len(prompt)), tail=True)
     lines = [*visible, *([""] * (available - len(visible))), *footer, *separator, prompt + visible_input]
     return "\n".join(fit(row, width) for row in lines), available, offset, max_offset
 
@@ -611,20 +610,20 @@ def draw_prompt(view, message, line, candidates, selected, size, offset, vt, for
     return page, offset, max_offset
 
 
-def windows_input(parser, message, show_queue=True, help_argv=None, complete=None):
+def windows_input(parser, message, show_queue=True, help_argv=None, complete=None, initial=None):
     with virtual_terminal() as vt:
-        return read_windows_prompt(parser, message, vt, show_queue, help_argv, complete)
+        return read_windows_prompt(parser, message, vt, show_queue, help_argv, complete, initial)
 
 
-def read_windows_prompt(parser, message, vt, show_queue, help_argv, complete):
+def read_windows_prompt(parser, message, vt, show_queue, help_argv, complete, initial):
     import msvcrt
 
-    line = ""
+    line = initial or ""
     form = complete is not None
     suggest = complete if form else partial(completion, parser)
     view = queue_view() if show_queue else ""
     selected = 0
-    start, candidates = suggest(line)
+    start, candidates = len(line), []
     size = shutil.get_terminal_size()
     page, offset, max_offset = draw_prompt(view, message, line, candidates, selected, size, 0, vt, form)
     refresh_at = time.monotonic() + 0.2
@@ -632,7 +631,7 @@ def read_windows_prompt(parser, message, vt, show_queue, help_argv, complete):
         redraw = False
         if msvcrt.kbhit():
             key = keys()
-            if key in ("\r", "\n"):
+            if key == "\r" or (key == "\n" and initial is None):
                 print()
                 return line
             if key == "\x03":
@@ -655,11 +654,12 @@ def read_windows_prompt(parser, message, vt, show_queue, help_argv, complete):
                 if key == "\t" and candidates:
                     candidate = candidates[selected]
                     line = line[:start] + (candidate.insertion if candidate.insertion is not None else candidate.name + " ")
-                    if candidate.submit:
-                        print()
-                        return line
                 elif key == "\b" and line:
                     line = line[:-1]
+                elif key == "\x15" and initial is not None:
+                    line = ""
+                elif key == "\n" and initial is not None:
+                    line += key
                 elif len(key) == 1 and key.isprintable():
                     line += key
                 if line != previous:
