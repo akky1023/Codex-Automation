@@ -1,5 +1,7 @@
 # Codex Queue
 
+[日本語](README-JA.md)
+
 Codex Queue runs tasks through Codex CLI in local Git repositories. On Windows, Task Scheduler checks the queue every 10 minutes and at sign-in by default.
 
 ## Install on Windows
