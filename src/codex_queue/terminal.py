@@ -1,9 +1,7 @@
 import argparse
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from collections import deque
-from datetime import datetime
 from functools import partial
-import json
 from io import StringIO
 import os
 import re
@@ -15,9 +13,10 @@ from typing import NamedTuple
 from .arguments import ArgumentParser, parser_candidates
 from .cli import BRANCH_MODES, QueueError, git_root, main, make_parser
 from .language import language, status_label, tr
-from .store import get_setting, open_queue, saved_language, settings
+from .status import queue_status
+from .store import open_queue, saved_language, settings
 from .text_layout import fit, print_wrapped, terminal_width, wrap_rows
-from .worker import attempt_folder, latest_attempt
+from .worker import latest_attempt
 
 
 def keys():
@@ -483,79 +482,9 @@ def prepare(argv):
     return argv
 
 
-def latest_progress(attempt):
-    directory = attempt_folder(attempt)
-    try:
-        runs = [p for p in directory.iterdir() if p.is_dir() and p.name.isdecimal()]
-        if not runs:
-            return ""
-        file = max(runs, key=lambda p: int(p.name)) / "events.jsonl"
-        with file.open("rb") as stream:
-            size = stream.seek(0, os.SEEK_END)
-            stream.seek(max(0, size - 65536))
-            for line in reversed(stream.readlines()):
-                try:
-                    item = json.loads(line).get("item", {})
-                except (ValueError, AttributeError):
-                    continue
-                if isinstance(item, dict):
-                    text = item.get("text")
-                    command = item.get("command")
-                    if isinstance(command, str) and command.strip():
-                        action = {
-                            "in_progress": tr("Running", "実行中"),
-                            "completed": tr("Finished", "実行済み"),
-                            "failed": tr("Failed", "失敗"),
-                        }.get(item.get("status"), tr("Command", "コマンド"))
-                        text = f"{action}: {command}"
-                    if isinstance(text, str) and text.strip():
-                        return " ".join(text.split())[:160]
-    except OSError:
-        pass
-    return ""
-
-
 def queue_view():
     with open_queue() as db:
-        lines = ["Codex Queue", tr("Automatic execution enabled", "自動実行は有効です") if get_setting(db, "enabled") == "1" else tr("Automatic execution paused", "自動実行は一時停止中です")]
-        rows = db.execute(
-            """SELECT t.*, p.name AS project FROM tasks t JOIN projects p ON p.id=t.project_id
-               WHERE t.status <> 'REMOVED' ORDER BY (t.status = 'DONE'), t.priority, t.id"""
-        )
-        running = []
-        tasks = []
-        for row in rows:
-            status = row["status"]
-            label = f"{row['id']}  {row['project']}  {row['name']}"
-            if status == "RUNNING":
-                running.append(label)
-                attempt = latest_attempt(db, row["id"])
-                if attempt:
-                    progress = latest_progress(attempt)
-                    if not progress:
-                        progress = (
-                            tr("Preparing workspace", "作業フォルダを準備中") if attempt["phase"] in ("PREPARING", "CHECKOUT", "READY")
-                            else tr("Waiting for Codex output", "Codex の出力を待機中")
-                        )
-                    running.append(f"  {attempt['started_at']} UTC  {progress}")
-                else:
-                    running.append(tr("  Preparing workspace", "  作業フォルダを準備中"))
-                continue
-            tasks.append(f"{status_label(status)}  {label}")
-            if status in ("QUEUED", "DONE", "ABORTED"):
-                continue
-            attempt = latest_attempt(db, row["id"])
-            if attempt:
-                if attempt["reason"]:
-                    tasks.append(f"  {attempt['reason']}")
-                if attempt["retry_at"]:
-                    retry = datetime.fromtimestamp(attempt["retry_at"]).astimezone()
-                    tasks.append("  " + tr("Retry after {time}", "再試行予定 {time}", time=retry.isoformat()))
-        lines.extend(["", tr("In progress", "実行中"), *(running or [tr("No tasks running", "実行中のタスクはありません")])])
-        lines.extend(["", tr("Tasks", "タスク一覧"), *(tasks or [tr("No other tasks", "ほかのタスクはありません")])])
-        if error := get_setting(db, "nextcloud_error"):
-            lines.append(error)
-        return "\n".join(lines)
+        return queue_status(db)
 
 
 def command_output(argv):
@@ -570,16 +499,16 @@ def command_output(argv):
 
 def screen():
     message = ""
-    showing_help = False
+    showing_output = False
     help_argv = None
     try:
         while True:
             language.set(saved_language())
             if os.name == "nt":
-                line = windows_input(make_parser(), message, show_queue=not showing_help, help_argv=help_argv)
+                line = windows_input(make_parser(), message, show_queue=not showing_output, help_argv=help_argv)
             else:
                 clear()
-                if not showing_help:
+                if not showing_output:
                     print_wrapped(queue_view())
                 if message:
                     print_wrapped(message)
@@ -590,8 +519,8 @@ def screen():
                 return 0
             try:
                 argv = prepare(tokens(line))
-                showing_help = bool(argv and argv[0] == "help")
-                help_argv = argv if showing_help else None
+                showing_output = bool(argv and argv[0] in ("help", "status"))
+                help_argv = argv if argv and argv[0] == "help" else None
                 if not argv:
                     message = ""
                     continue

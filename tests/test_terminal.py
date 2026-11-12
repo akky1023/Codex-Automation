@@ -252,7 +252,7 @@ class QueueViewTest(unittest.TestCase):
             run = Path(folder) / "1"
             run.mkdir()
             with patch("codex_queue.terminal.open_queue", return_value=contextlib.nullcontext(db)), patch(
-                "codex_queue.terminal.attempt_folder", return_value=Path(folder),
+                "codex_queue.status.attempt_folder", return_value=Path(folder),
             ):
                 self.assertIn("Waiting for Codex output", queue_view())
                 (run / "events.jsonl").write_text(

@@ -11,6 +11,7 @@ from .actions import queue_control, task_action, wake
 from .arguments import ArgumentParser, parser_candidates
 from .language import LANGUAGES, language, status_label, tr
 from .runtime import register_schedule, setup
+from .status import queue_status
 from .store import DEFAULTS, get_setting, open_queue, saved_language, settings, update, write
 from .text_layout import print_wrapped
 from .worker import latest_attempt, run_worker
@@ -284,6 +285,7 @@ def make_parser():
     parser = ArgumentParser(prog="cq", description=tr("Manage the local Codex task queue.", "ローカルの Codex タスクキューを管理します。"))
     commands = parser.add_subparsers(dest="command")
     task_commands(commands)
+    commands.add_parser("status", help=tr("Show queue status and tasks awaiting a reply", "キューの状況と返信待ちのタスクを表示"))
     task = commands.add_parser("task", help=tr("Manage tasks", "タスクを管理"))
     task_commands(task.add_subparsers(dest="command", required=True))
     project = commands.add_parser("project", help=tr("Manage projects", "プロジェクトを管理"))
@@ -402,6 +404,8 @@ def run_cli(argv, interactive):
         with open_queue() as db:
             if args.command == "project":
                 manage_project(db, args)
+            elif args.command == "status":
+                print_wrapped(queue_status(db))
             elif args.command in ("config", "settings"):
                 configure(db, args)
             elif args.command in ("start", "resume", "pause", "stop"):
