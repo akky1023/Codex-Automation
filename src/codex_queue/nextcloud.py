@@ -13,6 +13,7 @@ import webbrowser
 from xml.etree import ElementTree as ET
 
 from . import credentials
+from .language import tr
 from .processes import process_lock
 from .store import get_setting, set_setting, settings, update, write
 
@@ -30,7 +31,7 @@ class RejectRedirects(HTTPRedirectHandler):
 def origin(url):
     parsed = urlsplit(url)
     if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
-        raise RuntimeError("Enter an HTTPS Nextcloud URL without credentials.")
+        raise RuntimeError(tr("Enter an HTTPS Nextcloud URL without credentials.", "認証情報を含まない Nextcloud の HTTPS URL を入力してください。"))
     return parsed.hostname, parsed.port or 443
 
 
@@ -179,18 +180,18 @@ def connection(db):
     server = get_setting(db, "nextcloud_server")
     target = get_setting(db, "nextcloud_credential")
     if not server or not target:
-        raise RuntimeError("Run cq nextcloud connect first.")
+        raise RuntimeError(tr("Run cq nextcloud connect first.", "先に cq nextcloud connect を実行してください。"))
     try:
         auth = credentials.load(target)
     except OSError:
-        raise RuntimeError("Nextcloud credentials are unavailable. Run cq nextcloud connect.") from None
+        raise RuntimeError(tr("Nextcloud credentials are unavailable. Run cq nextcloud connect.", "Nextcloud の認証情報を利用できません。cq nextcloud connect を実行してください。")) from None
     return Client(server, auth), get_setting(db, "nextcloud_connection")
 
 
 def connect(db):
-    server = input("Nextcloud HTTPS URL: ").strip().rstrip("/")
+    server = input(tr("Nextcloud HTTPS URL: ", "Nextcloud の HTTPS URL：")).strip().rstrip("/")
     if urlsplit(server).query or urlsplit(server).fragment:
-        raise RuntimeError("Enter the server base URL.")
+        raise RuntimeError(tr("Enter the server base URL.", "サーバーのベース URL を入力してください。"))
     credentials.api()
     client = Client(server)
     _, _, response = client.request("POST", server + "/index.php/login/v2", b"")
@@ -198,7 +199,7 @@ def connect(db):
     login = client.href(flow["login"])
     endpoint = client.href(flow["poll"]["endpoint"])
     data = urlencode({"token": flow["poll"]["token"]}).encode()
-    print("Authorize Codex Queue in the browser.")
+    print(tr("Authorize Codex Queue in the browser.", "ブラウザーで Codex Queue の接続を許可してください。"))
     webbrowser.open(login)
     deadline = time.monotonic() + 20 * 60
     while time.monotonic() < deadline:
@@ -210,7 +211,7 @@ def connect(db):
             break
         time.sleep(5)
     else:
-        raise RuntimeError("Nextcloud login expired.")
+        raise RuntimeError(tr("Nextcloud login expired.", "Nextcloud のログイン受付が期限切れになりました。"))
     result = json.loads(response)
     server = client.href(result["server"]).rstrip("/")
     old_target = get_setting(db, "nextcloud_credential")
@@ -234,7 +235,7 @@ def connect(db):
         raise
     if old_target:
         credentials.delete(old_target)
-    print("Nextcloud connected.")
+    print(tr("Nextcloud connected.", "Nextcloud に接続しました。"))
 
 
 def disconnect(db):
@@ -244,7 +245,7 @@ def disconnect(db):
     with write(db):
         set_setting(db, "nextcloud_credential", "")
         set_setting(db, "nextcloud_error", "")
-    print("Nextcloud disconnected.")
+    print(tr("Nextcloud disconnected.", "Nextcloud との接続を解除しました。"))
 
 
 def settle_move(db, task_id):
@@ -390,8 +391,8 @@ def sync(db):
 
 
 def add_commands(commands):
-    commands.add_parser("sync", help="Synchronize linked Nextcloud Tasks lists")
-    parser = commands.add_parser("nextcloud", help="Manage Nextcloud Tasks integration")
+    commands.add_parser("sync", help=tr("Synchronize linked Nextcloud Tasks lists", "連携した Nextcloud Tasks のリストを同期"))
+    parser = commands.add_parser("nextcloud", help=tr("Manage Nextcloud Tasks integration", "Nextcloud Tasks 連携を管理"))
     actions = parser.add_subparsers(dest="nc_action", required=True)
     for name in ("connect", "disconnect", "lists"):
         actions.add_parser(name)
@@ -411,7 +412,7 @@ def dispatch(db, args):
         if error := get_setting(db, "nextcloud_error"):
             raise RuntimeError(error)
         if not synced:
-            raise RuntimeError("Nextcloud sync is already in progress.")
+            raise RuntimeError(tr("Nextcloud sync is already in progress.", "Nextcloud を同期中です。"))
         from .actions import wake
         wake(db)
         return
@@ -419,7 +420,7 @@ def dispatch(db, args):
     if action in ("connect", "disconnect", "link", "resolve"):
         with process_lock("sync.lock") as acquired:
             if not acquired:
-                raise RuntimeError("Nextcloud sync is in progress. Try again after it finishes.")
+                raise RuntimeError(tr("Nextcloud sync is in progress. Try again after it finishes.", "Nextcloud の同期が終わってから再試行してください。"))
             try:
                 manage_connection(db, args)
             except (ET.ParseError, ValueError, KeyError, StopIteration):
@@ -444,7 +445,7 @@ def manage_connection(db, args):
     client, identity = connection(db)
     if action == "link":
         if args.list not in dict(client.calendars()):
-            raise RuntimeError("Unknown Nextcloud list. Use cq nextcloud lists.")
+            raise RuntimeError(tr("Unknown Nextcloud list. Use cq nextcloud lists.", "Nextcloud のリストが見つかりません。cq nextcloud lists で確認してください。"))
         with write(db):
             if not db.execute("SELECT 1 FROM projects WHERE id=? AND retired=0", (args.project_id,)).fetchone():
                 raise RuntimeError(f"Unknown project ID {args.project_id}")
@@ -452,7 +453,7 @@ def manage_connection(db, args):
                 "INSERT INTO remote_links(list,project_id) VALUES (?,?) ON CONFLICT(list) DO UPDATE SET project_id=excluded.project_id",
                 (args.list, args.project_id),
             )
-        print("Nextcloud list linked.")
+        print(tr("Nextcloud list linked.", "Nextcloud のリストを連携しました。"))
         return
     row = db.execute(
         """SELECT r.*, t.completed_at FROM remote_tasks r JOIN tasks t ON t.id=r.task_id
@@ -460,10 +461,10 @@ def manage_connection(db, args):
         (args.id, identity),
     ).fetchone()
     if row is None:
-        raise RuntimeError("No Nextcloud completion conflict for that task.")
+        raise RuntimeError(tr("No Nextcloud completion conflict for that task.", "このタスクに Nextcloud の完了状態の競合はありません。"))
     if args.complete:
         print(writeback(db, client, row, force=True))
     else:
         with write(db):
             db.execute("UPDATE remote_tasks SET writeback='kept_remote' WHERE task_id=?", (args.id,))
-        print("Kept the remote task.")
+        print(tr("Kept the remote task.", "Nextcloud 側のタスクを保持しました。"))

@@ -1,4 +1,4 @@
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import os
 from pathlib import Path
 import sqlite3
@@ -11,6 +11,7 @@ DEFAULTS = {
     "base": "",
     "on_abort": "pause",
     "sync": "auto",
+    "language": "en",
 }
 
 SCHEMA = """
@@ -86,11 +87,23 @@ CREATE TABLE IF NOT EXISTS remote_tasks (
 """
 
 
-def queue_folder():
+def queue_folder(create=True):
     home = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".local" / "share")
     folder = Path(os.environ.get("CQ_WORKER_DATA_DIR") or home / "CodexQueue").resolve()
-    folder.mkdir(parents=True, exist_ok=True)
+    if create:
+        folder.mkdir(parents=True, exist_ok=True)
     return folder
+
+
+def saved_language():
+    path = queue_folder(create=False) / "queue.sqlite3"
+    if path.is_file():
+        try:
+            with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
+                return get_setting(db, "language", DEFAULTS["language"])
+        except sqlite3.Error:
+            pass
+    return DEFAULTS["language"]
 
 
 @contextmanager

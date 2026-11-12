@@ -8,8 +8,10 @@ import subprocess
 import tempfile
 
 from .actions import queue_control, task_action, wake
+from .arguments import ArgumentParser
+from .language import LANGUAGES, language, status_label, tr
 from .runtime import register_schedule, setup
-from .store import DEFAULTS, get_setting, open_queue, settings, update, write
+from .store import DEFAULTS, get_setting, open_queue, saved_language, settings, update, write
 from .worker import latest_attempt, run_worker
 
 
@@ -24,7 +26,7 @@ def git_root(path):
         cwd=folder, capture_output=True, text=True, encoding="utf-8",
     )
     if result.returncode:
-        raise QueueError(f"No Git repository at {folder}")
+        raise QueueError(tr("No Git repository at {path}", "{path} に Git リポジトリがありません", path=folder))
     return Path(result.stdout.strip()).resolve()
 
 
@@ -36,7 +38,8 @@ def by_id(db, table, row_id):
     active = " AND retired = 0" if table == "projects" else ""
     row = db.execute(f"SELECT * FROM {table} WHERE id = ?{active}", (row_id,)).fetchone()
     if row is None:
-        raise QueueError(f"Unknown {table[:-1]} ID {row_id}")
+        entity = tr("project", "プロジェクト") if table == "projects" else tr("task", "タスク")
+        raise QueueError(tr("Unknown {entity} ID {id}", "{entity} ID {id} が見つかりません", entity=entity, id=row_id))
     return row
 
 
@@ -55,7 +58,7 @@ def path_project(db, root, create=False):
     if row is not None and not row["retired"]:
         return row
     if not create:
-        raise QueueError(f"Project is not registered: {root}")
+        raise QueueError(tr("Project is not registered: {path}", "未登録のプロジェクト：{path}", path=root))
     if row is None:
         cursor = db.execute(
             "INSERT INTO projects(path, path_key, name) VALUES (?, ?, ?)",
@@ -78,19 +81,19 @@ def project_for_task(db, args):
         if len(candidates) == 1:
             return candidates[0]
         show_projects(candidates or active_projects(db))
-        raise QueueError("Choose a registered project with --project-id ID.")
+        raise QueueError(tr("Choose a registered project with --project-id ID.", "--project-id ID で登録済みのプロジェクトを選んでください。"))
     try:
         root = git_root(".")
     except QueueError:
         show_projects(active_projects(db))
-        raise QueueError("Use --project NAME or --project-id ID outside a Git repository.") from None
+        raise QueueError(tr("Use --project NAME or --project-id ID outside a Git repository.", "Git リポジトリの外では --project NAME または --project-id ID を指定してください。")) from None
     return path_project(db, root, create=True)
 
 
 def edit_prompt(prompt):
     editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
     if not editor and os.name != "nt":
-        raise QueueError("Set VISUAL or EDITOR to use --edit.")
+        raise QueueError(tr("Set VISUAL or EDITOR to use --edit.", "--edit を使うには VISUAL または EDITOR を設定してください。"))
     with tempfile.TemporaryDirectory() as folder:
         file = Path(folder) / "prompt.txt"
         file.write_text(prompt, encoding="utf-8")
@@ -99,7 +102,7 @@ def edit_prompt(prompt):
         else:
             command = [*shlex.split(editor), str(file)]
         if subprocess.run(command).returncode:
-            raise QueueError("The editor exited unsuccessfully.")
+            raise QueueError(tr("The editor exited unsuccessfully.", "エディターが正常に終了しませんでした。"))
         return file.read_text(encoding="utf-8-sig")
 
 
@@ -112,12 +115,16 @@ def project_options(args):
 
 def show_project(db, row):
     defaults = settings(db)
-    branch = row["branch"] or f"{defaults['branch']} (inherited)"
+    inherited = tr("(inherited)", "（継承）")
+    unset = tr("unset", "未設定")
+    branch = row["branch"] or f"{defaults['branch']} {inherited}"
     base = row["base"]
     if base is None:
-        base = f"{defaults['base'] or 'unset'} (inherited)"
+        base = f"{defaults['base'] or unset} {inherited}"
     show_projects([row])
-    print(f"Branch: {branch}\nBase: {base or 'unset'}\nPrompt: {row['prompt']}")
+    print(tr("Branch: {branch}\nBase: {base}\nPrompt: {prompt}",
+             "ブランチ運用：{branch}\n開始元：{base}\n指示：{prompt}",
+             branch=branch, base=base or unset, prompt=row["prompt"]))
 
 
 def manage_project(db, args):
@@ -132,7 +139,7 @@ def manage_project(db, args):
                 "SELECT 1 FROM tasks WHERE project_id = ? AND status NOT IN ('DONE', 'ABORTED', 'REMOVED')",
                 (row["id"],),
             ).fetchone():
-                raise QueueError("Resolve or remove unfinished tasks before removing this project.")
+                raise QueueError(tr("Resolve or remove unfinished tasks before removing this project.", "プロジェクトを削除する前に、未完了のタスクを解決するか削除してください。"))
             db.execute("DELETE FROM remote_links WHERE project_id = ?", (row["id"],))
             update(db, "projects", row["id"], {"retired": 1})
             return
@@ -148,7 +155,7 @@ def manage_project(db, args):
                             'RESUME_QUEUED', 'RATE_LIMITED', 'AUTH_REQUIRED', 'RETRY_WAIT')""",
                         (row["id"],),
                     ).fetchone():
-                        raise QueueError("Resolve active or suspended tasks before changing the path.")
+                        raise QueueError(tr("Resolve active or suspended tasks before changing the path.", "パスを変更する前に、実行中または中断中のタスクを解決してください。"))
                     values.update(path=str(root), path_key=os.path.normcase(str(root)))
         else:
             row = path_project(db, git_root(args.path or "."), create=bool(values) or action == "add")
@@ -161,7 +168,7 @@ def manage_task(db, args):
     action = args.command
     if action in ("ls", "list"):
         if get_setting(db, "enabled") != "1":
-            print("Automatic execution paused.")
+            print(tr("Automatic execution paused.", "自動実行は一時停止中です。"))
         if error := get_setting(db, "nextcloud_error"):
             print(error)
         for row in db.execute(
@@ -170,19 +177,22 @@ def manage_task(db, args):
                WHERE t.status <> 'REMOVED'
                ORDER BY (t.status = 'DONE'), t.priority, t.id"""
         ):
-            print(f"{row['id']}\t{row['project_name']}\t{row['status']}\t{row['name']}")
+            print(f"{row['id']}\t{row['project_name']}\t{status_label(row['status'])}\t{row['name']}")
             if row["status"] not in ("DONE", "QUEUED"):
                 attempt = latest_attempt(db, row["id"])
                 if attempt and attempt["reason"]:
                     print(f"  {attempt['reason']}")
                 if attempt and attempt["retry_at"]:
-                    print(f"  Retry after {datetime.fromtimestamp(attempt['retry_at']).astimezone().isoformat()}")
+                    retry = datetime.fromtimestamp(attempt["retry_at"]).astimezone().isoformat()
+                    print("  " + tr("Retry after {time}", "再試行予定 {time}", time=retry))
                 if row["status"] == "AUTH_REQUIRED":
-                    print("  Run codex login.")
+                    print("  " + tr("Run codex login.", "codex login を実行してください。"))
             if row["writeback"] == "conflict":
-                print(f"  Nextcloud completion conflict. Run cq nextcloud resolve {row['id']}.")
+                print("  " + tr("Nextcloud completion conflict. Run cq nextcloud resolve {id}.",
+                                "Nextcloud で完了状態が競合しています。cq nextcloud resolve {id} を実行してください。",
+                                id=row["id"]))
             if row["blocked"] and row["status"] in ("QUEUED", "RESUME_QUEUED"):
-                print("  Waiting for Nextcloud to confirm the task location.")
+                print("  " + tr("Waiting for Nextcloud to confirm the task location.", "Nextcloud でタスクの所在を確認中です。"))
         return
     with write(db):
         if action == "add":
@@ -192,19 +202,22 @@ def manage_task(db, args):
                 "INSERT INTO tasks(project_id, name, prompt, priority) VALUES (?, ?, ?, ?)",
                 (project["id"], args.name, args.prompt or "", priority),
             )
-            message = f"Added task {cursor.lastrowid} to {project['name']} (priority {priority})."
+            message = tr("Added task {id} to {project} (priority {priority}).",
+                         "{project} にタスク {id} を追加しました（優先度 {priority}）。",
+                         id=cursor.lastrowid, project=project["name"], priority=priority)
         else:
             row = by_id(db, "tasks", args.id)
             if row["status"] in ("RUNNING", "REMOVED"):
-                raise QueueError(f"Task {row['id']} is {row['status']}.")
+                raise QueueError(tr("Task {id} is {status}.", "タスク {id} の状態は「{status}」です。",
+                                    id=row["id"], status=status_label(row["status"])))
             if action == "edit":
                 if db.execute("SELECT 1 FROM remote_tasks WHERE task_id = ?", (row["id"],)).fetchone():
-                    raise QueueError("Edit imported tasks in Nextcloud.")
+                    raise QueueError(tr("Edit imported tasks in Nextcloud.", "取り込んだタスクは Nextcloud で編集してください。"))
                 update(db, "tasks", row["id"], changes(args, "name", "prompt", "priority"))
-                message = f"Updated task {row['id']}."
+                message = tr("Updated task {id}.", "タスク {id} を更新しました。", id=row["id"])
             else:
                 update(db, "tasks", row["id"], {"status": "REMOVED"})
-                message = f"Removed task {row['id']}."
+                message = tr("Removed task {id}.", "タスク {id} を削除しました。", id=row["id"])
     print(message)
     wake(db)
 
@@ -220,38 +233,39 @@ def configure(db, args):
             values.items(),
         )
         current = settings(db)
+    language.set(current["language"])
     for key, value in current.items():
-        print(f"{key.replace('_', '-')}: {value or 'unset'}")
+        print(f"{key.replace('_', '-')}: {value or tr('unset', '未設定')}")
 
 
 def positive(value):
     number = int(value)
     if number < 1:
-        raise argparse.ArgumentTypeError("must be a positive integer")
+        raise argparse.ArgumentTypeError(tr("must be a positive integer", "正の整数を指定してください"))
     return number
 
 
 def task_commands(subparsers):
-    add = subparsers.add_parser("add", help="Add a task")
+    add = subparsers.add_parser("add", help=tr("Add a task", "タスクを追加"))
     add.add_argument("name")
     target = add.add_mutually_exclusive_group()
     target.add_argument("--project")
     target.add_argument("--project-id", type=positive)
     prompt = add.add_mutually_exclusive_group()
     prompt.add_argument("--prompt")
-    prompt.add_argument("--prompt-file", type=Path, help="Read UTF-8 task instructions from a file")
-    add.add_argument("--edit", action="store_true", help="Edit the task prompt before saving")
+    prompt.add_argument("--prompt-file", type=Path, help=tr("Read UTF-8 task instructions from a file", "UTF-8 のファイルからタスクの指示を読み込む"))
+    add.add_argument("--edit", action="store_true", help=tr("Edit the task prompt before saving", "保存前にタスクの指示を編集"))
     add.add_argument("--priority", type=int, choices=range(1, 10))
-    edit = subparsers.add_parser("edit", help="Edit a task")
+    edit = subparsers.add_parser("edit", help=tr("Edit a task", "タスクを編集"))
     edit.add_argument("id", type=positive)
     edit.add_argument("--name")
     prompt = edit.add_mutually_exclusive_group()
     prompt.add_argument("--prompt")
-    prompt.add_argument("--prompt-file", type=Path, help="Read UTF-8 task instructions from a file")
+    prompt.add_argument("--prompt-file", type=Path, help=tr("Read UTF-8 task instructions from a file", "UTF-8 のファイルからタスクの指示を読み込む"))
     edit.add_argument("--priority", type=int, choices=range(1, 10))
-    remove = subparsers.add_parser("rm", aliases=["remove"], help="Remove a task")
+    remove = subparsers.add_parser("rm", aliases=["remove"], help=tr("Remove a task", "タスクを削除"))
     remove.add_argument("id", type=positive)
-    subparsers.add_parser("ls", aliases=["list"], help="List tasks")
+    subparsers.add_parser("ls", aliases=["list"], help=tr("List tasks", "タスクを一覧表示"))
 
 
 def project_arguments(parser):
@@ -263,37 +277,41 @@ def project_arguments(parser):
 
 
 def make_parser():
-    parser = argparse.ArgumentParser(prog="cq", description="Manage the local Codex task queue.")
+    parser = ArgumentParser(prog="cq", description=tr("Manage the local Codex task queue.", "ローカルの Codex タスクキューを管理します。"))
     commands = parser.add_subparsers(dest="command")
     task_commands(commands)
-    task = commands.add_parser("task", help="Manage tasks")
+    task = commands.add_parser("task", help=tr("Manage tasks", "タスクを管理"))
     task_commands(task.add_subparsers(dest="command", required=True))
-    project = commands.add_parser("project", help="Manage projects")
+    project = commands.add_parser("project", help=tr("Manage projects", "プロジェクトを管理"))
     project_arguments(project)
     actions = project.add_subparsers(dest="project_action")
-    project_arguments(actions.add_parser("add", help="Register a Git repository"))
-    actions.add_parser("ls", aliases=["list"], help="List projects")
-    edit = actions.add_parser("edit", help="Edit a project")
+    project_arguments(actions.add_parser("add", help=tr("Register a Git repository", "Git リポジトリを登録")))
+    actions.add_parser("ls", aliases=["list"], help=tr("List projects", "プロジェクトを一覧表示"))
+    edit = actions.add_parser("edit", help=tr("Edit a project", "プロジェクトを編集"))
     edit.add_argument("id", type=positive)
     project_arguments(edit)
-    remove = actions.add_parser("rm", aliases=["remove"], help="Remove a project")
+    remove = actions.add_parser("rm", aliases=["remove"], help=tr("Remove a project", "プロジェクトを削除"))
     remove.add_argument("id", type=positive)
 
-    config = commands.add_parser("config", aliases=["settings"], help="Manage queue defaults")
+    config = commands.add_parser("config", aliases=["settings"], help=tr("Manage queue defaults", "キューの設定を管理"))
     config.add_argument("--parallel", type=positive)
     config.add_argument("--priority", type=int, choices=range(1, 10))
     config.add_argument("--branch", choices=["per-task", "current"])
     config.add_argument("--base")
     config.add_argument("--on-abort", choices=["pause", "continue"])
     config.add_argument("--sync", choices=["auto", "manual"])
+    config.add_argument("--language", choices=LANGUAGES, help=tr(
+        "Display language (en: English, ja: Japanese)",
+        "表示言語（en: 英語、ja: 日本語）",
+    ))
     for name, aliases, help_text in (
-        ("start", ["resume"], "Enable automatic execution and request the worker"),
-        ("pause", [], "Pause the queue and wait for running tasks"),
-        ("stop", [], "Stop the queue and interrupt running tasks"),
-        ("setup", [], "Authenticate Codex CLI and register the worker"),
+        ("start", ["resume"], tr("Enable automatic execution and request the worker", "自動実行を有効にしてワーカーを起動")),
+        ("pause", [], tr("Pause the queue and wait for running tasks", "キューを一時停止し、実行中のタスクを待つ")),
+        ("stop", [], tr("Stop the queue and interrupt running tasks", "キューを停止し、実行中のタスクを中断")),
+        ("setup", [], tr("Authenticate Codex CLI and register the worker", "Codex CLI を認証し、ワーカーを登録")),
     ):
         commands.add_parser(name, aliases=aliases, help=help_text)
-    schedule = commands.add_parser("schedule", help="Register a Windows scheduled task")
+    schedule = commands.add_parser("schedule", help=tr("Register a Windows scheduled task", "Windows の定期タスクを登録"))
     schedule.add_argument("--every-minutes", type=positive, required=True)
     for name in ("retry", "reply", "abort", "logs", "done"):
         action = commands.add_parser(name)
@@ -313,6 +331,14 @@ def make_parser():
 
 
 def main(argv=None, interactive=True):
+    token = language.set(saved_language())
+    try:
+        return run_cli(argv, interactive)
+    finally:
+        language.reset(token)
+
+
+def run_cli(argv, interactive):
     parser = make_parser()
     args = parser.parse_args(argv)
     if args.command is None:
@@ -330,6 +356,7 @@ def main(argv=None, interactive=True):
         if args.command == "_worker":
             if args.data_dir:
                 os.environ["CQ_WORKER_DATA_DIR"] = args.data_dir
+                language.set(saved_language())
             run_worker(args.scheduled)
             return 0
         with open_queue() as db:
@@ -352,7 +379,7 @@ def main(argv=None, interactive=True):
                 manage_task(db, args)
     except sqlite3.IntegrityError as error:
         if "projects.path_key" in str(error):
-            parser.exit(1, "cq: That Git repository is already registered.\n")
+            parser.exit(1, "cq: " + tr("That Git repository is already registered.", "その Git リポジトリは登録済みです。") + "\n")
         parser.exit(1, f"cq: {error}\n")
     except (QueueError, OSError, RuntimeError, sqlite3.Error, subprocess.SubprocessError, UnicodeError) as error:
         parser.exit(1, f"cq: {error}\n")

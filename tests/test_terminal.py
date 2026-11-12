@@ -3,11 +3,14 @@ import io
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
+import sys
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
 from codex_queue.cli import make_parser
+from codex_queue.language import language
 from codex_queue.store import SCHEMA
 from codex_queue.terminal import command_text, completion, draw_prompt, prompt_frame, queue_view, windows_input
 
@@ -103,8 +106,45 @@ class QueueViewTest(unittest.TestCase):
                     '{"item":{"command":"git status","status":"in_progress"}}\n', encoding="utf-8",
                 )
                 view = queue_view()
+                token = language.set("ja")
+                try:
+                    japanese_view = queue_view()
+                finally:
+                    language.reset(token)
             self.assertLess(view.index("Index notes"), view.index("Tasks\n"))
             self.assertIn("Running: git status", view)
             self.assertLess(view.index("Fix search"), view.index("Update docs"))
             self.assertLess(view.index("Update docs"), view.index("First release"))
             self.assertNotIn("Discarded task", view)
+            self.assertIn("タスク一覧", japanese_view)
+            self.assertIn("待機中  2  Notes  Fix search", japanese_view)
+            self.assertIn("実行中: git status", japanese_view)
+
+    def test_language_switch_is_persisted_for_new_cli_processes(self):
+        with TemporaryDirectory(dir=Path.cwd()) as folder:
+            source = Path(__file__).resolve().parents[1] / "src"
+            env = dict(os.environ, CQ_WORKER_DATA_DIR=folder, PYTHONPATH=str(source), PYTHONIOENCODING="utf-8")
+
+            def cq(*args, code=0):
+                result = subprocess.run(
+                    [sys.executable, "-m", "codex_queue.cli", *args],
+                    env=env, capture_output=True, encoding="utf-8", timeout=10,
+                )
+                self.assertEqual(code, result.returncode, result.stderr)
+                return result.stdout
+
+            self.assertIn("language: en", cq("config"))
+            self.assertIn("language: ja", cq("config", "--language", "ja"))
+            self.assertIn("自動実行は一時停止中です。", cq("ls"))
+            help_ja = cq("config", "--help")
+            for label in ("使い方: cq config", "オプション:", "このヘルプを表示して終了", "表示言語"):
+                self.assertIn(label, help_ja)
+            self.assertIn("位置引数:", cq("--help"))
+            self.assertNotIn("show this help message", help_ja)
+            cq("config", "--language", "de", code=2)
+            self.assertIn("language: ja", cq("config"))
+            self.assertIn("language: en", cq("config", "--language", "en"))
+            self.assertIn("Automatic execution paused.", cq("ls"))
+            help_en = cq("config", "--help")
+            self.assertIn("usage: cq config", help_en)
+            self.assertIn("show this help message and exit", help_en)

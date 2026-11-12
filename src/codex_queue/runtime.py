@@ -8,6 +8,7 @@ import time
 from datetime import datetime
 from xml.etree import ElementTree as ET
 
+from .language import tr
 from .store import get_setting, queue_folder, set_setting, write
 
 
@@ -25,7 +26,7 @@ def codex_command(db, use_saved=True):
         node_path = str(node) if node.is_file() else shutil.which("node")
         if script.is_file() and node_path:
             return [node_path, str(script)]
-    raise RuntimeError("Install Codex CLI and make it available on PATH.")
+    raise RuntimeError(tr("Install Codex CLI and make it available on PATH.", "Codex CLI をインストールして PATH に追加してください。"))
 
 
 def codex_env(db):
@@ -70,7 +71,7 @@ def task_name(db):
 
 def register_schedule(db, minutes):
     if os.name != "nt":
-        raise RuntimeError("The scheduled worker requires Windows Task Scheduler.")
+        raise RuntimeError(tr("The scheduled worker requires Windows Task Scheduler.", "定期実行には Windows タスク スケジューラが必要です。"))
     system = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
     user = subprocess.check_output([str(system / "whoami.exe")], text=True).strip()
     task = ET.Element("Task", version="1.3", xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task")
@@ -127,6 +128,6 @@ def setup(db):
     deadline = time.monotonic() + 12
     while float(get_setting(db, "scheduled_heartbeat", "0")) < requested_at:
         if time.monotonic() >= deadline:
-            raise RuntimeError("The scheduled task was registered, but its worker did not check in.")
+            raise RuntimeError(tr("The scheduled task was registered, but its worker did not check in.", "定期タスクを登録しましたが、ワーカーの起動を確認できませんでした。"))
         time.sleep(0.2)
-    print("Setup complete. Run cq start to enable automatic execution.")
+    print(tr("Setup complete. Run cq start to enable automatic execution.", "セットアップが完了しました。cq start で自動実行を有効にできます。"))

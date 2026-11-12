@@ -10,8 +10,10 @@ import shutil
 import time
 import unicodedata
 
+from .arguments import ArgumentParser
 from .cli import QueueError, git_root, main, make_parser
-from .store import get_setting, open_queue, settings
+from .language import language, status_label, tr
+from .store import get_setting, open_queue, saved_language, settings
 from .worker import attempt_folder, latest_attempt
 
 
@@ -49,12 +51,12 @@ def clear():
 
 def choose(title, options, default=0):
     if not options:
-        print("No available choices.")
+        print(tr("No available choices.", "選択できる項目がありません。"))
         return None
     index = default
     while True:
         clear()
-        print(title, "(Up/Down, Enter, Esc)")
+        print(title, tr("(Up/Down, Enter, Esc)", "（上下キーで選択、Enter で確定、Esc で戻る）"))
         page = max(3, shutil.get_terminal_size().lines - 4)
         start = min(max(0, index - page // 2), max(0, len(options) - page))
         for i, (label, _) in enumerate(options[start:start + page], start):
@@ -145,7 +147,8 @@ def field(label, default=""):
 
 
 def multiline(label, default=""):
-    print(f"{label} (finish with a line containing only .; enter . first to keep current text)")
+    print(label, tr("(finish with a line containing only .; enter . first to keep current text)",
+                    "（. だけの行で入力終了。最初に . を入力すると現在の内容を保持）"))
     if default:
         print(default)
     lines = []
@@ -155,7 +158,7 @@ def multiline(label, default=""):
 
 
 def confirmed(argv, prompted):
-    if prompted and input("Save changes? [y/N] ").strip().lower() not in ("y", "yes"):
+    if prompted and input(tr("Save changes? [y/N] ", "変更を保存しますか？ [y/N] ")).strip().lower() not in ("y", "yes"):
         return None
     return argv
 
@@ -166,7 +169,7 @@ def option(command, flag, value):
 
 def task_options(db, statuses=None):
     return [
-        (f"{row['id']}  {row['project']}  {row['name']}  {row['status']}", row["id"])
+        (f"{row['id']}  {row['project']}  {row['name']}  {status_label(row['status'])}", row["id"])
         for row in db.execute(
             """SELECT t.*, p.name AS project FROM tasks t JOIN projects p ON p.id=t.project_id
                WHERE t.status NOT IN ('RUNNING','REMOVED') ORDER BY t.priority,t.id"""
@@ -189,7 +192,7 @@ def repo_here():
 
 
 def fill_add(db, argv):
-    parser = argparse.ArgumentParser(add_help=False)
+    parser = ArgumentParser(add_help=False)
     parser.add_argument("name", nargs="?")
     parser.add_argument("--project")
     parser.add_argument("--project-id")
@@ -212,8 +215,8 @@ def fill_add(db, argv):
             if current:
                 default = next(i for i, (_, key) in enumerate(options) if key == current["id"])
             else:
-                options.insert(0, (f"{root.name}  {root} (register)", "current"))
-        selected = choose("Project", options, default)
+                options.insert(0, (f"{root.name}  {root} " + tr("(register)", "（新規登録）"), "current"))
+        selected = choose(tr("Project", "プロジェクト"), options, default)
         if selected is None:
             return None
         if selected != "current":
@@ -223,7 +226,7 @@ def fill_add(db, argv):
     else:
         command = option(command, "--project", args.project)
     if name is None:
-        name = field("Task title")
+        name = field(tr("Task title", "タスク名"))
         if not name.strip():
             return None
     needs_prompt = args.prompt is None and args.prompt_file is None and not args.edit
@@ -232,15 +235,15 @@ def fill_add(db, argv):
     if args.prompt_file is not None:
         command = option(command, "--prompt-file", args.prompt_file)
     elif needs_prompt or args.prompt is not None:
-        command = option(command, "--prompt", multiline("Task instructions") if needs_prompt else args.prompt)
-    priority = args.priority if args.priority is not None else field("Priority (1-9)", settings(db)["priority"])
+        command = option(command, "--prompt", multiline(tr("Task instructions", "タスクの指示")) if needs_prompt else args.prompt)
+    priority = args.priority if args.priority is not None else field(tr("Priority (1-9)", "優先度（1〜9）"), settings(db)["priority"])
     command = option(command, "--priority", priority) + ["--", name]
     return confirmed(command, args.name is None or needs_prompt or args.priority is None)
 
 
 def fill_task(db, argv):
     action = argv[0]
-    parser = argparse.ArgumentParser(prog=f"cq {action}", add_help=False)
+    parser = ArgumentParser(prog=f"cq {action}", add_help=False)
     parser.add_argument("id", nargs="?", type=int)
     if action == "edit":
         parser.add_argument("--name")
@@ -258,7 +261,7 @@ def fill_task(db, argv):
         if action == "edit":
             imported = {row[0] for row in db.execute("SELECT task_id FROM remote_tasks")}
             options = [item for item in options if item[1] not in imported]
-        target = choose("Task", options)
+        target = choose(tr("Task", "タスク"), options)
     if target is None:
         return None
     command = [action, str(target)]
@@ -271,13 +274,13 @@ def fill_task(db, argv):
         attempt = latest_attempt(db, target)
         if answer is None and attempt and task["status"] == "WAITING_FOR_INPUT":
             print(attempt["reason"])
-            answer = multiline("Answer")
+            answer = multiline(tr("Answer", "回答"))
             prompted = True
         command += ["--", answer or ""]
     if action == "edit":
         for key, label, read in (
-            ("name", "Task title", field), ("prompt", "Task instructions", multiline),
-            ("priority", "Priority (1-9)", field),
+            ("name", tr("Task title", "タスク名"), field), ("prompt", tr("Task instructions", "タスクの指示"), multiline),
+            ("priority", tr("Priority (1-9)", "優先度（1〜9）"), field),
         ):
             if key == "prompt" and args.prompt_file is not None:
                 command = option(command, "--prompt-file", args.prompt_file)
@@ -295,13 +298,13 @@ def fill_task(db, argv):
 
 def fill_project(db, argv):
     action = argv[1]
-    parser = argparse.ArgumentParser(prog=f"cq project {action}", add_help=False)
+    parser = ArgumentParser(prog=f"cq project {action}", add_help=False)
     if action != "add":
         parser.add_argument("id", nargs="?", type=int)
     fields = (
-        ("path", "Repository path", field), ("name", "Project name", field),
-        ("prompt", "Project instructions", multiline), ("branch", "Branch mode (per-task/current)", field),
-        ("base", "Base branch (inherit/unset/branch)", field),
+        ("path", tr("Repository path", "リポジトリのパス"), field), ("name", tr("Project name", "プロジェクト名"), field),
+        ("prompt", tr("Project instructions", "プロジェクトの共通指示"), multiline), ("branch", tr("Branch mode (per-task/current)", "ブランチ運用（per-task/current）"), field),
+        ("base", tr("Base branch (inherit/unset/branch)", "開始元ブランチ（inherit/unset/ブランチ名）"), field),
     )
     if action in ("add", "edit"):
         for key, _, _ in fields:
@@ -310,7 +313,7 @@ def fill_project(db, argv):
     command = ["project", action]
     row = None
     if action != "add":
-        target = args.id if args.id is not None else choose("Project", project_options(db))
+        target = args.id if args.id is not None else choose(tr("Project", "プロジェクト"), project_options(db))
         if target is None:
             return None
         command += [str(target)]
@@ -369,10 +372,10 @@ def latest_progress(attempt):
                     command = item.get("command")
                     if isinstance(command, str) and command.strip():
                         action = {
-                            "in_progress": "Running",
-                            "completed": "Finished",
-                            "failed": "Failed",
-                        }.get(item.get("status"), "Command")
+                            "in_progress": tr("Running", "実行中"),
+                            "completed": tr("Finished", "実行済み"),
+                            "failed": tr("Failed", "失敗"),
+                        }.get(item.get("status"), tr("Command", "コマンド"))
                         text = f"{action}: {command}"
                     if isinstance(text, str) and text.strip():
                         return " ".join(text.split())[:160]
@@ -383,7 +386,7 @@ def latest_progress(attempt):
 
 def queue_view():
     with open_queue() as db:
-        lines = ["Codex Queue", "Automatic execution enabled" if get_setting(db, "enabled") == "1" else "Automatic execution paused"]
+        lines = ["Codex Queue", tr("Automatic execution enabled", "自動実行は有効です") if get_setting(db, "enabled") == "1" else tr("Automatic execution paused", "自動実行は一時停止中です")]
         rows = db.execute(
             """SELECT t.*, p.name AS project FROM tasks t JOIN projects p ON p.id=t.project_id
                WHERE t.status <> 'REMOVED' ORDER BY (t.status = 'DONE'), t.priority, t.id"""
@@ -400,14 +403,14 @@ def queue_view():
                     progress = latest_progress(attempt)
                     if not progress:
                         progress = (
-                            "Preparing workspace" if attempt["phase"] in ("PREPARING", "CHECKOUT", "READY")
-                            else "Waiting for Codex output"
+                            tr("Preparing workspace", "作業フォルダを準備中") if attempt["phase"] in ("PREPARING", "CHECKOUT", "READY")
+                            else tr("Waiting for Codex output", "Codex の出力を待機中")
                         )
                     running.append(f"  {attempt['started_at']} UTC  {progress}")
                 else:
-                    running.append("  Preparing workspace")
+                    running.append(tr("  Preparing workspace", "  作業フォルダを準備中"))
                 continue
-            tasks.append(f"{status}  {label}")
+            tasks.append(f"{status_label(status)}  {label}")
             if status in ("QUEUED", "DONE", "ABORTED"):
                 continue
             attempt = latest_attempt(db, row["id"])
@@ -416,9 +419,9 @@ def queue_view():
                     tasks.append(f"  {attempt['reason']}")
                 if attempt["retry_at"]:
                     retry = datetime.fromtimestamp(attempt["retry_at"]).astimezone()
-                    tasks.append(f"  Retry after {retry.isoformat()}")
-        lines.extend(["", "In progress", *(running or ["No tasks running"])])
-        lines.extend(["", "Tasks", *(tasks or ["No other tasks"])])
+                    tasks.append("  " + tr("Retry after {time}", "再試行予定 {time}", time=retry.isoformat()))
+        lines.extend(["", tr("In progress", "実行中"), *(running or [tr("No tasks running", "実行中のタスクはありません")])])
+        lines.extend(["", tr("Tasks", "タスク一覧"), *(tasks or [tr("No other tasks", "ほかのタスクはありません")])])
         if error := get_setting(db, "nextcloud_error"):
             lines.append(error)
         return "\n".join(lines)
@@ -426,11 +429,11 @@ def queue_view():
 
 def screen():
     message = ""
-    parser = make_parser()
     try:
         while True:
+            language.set(saved_language())
             if os.name == "nt":
-                line = windows_input(parser, message)
+                line = windows_input(make_parser(), message)
             else:
                 clear()
                 print(queue_view())
@@ -460,7 +463,7 @@ def screen():
                     except SystemExit:
                         pass
                 if live:
-                    input("Press Enter to return to the queue.")
+                    input(tr("Press Enter to return to the queue.", "Enter でキューに戻ります。"))
                 message = output.getvalue().strip()
             except (ValueError, OSError, RuntimeError, SystemExit) as error:
                 message = str(error)
@@ -530,14 +533,14 @@ def prompt_frame(view, message, line, candidates, selected, size, offset):
     footer = []
     if rows >= 4:
         if candidates:
-            footer.append("Up/Down select  Tab complete  Esc hide")
+            footer.append(tr("Up/Down select  Tab complete  Esc hide", "上下キーで選択  Tab で補完  Esc で閉じる"))
             page = min(5, rows - 4)
             first = max(0, selected - page + 1)
             for index, candidate in enumerate(candidates[first:first + page], first):
                 marker = ">" if index == selected else " "
                 footer.append(f"{marker} {candidate}")
         else:
-            footer.append("Enter run  / commands  PgUp/PgDn scroll")
+            footer.append(tr("Enter run  / commands  PgUp/PgDn scroll", "Enter で実行  / で候補  PgUp/PgDn でスクロール"))
     separator = ["-" * width] if rows >= 4 else []
     available = max(0, rows - len(footer) - len(separator) - 1)
     max_offset = max(0, len(body) - available)
