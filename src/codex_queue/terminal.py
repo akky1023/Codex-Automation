@@ -1,20 +1,21 @@
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from collections import deque
 from datetime import datetime
 import json
+from io import StringIO
 import os
 import re
 import shlex
 import shutil
 import time
 from typing import NamedTuple
-import unicodedata
 
 from .arguments import ArgumentParser, parser_candidates
 from .cli import QueueError, git_root, main, make_parser
 from .language import language, status_label, tr
 from .store import get_setting, open_queue, saved_language, settings
+from .text_layout import fit, print_wrapped, terminal_width, wrap_rows
 from .worker import attempt_folder, latest_attempt
 
 
@@ -57,11 +58,20 @@ def choose(title, options, default=0):
     index = default
     while True:
         clear()
-        print(title, tr("(Up/Down, Enter, Esc)", "（上下キーで選択、Enter で確定、Esc で戻る）"))
-        page = max(3, shutil.get_terminal_size().lines - 4)
-        start = min(max(0, index - page // 2), max(0, len(options) - page))
-        for i, (label, _) in enumerate(options[start:start + page], start):
-            print(f"{'>' if i == index else ' '} {label}")
+        columns, height = shutil.get_terminal_size()
+        width = max(1, columns - 1)
+        heading = list(wrap_rows(title + " " + tr(
+            "(Up/Down, Enter, Esc)", "（上下キーで選択、Enter で確定、Esc で戻る）",
+        ), width))[:max(0, height - 2)]
+        rows = []
+        for i, (label, _) in enumerate(options):
+            if i == index:
+                selected_row = len(rows)
+            marker = ">" if i == index else " "
+            rows.extend(wrap_rows(f"{marker} {label}", width))
+        page = max(1, height - len(heading) - 1)
+        start = min(max(0, selected_row - page // 2), max(0, len(rows) - page))
+        print("\n".join([*heading, *rows[start:start + page]]))
         key = keys()
         if key == "up":
             index = (index - 1) % len(options)
@@ -143,15 +153,15 @@ def completion(parser, line):
 
 
 def field(label, default=""):
-    result = input(f"{label} [{default}]: ")
+    result = screen_input(f"{label} [{default}]: ")
     return default if result == "" else result
 
 
 def multiline(label, default=""):
-    print(label, tr("(finish with a line containing only .; enter . first to keep current text)",
-                    "（. だけの行で入力終了。最初に . を入力すると現在の内容を保持）"))
+    print_wrapped(label + " " + tr("(finish with a line containing only .; enter . first to keep current text)",
+                                 "（. だけの行で入力終了。最初に . を入力すると現在の内容を保持）"))
     if default:
-        print(default)
+        print_wrapped(default)
     lines = []
     while (line := input()) != ".":
         lines.append(line)
@@ -159,9 +169,18 @@ def multiline(label, default=""):
 
 
 def confirmed(argv, prompted):
-    if prompted and input(tr("Save changes? [y/N] ", "変更を保存しますか？ [y/N] ")).strip().lower() not in ("y", "yes"):
+    if prompted and screen_input(tr("Save changes? [y/N] ", "変更を保存しますか？ [y/N] ")).strip().lower() not in ("y", "yes"):
         return None
     return argv
+
+
+def screen_input(prompt):
+    rows = list(wrap_rows(prompt, max(1, terminal_width() - 1)))
+    if not rows:
+        return input()
+    if len(rows) > 1:
+        print("\n".join(rows[:-1]))
+    return input(rows[-1] + " ")
 
 
 def option(command, flag, value):
@@ -274,7 +293,7 @@ def fill_task(db, argv):
         answer = args.answer
         attempt = latest_attempt(db, target)
         if answer is None and attempt and task["status"] == "WAITING_FOR_INPUT":
-            print(attempt["reason"])
+            print_wrapped(attempt["reason"])
             answer = multiline(tr("Answer", "回答"))
             prompted = True
         command += ["--", answer or ""]
@@ -428,21 +447,32 @@ def queue_view():
         return "\n".join(lines)
 
 
+def command_output(argv):
+    output = StringIO()
+    with redirect_stdout(output), redirect_stderr(output):
+        try:
+            main(argv, interactive=False)
+        except SystemExit:
+            pass
+    return output.getvalue().strip()
+
+
 def screen():
     message = ""
     showing_help = False
+    help_argv = None
     try:
         while True:
             language.set(saved_language())
             if os.name == "nt":
-                line = windows_input(make_parser(), message, show_queue=not showing_help)
+                line = windows_input(make_parser(), message, show_queue=not showing_help, help_argv=help_argv)
             else:
                 clear()
                 if not showing_help:
-                    print(queue_view())
+                    print_wrapped(queue_view())
                 if message:
-                    print(message)
-                print("add / edit / rm / ls / project / start / pause / stop / sync / q")
+                    print_wrapped(message)
+                print_wrapped("add / edit / rm / ls / project / start / pause / stop / sync / q")
                 line = input("cq> ")
             line = command_text(line)
             if line.strip() in ("q", "quit", "exit"):
@@ -450,25 +480,20 @@ def screen():
             try:
                 argv = prepare(tokens(line))
                 showing_help = bool(argv and argv[0] == "help")
+                help_argv = argv if showing_help else None
                 if not argv:
                     message = ""
                     continue
-                import contextlib
-                import io
                 live = argv[:2] == ["nextcloud", "connect"] or argv[0] in ("setup", "pause", "stop")
-                output = io.StringIO()
-                context = contextlib.ExitStack()
-                with context:
-                    if not live:
-                        context.enter_context(contextlib.redirect_stdout(output))
-                        context.enter_context(contextlib.redirect_stderr(output))
+                if live:
                     try:
                         main(argv, interactive=False)
                     except SystemExit:
                         pass
-                if live:
-                    input(tr("Press Enter to return to the queue.", "Enter でキューに戻ります。"))
-                message = output.getvalue().strip()
+                    screen_input(tr("Press Enter to return to the queue.", "Enter でキューに戻ります。"))
+                    message = ""
+                else:
+                    message = command_output(argv)
             except (ValueError, OSError, RuntimeError, SystemExit) as error:
                 message = str(error)
     except KeyboardInterrupt:
@@ -497,35 +522,6 @@ def virtual_terminal():
     finally:
         if enabled:
             kernel.SetConsoleMode(handle, mode.value)
-
-
-def cell_width(char):
-    if unicodedata.category(char) in ("Mn", "Me", "Cf"):
-        return 0
-    return 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
-
-
-def fit(text, width, tail=False):
-    result = []
-    for char in reversed(text) if tail else text:
-        size = cell_width(char)
-        if size > width:
-            break
-        width -= size
-        result.append(char)
-    return "".join(reversed(result) if tail else result)
-
-
-def wrap_rows(text, width):
-    for row in text.expandtabs(4).splitlines():
-        row = "".join(char for char in row if unicodedata.category(char) != "Cc")
-        if not row or width < 2:
-            yield fit(row, width)
-            continue
-        while row:
-            fragment = fit(row, width)
-            yield fragment
-            row = row[len(fragment):]
 
 
 def prompt_frame(view, message, line, candidates, selected, size, offset):
@@ -573,12 +569,12 @@ def draw_prompt(view, message, line, candidates, selected, size, offset, vt):
     return page, offset, max_offset
 
 
-def windows_input(parser, message, show_queue=True):
+def windows_input(parser, message, show_queue=True, help_argv=None):
     with virtual_terminal() as vt:
-        return read_windows_prompt(parser, message, vt, show_queue)
+        return read_windows_prompt(parser, message, vt, show_queue, help_argv)
 
 
-def read_windows_prompt(parser, message, vt, show_queue):
+def read_windows_prompt(parser, message, vt, show_queue, help_argv):
     import msvcrt
 
     line = ""
@@ -624,11 +620,14 @@ def read_windows_prompt(parser, message, vt, show_queue):
                     redraw = True
         else:
             time.sleep(0.03)
-        if time.monotonic() >= refresh_at:
-            refresh_at = time.monotonic() + 0.2
+        now = time.monotonic()
+        if now >= refresh_at:
+            refresh_at = now + 0.2
             current = queue_view() if show_queue else ""
             current_size = shutil.get_terminal_size()
             if current != view or current_size != size:
+                if help_argv and current_size.columns != size.columns:
+                    message = command_output(help_argv)
                 view = current
                 size = current_size
                 redraw = True

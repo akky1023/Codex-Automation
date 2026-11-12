@@ -13,11 +13,32 @@ from codex_queue.cli import make_parser
 from codex_queue.language import language
 from codex_queue.store import SCHEMA
 from codex_queue.terminal import Suggestion, command_text, completion, draw_prompt, prompt_frame, queue_view, screen, windows_input
+from codex_queue.text_layout import text_width, wrap_rows
 
 
 class SuggestionTest(unittest.TestCase):
     def setUp(self):
         self.parser = make_parser()
+
+    def test_help_respects_terminal_columns_in_both_languages(self):
+        for locale in ("ja", "en"):
+            token = language.set(locale)
+            try:
+                for columns in (24, 34, 80):
+                    with self.subTest(locale=locale, columns=columns), patch.dict(os.environ, {"COLUMNS": str(columns)}):
+                        parser = make_parser()
+                        with contextlib.redirect_stdout(io.StringIO()) as output, self.assertRaises(SystemExit) as exit:
+                            parser.parse_args(["config", "--help"])
+                        self.assertEqual(0, exit.exception.code)
+                        rows = output.getvalue().splitlines()
+                        self.assertTrue(all(text_width(row) < columns for row in rows), rows)
+                        self.assertTrue(any("[--priority 1-9]" in row for row in rows))
+                        self.assertTrue(any("--language" in row for row in rows))
+            finally:
+                language.reset(token)
+
+    def test_display_wrap_keeps_words_and_counts_wide_glyphs(self):
+        self.assertEqual(["  Task", "  日本語", "  Status"], list(wrap_rows("  Task 日本語 Status", 10)))
 
     def test_slash_command_replaces_only_prefix(self):
         line = "  /proj"
@@ -47,6 +68,22 @@ class SuggestionTest(unittest.TestCase):
             self.assertFalse(prompt.call_args.kwargs["show_queue"])
         finally:
             language.reset(token)
+
+    @unittest.skipUnless(os.name == "nt", "Windows console input")
+    def test_help_is_formatted_again_when_terminal_width_changes(self):
+        with patch("msvcrt.kbhit", side_effect=[False, True]), patch(
+            "codex_queue.terminal.keys", return_value="\r",
+        ), patch("codex_queue.terminal.time.monotonic", side_effect=[0.0, 1.0]), patch(
+            "codex_queue.terminal.time.sleep",
+        ), patch("codex_queue.terminal.shutil.get_terminal_size", side_effect=[
+            os.terminal_size((80, 24)), os.terminal_size((34, 24)),
+        ]), patch("codex_queue.terminal.command_output", return_value="Narrow help") as output, patch(
+            "codex_queue.terminal.draw_prompt", return_value=(8, 0, 0),
+        ) as draw, contextlib.redirect_stdout(io.StringIO()):
+            windows_input(self.parser, "Wide help", show_queue=False, help_argv=["help", "config"])
+        output.assert_called_once_with(["help", "config"])
+        self.assertEqual("Narrow help", draw.call_args.args[1])
+        self.assertEqual((34, 24), draw.call_args.args[5])
 
     def test_blank_input_has_no_candidates_but_slash_opens_them(self):
         for line in ("", "   ", "\t"):
@@ -151,7 +188,7 @@ class QueueViewTest(unittest.TestCase):
     def test_language_switch_is_persisted_for_new_cli_processes(self):
         with TemporaryDirectory(dir=Path.cwd()) as folder:
             source = Path(__file__).resolve().parents[1] / "src"
-            env = dict(os.environ, CQ_WORKER_DATA_DIR=folder, PYTHONPATH=str(source), PYTHONIOENCODING="utf-8")
+            env = dict(os.environ, CQ_WORKER_DATA_DIR=folder, PYTHONPATH=str(source), PYTHONIOENCODING="utf-8", COLUMNS="80")
 
             def cq(*args, code=0):
                 result = subprocess.run(

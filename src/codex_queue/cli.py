@@ -12,6 +12,7 @@ from .arguments import ArgumentParser, parser_candidates
 from .language import LANGUAGES, language, status_label, tr
 from .runtime import register_schedule, setup
 from .store import DEFAULTS, get_setting, open_queue, saved_language, settings, update, write
+from .text_layout import print_wrapped
 from .worker import latest_attempt, run_worker
 
 
@@ -255,14 +256,14 @@ def task_commands(subparsers):
     prompt.add_argument("--prompt", help=tr("Task instructions", "タスクの指示"))
     prompt.add_argument("--prompt-file", type=Path, help=tr("Read UTF-8 task instructions from a file", "UTF-8 のファイルからタスクの指示を読み込む"))
     add.add_argument("--edit", action="store_true", help=tr("Edit the task prompt before saving", "保存前にタスクの指示を編集"))
-    add.add_argument("--priority", type=int, choices=range(1, 10), help=tr("Task priority", "タスクの優先度"))
+    add.add_argument("--priority", type=int, choices=range(1, 10), metavar="1-9", help=tr("Task priority", "タスクの優先度"))
     edit = subparsers.add_parser("edit", help=tr("Edit a task", "タスクを編集"))
     edit.add_argument("id", type=positive)
     edit.add_argument("--name", help=tr("Task title", "タスク名"))
     prompt = edit.add_mutually_exclusive_group()
     prompt.add_argument("--prompt", help=tr("Task instructions", "タスクの指示"))
     prompt.add_argument("--prompt-file", type=Path, help=tr("Read UTF-8 task instructions from a file", "UTF-8 のファイルからタスクの指示を読み込む"))
-    edit.add_argument("--priority", type=int, choices=range(1, 10), help=tr("Task priority", "タスクの優先度"))
+    edit.add_argument("--priority", type=int, choices=range(1, 10), metavar="1-9", help=tr("Task priority", "タスクの優先度"))
     remove = subparsers.add_parser("rm", aliases=["remove"], help=tr("Remove a task", "タスクを削除"))
     remove.add_argument("id", type=positive)
     subparsers.add_parser("ls", aliases=["list"], help=tr("List tasks", "タスクを一覧表示"))
@@ -295,7 +296,7 @@ def make_parser():
 
     config = commands.add_parser("config", aliases=["settings"], help=tr("Manage queue defaults", "キューの設定を管理"))
     config.add_argument("--parallel", type=positive, help=tr("Maximum concurrent tasks", "同時に実行するタスク数の上限"))
-    config.add_argument("--priority", type=int, choices=range(1, 10), help=tr("Default task priority", "タスクの既定の優先度"))
+    config.add_argument("--priority", type=int, choices=range(1, 10), metavar="1-9", help=tr("Default task priority", "タスクの既定の優先度"))
     config.add_argument("--branch", choices=["per-task", "current"], help=tr("Default branch mode", "既定のブランチ運用"))
     config.add_argument("--base", help=tr("Default base branch", "既定の開始元ブランチ"))
     config.add_argument("--on-abort", choices=["pause", "continue"], help=tr("Queue behavior after an abort", "タスク中止後のキューの動作"))
@@ -351,8 +352,8 @@ def show_command_help(parser, topic):
     if not topic:
         print(tr("Commands", "コマンド一覧"))
         for command, description in command_help_rows(parser):
-            print(f"  {command}: {description}")
-        print(tr("Use cq help COMMAND for options.", "オプションを確認するには cq help COMMAND を実行してください。"))
+            print_wrapped(f"  {command}: {description}")
+        print_wrapped(tr("Use cq help COMMAND for options.", "オプションを確認するには cq help COMMAND を実行してください。"))
         return
     target = parser
     for name in topic:
