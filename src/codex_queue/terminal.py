@@ -9,6 +9,7 @@ import shlex
 import shutil
 import time
 from typing import NamedTuple
+import unicodedata
 
 from .arguments import ArgumentParser, parser_candidates
 from .cli import BRANCH_MODES, QueueError, git_root, main, make_parser
@@ -16,16 +17,11 @@ from .language import language, status_label, tr
 from .status import queue_status
 from .store import open_queue, saved_language, settings
 from .text_layout import fit, print_wrapped, terminal_width, wrap_rows
+from .windows_console import ConsoleInput
 from .worker import latest_attempt
 
 
 def keys():
-    if os.name == "nt":
-        import msvcrt
-        key = msvcrt.getwch()
-        if key in ("\x00", "\xe0"):
-            return {"H": "up", "P": "down", "I": "pageup", "Q": "pagedown"}.get(msvcrt.getwch(), "")
-        return key
     import sys
     import termios
     import tty
@@ -56,6 +52,7 @@ def choose(title, options, default=0):
         print(tr("No available choices.", "選択できる項目がありません。"))
         return None
     index = default
+    console = ConsoleInput() if os.name == "nt" else None
     while True:
         clear()
         columns, height = shutil.get_terminal_size()
@@ -72,7 +69,11 @@ def choose(title, options, default=0):
         page = max(1, height - len(heading) - 1)
         start = min(max(0, selected_row - page // 2), max(0, len(rows) - page))
         print("\n".join([*heading, *rows[start:start + page]]))
-        key = keys()
+        if console is None:
+            key = keys()
+        else:
+            while (key := console.read()) is None:
+                time.sleep(0.03)
         if key == "up":
             index = (index - 1) % len(options)
         elif key == "down":
@@ -603,7 +604,7 @@ def draw_prompt(view, message, line, candidates, selected, size, offset, vt, for
     if vt:
         body, _, prompt = frame.rpartition("\n")
         upper = body.replace("\n", "\033[K\n") + "\033[K\n" if "\n" in frame else ""
-        print(f"\033[H{upper}\033[97;44m{prompt}\033[K\033[0m", end="", flush=True)
+        print(f"\033[H{upper}\r\033[2K\033[97;44m{prompt}\033[K\033[0m", end="", flush=True)
     else:
         clear()
         print(frame, end="", flush=True)
@@ -616,8 +617,7 @@ def windows_input(parser, message, show_queue=True, help_argv=None, complete=Non
 
 
 def read_windows_prompt(parser, message, vt, show_queue, help_argv, complete, initial):
-    import msvcrt
-
+    console = ConsoleInput()
     line = initial or ""
     form = complete is not None
     suggest = complete if form else partial(completion, parser)
@@ -629,8 +629,8 @@ def read_windows_prompt(parser, message, vt, show_queue, help_argv, complete, in
     refresh_at = time.monotonic() + 0.2
     while True:
         redraw = False
-        if msvcrt.kbhit():
-            key = keys()
+        key = console.read()
+        if key is not None:
             if key == "\r" or (key == "\n" and initial is None):
                 print()
                 return line
@@ -654,8 +654,11 @@ def read_windows_prompt(parser, message, vt, show_queue, help_argv, complete, in
                 if key == "\t" and candidates:
                     candidate = candidates[selected]
                     line = line[:start] + (candidate.insertion if candidate.insertion is not None else candidate.name + " ")
-                elif key == "\b" and line:
-                    line = line[:-1]
+                elif key in ("\b", "\x7f") and line:
+                    end = len(line) - 1
+                    while end and unicodedata.category(line[end]).startswith("M"):
+                        end -= 1
+                    line = line[:end]
                 elif key == "\x15" and initial is not None:
                     line = ""
                 elif key == "\n" and initial is not None:

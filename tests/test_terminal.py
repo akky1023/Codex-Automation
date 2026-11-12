@@ -1,4 +1,5 @@
 import contextlib
+import ctypes
 import io
 import os
 from pathlib import Path
@@ -14,6 +15,7 @@ from codex_queue.language import language
 from codex_queue.store import SCHEMA
 from codex_queue.terminal import Suggestion, command_text, completion, draw_prompt, edit_field, fill_project, fill_task, prompt_frame, queue_view, screen, tokens, windows_input
 from codex_queue.text_layout import text_width, wrap_rows
+from codex_queue.windows_console import ConsoleInput, InputRecord, KeyEvent
 
 
 class SuggestionTest(unittest.TestCase):
@@ -39,6 +41,34 @@ class SuggestionTest(unittest.TestCase):
 
     def test_display_wrap_keeps_words_and_counts_wide_glyphs(self):
         self.assertEqual(["  Task", "  日本語", "  Status"], list(wrap_rows("  Task 日本語 Status", 10)))
+
+    @unittest.skipUnless(os.name == "nt", "Windows console input")
+    def test_console_keeps_repeats_after_switching_from_japanese_input(self):
+        events = [KeyEvent(True, 1, 0xE7, 0, ord(char), 0) for char in "あいうえお"]
+        events.extend([
+            KeyEvent(True, 1, 0x19, 41, 0, 0),
+            KeyEvent(False, 1, 0x19, 41, 0, 0),
+            KeyEvent(True, 5, 0x41, 30, ord("a"), 0),
+            KeyEvent(True, 1, 8, 14, 8, 0),
+            KeyEvent(True, 1, 13, 28, 13, 0),
+        ])
+        records = iter(InputRecord(1, event) for event in events)
+
+        def read_event(handle, output, limit, count):
+            record = next(records)
+            ctypes.memmove(output, ctypes.byref(record), ctypes.sizeof(record))
+            return True
+
+        def count_events(handle, count):
+            ctypes.cast(count, ctypes.POINTER(ctypes.c_ulong)).contents.value = 1
+            return True
+
+        with patch("codex_queue.windows_console.ctypes.WinDLL") as load:
+            kernel = load.return_value
+            kernel.GetNumberOfConsoleInputEvents.side_effect = count_events
+            kernel.ReadConsoleInputW.side_effect = read_event
+            console = ConsoleInput()
+            self.assertEqual(list("あいうえおaaaaa\b\r"), [console.read() for _ in range(12)])
 
     def test_slash_command_replaces_only_prefix(self):
         line = "  /proj"
@@ -117,13 +147,23 @@ class SuggestionTest(unittest.TestCase):
             (["\x15", "\r"], ""),
             (["\x15", "a", "\n", "b", "\r"], "a\nb"),
         ):
-            with self.subTest(keys=keys), patch("msvcrt.kbhit", return_value=True), patch(
-                "codex_queue.terminal.keys", side_effect=keys,
+            with self.subTest(keys=keys), patch(
+                "codex_queue.terminal.ConsoleInput.read", side_effect=keys,
             ), patch(
                 "codex_queue.terminal.draw_prompt", return_value=(8, 0, 0),
             ) as draw, contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(expected, edit_field("prompt", "Instructions", current))
             self.assertEqual((current, []), draw.call_args_list[0].args[2:4])
+
+    @unittest.skipUnless(os.name == "nt", "Windows console input")
+    def test_backspace_removes_japanese_characters_in_edit_field(self):
+        for backspace in ("\b", "\x7f"):
+            with self.subTest(backspace=backspace), patch(
+                "codex_queue.terminal.ConsoleInput.read", side_effect=["本", "か", "\u3099", backspace, "\r"],
+            ), patch(
+                "codex_queue.terminal.draw_prompt", return_value=(8, 0, 0),
+            ), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual("日本", edit_field("name", "Task title", "日"))
 
     @unittest.skipUnless(os.name == "nt", "Windows console input")
     def test_project_and_task_edits_omit_unchanged_options(self):
@@ -204,8 +244,8 @@ class SuggestionTest(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "nt", "Windows console input")
     def test_help_is_formatted_again_when_terminal_width_changes(self):
-        with patch("msvcrt.kbhit", side_effect=[False, True]), patch(
-            "codex_queue.terminal.keys", return_value="\r",
+        with patch(
+            "codex_queue.terminal.ConsoleInput.read", side_effect=[None, "\r"],
         ), patch("codex_queue.terminal.time.monotonic", side_effect=[0.0, 1.0]), patch(
             "codex_queue.terminal.time.sleep",
         ), patch("codex_queue.terminal.shutil.get_terminal_size", side_effect=[
@@ -261,17 +301,18 @@ class SuggestionTest(unittest.TestCase):
         self.assertTrue(frame.endswith("end"))
         self.assertEqual(5, len(frame.split("\n")))
 
-    def test_virtual_terminal_highlights_only_input_row(self):
+    def test_virtual_terminal_clears_input_row_before_redrawing_shorter_text(self):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            draw_prompt("Queue", "", "", [], 0, (80, 8), 0, vt=True)
-        self.assertTrue(output.getvalue().endswith("\033[97;44mcq> \033[K\033[0m"))
+            draw_prompt("Queue", "", "日本", [], 0, (80, 8), 0, vt=True)
+            draw_prompt("Queue", "", "日", [], 0, (80, 8), 0, vt=True)
+        self.assertTrue(output.getvalue().endswith("\r\033[2K\033[97;44mcq> 日\033[K\033[0m"))
 
     @unittest.skipUnless(os.name == "nt", "Windows console input")
     def test_arrow_selects_tab_completes_and_enter_submits(self):
         sequence = ["/", "r", "down", "\t", "\r"]
-        with patch("msvcrt.kbhit", return_value=True), patch(
-            "codex_queue.terminal.keys", side_effect=sequence,
+        with patch(
+            "codex_queue.terminal.ConsoleInput.read", side_effect=sequence,
         ), patch("codex_queue.terminal.queue_view", return_value="Queue"), patch(
             "codex_queue.terminal.draw_prompt", return_value=(8, 0, 0),
         ), contextlib.redirect_stdout(io.StringIO()):
