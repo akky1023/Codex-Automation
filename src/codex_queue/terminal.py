@@ -101,6 +101,7 @@ class Suggestion(NamedTuple):
     name: str
     help: str = ""
     insertion: str | None = None
+    submit: bool = False
 
 
 COMPLETION_WORD = re.compile(r"""(?:[^\s'"]+|"[^"]*(?:"|$)|'[^']*(?:'|$))+""")
@@ -219,21 +220,53 @@ def project_field(key, label, default):
         return field(label, default)
 
     def complete(prefix):
-        if key == "path":
-            return 0, path_suggestions(prefix, directories_only=True, quote=False)
-        choices = BRANCH_MODES if key == "branch" else PROJECT_BASE_VALUES
-        return 0, [Suggestion(value, insertion=value) for value in choices if value.startswith(prefix)]
+        return 0, form_suggestions(key, prefix)
 
     value = windows_input(None, f"{label} [{default}]", show_queue=False, complete=complete)
     return value or default
 
 
-def multiline(label, default=""):
+def form_suggestions(key, prefix):
+    if key == "path":
+        return path_suggestions(prefix, directories_only=True, quote=False)
+    choices = {
+        "branch": BRANCH_MODES,
+        "base": PROJECT_BASE_VALUES,
+        "priority": tuple(map(str, range(1, 10))),
+    }.get(key, ())
+    return [Suggestion(value, insertion=value) for value in choices if value.startswith(prefix)]
+
+
+def edit_field(key, label, current, read):
+    if os.name != "nt":
+        return read(label, current)
+
+    keep = Suggestion(tr("Keep unchanged", "変更しない"), insertion="", submit=True)
+
+    def complete(prefix):
+        candidates = form_suggestions(key, prefix)
+        return 0, [*candidates, keep] if prefix else [keep, *candidates]
+
+    if read is multiline:
+        heading = "\n".join((
+            label, current,
+            tr("Type the first line to edit, or press Enter to keep the current text.",
+               "編集する場合は最初の行を入力。現在の指示を保持する場合は Enter。"),
+        ))
+    else:
+        heading = f"{label} [{current}]"
+    value = windows_input(None, heading, show_queue=False, complete=complete)
+    if not value or (read is multiline and value == "."):
+        return current
+    return multiline(label, current, initial=(value,)) if read is multiline else value
+
+
+def multiline(label, default="", initial=()):
     print_wrapped(label + " " + tr("(finish with a line containing only .; enter . first to keep current text)",
                                  "（. だけの行で入力終了。最初に . を入力すると現在の内容を保持）"))
-    if default:
+    if default and not initial:
         print_wrapped(default)
-    lines = []
+    lines = list(initial)
     while (line := input()) != ".":
         lines.append(line)
     return "\n".join(lines) if lines else default
@@ -380,10 +413,12 @@ def fill_task(db, argv):
             current = str(task[key])
             if value is None:
                 prompted = True
-                value = read(label, current)
+                value = edit_field(key, label, current, read)
                 if value == current:
                     continue
             command = option(command, f"--{key}", value)
+        if len(command) == 2:
+            return None
     return confirmed(command, prompted)
 
 
@@ -421,10 +456,15 @@ def fill_project(db, argv):
         if value is None:
             prompted = True
             current = defaults[key] or ""
-            value = project_field(key, label, current) if read is field else read(label, current)
+            if action == "edit":
+                value = edit_field(key, label, current, read)
+            else:
+                value = project_field(key, label, current) if read is field else read(label, current)
             if value == current:
                 continue
         command = option(command, f"--{key}", value)
+    if action == "edit" and len(command) == 3:
+        return None
     return confirmed(command, prompted)
 
 
@@ -686,6 +726,9 @@ def read_windows_prompt(parser, message, vt, show_queue, help_argv, complete):
                 if key == "\t" and candidates:
                     candidate = candidates[selected]
                     line = line[:start] + (candidate.insertion if candidate.insertion is not None else candidate.name + " ")
+                    if candidate.submit:
+                        print()
+                        return line
                 elif key == "\b" and line:
                     line = line[:-1]
                 elif len(key) == 1 and key.isprintable():

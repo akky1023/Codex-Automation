@@ -12,7 +12,7 @@ from unittest.mock import patch
 from codex_queue.cli import make_parser
 from codex_queue.language import language
 from codex_queue.store import SCHEMA
-from codex_queue.terminal import Suggestion, command_text, completion, draw_prompt, fill_project, prompt_frame, queue_view, screen, tokens, windows_input
+from codex_queue.terminal import Suggestion, command_text, completion, draw_prompt, edit_field, field, fill_project, fill_task, prompt_frame, queue_view, screen, tokens, windows_input
 from codex_queue.text_layout import text_width, wrap_rows
 
 
@@ -107,6 +107,38 @@ class SuggestionTest(unittest.TestCase):
             self.assertIn(f"--path={directory}{os.sep}", command)
             self.assertIn("--branch=per-task", command)
             self.assertIn("--base=unset", command)
+
+    @unittest.skipUnless(os.name == "nt", "Windows console input")
+    def test_tab_on_keep_unchanged_accepts_current_path(self):
+        with patch("msvcrt.kbhit", return_value=True), patch(
+            "codex_queue.terminal.keys", return_value="\t",
+        ) as keys, patch("codex_queue.terminal.draw_prompt", return_value=(8, 0, 0)), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual("old folder", edit_field("path", "Repository path", "old folder", field))
+        keys.assert_called_once_with()
+
+    @unittest.skipUnless(os.name == "nt", "Windows console input")
+    def test_project_and_task_edits_omit_unchanged_options(self):
+        with contextlib.closing(sqlite3.connect(":memory:")) as db:
+            db.row_factory = sqlite3.Row
+            db.executescript(SCHEMA)
+            db.execute("INSERT INTO projects(path, path_key, name, prompt) VALUES ('old folder', 'old', 'Project', 'Keep me')")
+            db.execute("INSERT INTO tasks(project_id, name, prompt, priority) VALUES (1, 'Task', 'Keep me too', 5)")
+
+            def complete_field(parser, message, *, show_queue, complete):
+                _, candidates = complete("")
+                self.assertEqual(Suggestion("Keep unchanged", insertion="", submit=True), candidates[0])
+                if message.startswith("Project name"):
+                    return "New project name"
+                if message.startswith("Priority"):
+                    self.assertEqual("1", candidates[1].insertion)
+                    return "3"
+                return candidates[0].insertion
+
+            with patch("codex_queue.terminal.windows_input", side_effect=complete_field), patch(
+                "codex_queue.terminal.confirmed", side_effect=lambda command, prompted: command,
+            ):
+                self.assertEqual(["project", "edit", "1", "--name=New project name"], fill_project(db, ["project", "edit", "1"]))
+                self.assertEqual(["edit", "1", "--priority=3"], fill_task(db, ["edit", "1"]))
 
     def test_help_completes_nested_topics(self):
         self.assertEqual([Suggestion("help", "Show command help")], completion(self.parser, "/he")[1])
