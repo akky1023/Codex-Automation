@@ -12,7 +12,7 @@ from unittest.mock import patch
 from codex_queue.cli import make_parser
 from codex_queue.language import language
 from codex_queue.store import SCHEMA
-from codex_queue.terminal import command_text, completion, draw_prompt, prompt_frame, queue_view, windows_input
+from codex_queue.terminal import Suggestion, command_text, completion, draw_prompt, prompt_frame, queue_view, windows_input
 
 
 class SuggestionTest(unittest.TestCase):
@@ -22,19 +22,30 @@ class SuggestionTest(unittest.TestCase):
     def test_slash_command_replaces_only_prefix(self):
         line = "  /proj"
         start, choices = completion(self.parser, line)
-        self.assertEqual(["project"], choices)
-        self.assertEqual("project", command_text(line[:start] + choices[0]))
+        self.assertEqual([Suggestion("project", "Manage projects")], choices)
+        self.assertEqual("project", command_text(line[:start] + choices[0].name))
 
     def test_subcommands_and_options_follow_parser(self):
-        self.assertEqual(["edit"], completion(self.parser, "task e")[1])
-        self.assertEqual(["--priority"], completion(self.parser, "task edit 42 --pri")[1])
-        self.assertEqual(["resolve"], completion(self.parser, "/nextcloud re")[1])
-        self.assertNotIn("_worker", completion(self.parser, "/")[1])
+        self.assertEqual([Suggestion("edit", "Edit a task")], completion(self.parser, "task e")[1])
+        self.assertEqual([Suggestion("--priority", "Task priority")], completion(self.parser, "task edit 42 --pri")[1])
+        self.assertEqual([Suggestion("resolve", "Resolve a completion conflict")], completion(self.parser, "/nextcloud re")[1])
+        self.assertNotIn("_worker", [candidate.name for candidate in completion(self.parser, "/")[1]])
 
     def test_blank_input_has_no_candidates_but_slash_opens_them(self):
         for line in ("", "   ", "\t"):
             self.assertEqual([], completion(self.parser, line)[1])
-        self.assertIn("project", completion(self.parser, "/")[1])
+        self.assertIn(Suggestion("project", "Manage projects"), completion(self.parser, "/")[1])
+
+    def test_localized_command_and_alias_descriptions_are_shown(self):
+        token = language.set("ja")
+        try:
+            parser = make_parser()
+            _, candidates = completion(parser, "/a")
+            frame, _, _, _ = prompt_frame("Queue", "", "/a", candidates, 0, (80, 12), 0)
+            self.assertIn("> add: タスクを追加", frame)
+            self.assertIn(Suggestion("remove", "タスクを削除"), completion(parser, "/rem")[1])
+        finally:
+            language.reset(token)
 
     def test_no_completion_in_argument_values(self):
         for line in ('add "title --pr', 'add x --prompt --pr', 'add -- --pr'):
@@ -42,7 +53,7 @@ class SuggestionTest(unittest.TestCase):
                 self.assertEqual([], completion(self.parser, line)[1])
 
     def test_input_stays_on_last_row_with_or_without_suggestions(self):
-        for candidates in ([], ["project", "pause"]):
+        for candidates in ([], [Suggestion("project", "Manage projects"), Suggestion("pause", "Pause the queue")]):
             frame, _, _, _ = prompt_frame("Queue", "Done", "/p", candidates, 0, (80, 12), 0)
             rows = frame.split("\n")
             self.assertEqual(12, len(rows))
@@ -50,7 +61,7 @@ class SuggestionTest(unittest.TestCase):
             self.assertEqual("-" * 79, rows[-2])
             self.assertEqual("Queue", rows[0])
             if candidates:
-                self.assertIn("> project", rows[:-1])
+                self.assertIn("> project: Manage projects", rows[:-1])
 
     def test_short_console_scrolls_output_and_shows_end_of_wide_input(self):
         frame, page, offset, maximum = prompt_frame(

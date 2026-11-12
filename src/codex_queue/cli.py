@@ -249,31 +249,31 @@ def task_commands(subparsers):
     add = subparsers.add_parser("add", help=tr("Add a task", "タスクを追加"))
     add.add_argument("name")
     target = add.add_mutually_exclusive_group()
-    target.add_argument("--project")
-    target.add_argument("--project-id", type=positive)
+    target.add_argument("--project", help=tr("Project name", "プロジェクト名"))
+    target.add_argument("--project-id", type=positive, help=tr("Project ID", "プロジェクト ID"))
     prompt = add.add_mutually_exclusive_group()
-    prompt.add_argument("--prompt")
+    prompt.add_argument("--prompt", help=tr("Task instructions", "タスクの指示"))
     prompt.add_argument("--prompt-file", type=Path, help=tr("Read UTF-8 task instructions from a file", "UTF-8 のファイルからタスクの指示を読み込む"))
     add.add_argument("--edit", action="store_true", help=tr("Edit the task prompt before saving", "保存前にタスクの指示を編集"))
-    add.add_argument("--priority", type=int, choices=range(1, 10))
+    add.add_argument("--priority", type=int, choices=range(1, 10), help=tr("Task priority", "タスクの優先度"))
     edit = subparsers.add_parser("edit", help=tr("Edit a task", "タスクを編集"))
     edit.add_argument("id", type=positive)
-    edit.add_argument("--name")
+    edit.add_argument("--name", help=tr("Task title", "タスク名"))
     prompt = edit.add_mutually_exclusive_group()
-    prompt.add_argument("--prompt")
+    prompt.add_argument("--prompt", help=tr("Task instructions", "タスクの指示"))
     prompt.add_argument("--prompt-file", type=Path, help=tr("Read UTF-8 task instructions from a file", "UTF-8 のファイルからタスクの指示を読み込む"))
-    edit.add_argument("--priority", type=int, choices=range(1, 10))
+    edit.add_argument("--priority", type=int, choices=range(1, 10), help=tr("Task priority", "タスクの優先度"))
     remove = subparsers.add_parser("rm", aliases=["remove"], help=tr("Remove a task", "タスクを削除"))
     remove.add_argument("id", type=positive)
     subparsers.add_parser("ls", aliases=["list"], help=tr("List tasks", "タスクを一覧表示"))
 
 
 def project_arguments(parser):
-    parser.add_argument("--name")
-    parser.add_argument("--path")
-    parser.add_argument("--prompt")
-    parser.add_argument("--branch", choices=["per-task", "current"])
-    parser.add_argument("--base")
+    parser.add_argument("--name", help=tr("Project name", "プロジェクト名"))
+    parser.add_argument("--path", help=tr("Repository path", "リポジトリのパス"))
+    parser.add_argument("--prompt", help=tr("Project instructions", "プロジェクトの共通指示"))
+    parser.add_argument("--branch", choices=["per-task", "current"], help=tr("Branch mode", "ブランチ運用"))
+    parser.add_argument("--base", help=tr("Base branch", "開始元ブランチ"))
 
 
 def make_parser():
@@ -294,12 +294,12 @@ def make_parser():
     remove.add_argument("id", type=positive)
 
     config = commands.add_parser("config", aliases=["settings"], help=tr("Manage queue defaults", "キューの設定を管理"))
-    config.add_argument("--parallel", type=positive)
-    config.add_argument("--priority", type=int, choices=range(1, 10))
-    config.add_argument("--branch", choices=["per-task", "current"])
-    config.add_argument("--base")
-    config.add_argument("--on-abort", choices=["pause", "continue"])
-    config.add_argument("--sync", choices=["auto", "manual"])
+    config.add_argument("--parallel", type=positive, help=tr("Maximum concurrent tasks", "同時に実行するタスク数の上限"))
+    config.add_argument("--priority", type=int, choices=range(1, 10), help=tr("Default task priority", "タスクの既定の優先度"))
+    config.add_argument("--branch", choices=["per-task", "current"], help=tr("Default branch mode", "既定のブランチ運用"))
+    config.add_argument("--base", help=tr("Default base branch", "既定の開始元ブランチ"))
+    config.add_argument("--on-abort", choices=["pause", "continue"], help=tr("Queue behavior after an abort", "タスク中止後のキューの動作"))
+    config.add_argument("--sync", choices=["auto", "manual"], help=tr("Nextcloud sync mode", "Nextcloud の同期方式"))
     config.add_argument("--language", choices=LANGUAGES, help=tr(
         "Display language (en: English, ja: Japanese)",
         "表示言語（en: 英語、ja: 日本語）",
@@ -312,16 +312,22 @@ def make_parser():
     ):
         commands.add_parser(name, aliases=aliases, help=help_text)
     schedule = commands.add_parser("schedule", help=tr("Register a Windows scheduled task", "Windows の定期タスクを登録"))
-    schedule.add_argument("--every-minutes", type=positive, required=True)
-    for name in ("retry", "reply", "abort", "logs", "done"):
-        action = commands.add_parser(name)
+    schedule.add_argument("--every-minutes", type=positive, required=True, help=tr("Interval in minutes", "実行間隔（分）"))
+    for name, help_text in (
+        ("retry", tr("Retry a task", "タスクを再試行")),
+        ("reply", tr("Answer a task's question", "タスクからの質問に回答")),
+        ("abort", tr("Abort a task", "タスクを中止")),
+        ("logs", tr("Show task logs", "タスクのログを表示")),
+        ("done", tr("Mark a task as complete", "タスクを完了にする")),
+    ):
+        action = commands.add_parser(name, help=help_text)
         action.add_argument("id", type=positive)
         if name == "retry":
-            action.add_argument("--fresh", action="store_true")
+            action.add_argument("--fresh", action="store_true", help=tr("Start a new attempt", "新しい試行を開始"))
         elif name == "reply":
             action.add_argument("answer")
         elif name == "done":
-            action.add_argument("--note")
+            action.add_argument("--note", help=tr("Completion note", "完了メモ"))
     worker = commands.add_parser("_worker")
     worker.add_argument("--scheduled", action="store_true")
     worker.add_argument("--data-dir", help=argparse.SUPPRESS)

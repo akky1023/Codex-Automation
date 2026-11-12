@@ -8,6 +8,7 @@ import re
 import shlex
 import shutil
 import time
+from typing import NamedTuple
 import unicodedata
 
 from .arguments import ArgumentParser
@@ -85,6 +86,11 @@ def command_text(line):
     return line.lstrip().removeprefix("/")
 
 
+class Suggestion(NamedTuple):
+    name: str
+    help: str = ""
+
+
 def completion(parser, line):
     """Return the replaceable suffix and its candidates for the current input."""
     if not line.strip():
@@ -115,18 +121,22 @@ def completion(parser, line):
         if flag in options:
             value_expected = not equals and options[flag].nargs != 0
         elif not positional and word in commands:
-            parser = commands[word]
+            parser, _ = commands[word]
         else:
             positional = True
 
     if value_expected:
         return start, []
     commands, options = parser_candidates(parser)
-    choices = options if prefix.startswith("-") else commands if not positional else {}
-    if not words and not prefix.startswith("-"):
-        choices = [*choices, "q"]
+    if prefix.startswith("-"):
+        choices = {name: action.help for name, action in options.items()}
+    else:
+        choices = {} if positional else {name: help_text for name, (_, help_text) in commands.items()}
+        if not words:
+            choices["q"] = tr("Close the interactive screen", "対話画面を閉じる")
     return start, [
-        name for name in choices if not name.startswith("_") and name.startswith(prefix)
+        Suggestion(name, help_text or "") for name, help_text in choices.items()
+        if not name.startswith("_") and name.startswith(prefix)
     ]
 
 
@@ -135,7 +145,8 @@ def parser_candidates(parser):
     options = {}
     for action in parser._actions:
         if isinstance(action, argparse._SubParsersAction):
-            commands.update(action.choices)
+            descriptions = {action.choices[entry.dest]: entry.help for entry in action._choices_actions}
+            commands.update((name, (child, descriptions.get(child))) for name, child in action.choices.items())
         elif action.help != argparse.SUPPRESS:
             options.update((name, action) for name in action.option_strings)
     return commands, options
@@ -538,7 +549,8 @@ def prompt_frame(view, message, line, candidates, selected, size, offset):
             first = max(0, selected - page + 1)
             for index, candidate in enumerate(candidates[first:first + page], first):
                 marker = ">" if index == selected else " "
-                footer.append(f"{marker} {candidate}")
+                description = f": {candidate.help}" if candidate.help else ""
+                footer.append(f"{marker} {candidate.name}{description}")
         else:
             footer.append(tr("Enter run  / commands  PgUp/PgDn scroll", "Enter で実行  / で候補  PgUp/PgDn でスクロール"))
     separator = ["-" * width] if rows >= 4 else []
@@ -606,7 +618,7 @@ def read_windows_prompt(parser, message, vt):
             else:
                 previous = line
                 if key == "\t" and candidates:
-                    line = line[:start] + candidates[selected] + " "
+                    line = line[:start] + candidates[selected].name + " "
                 elif key == "\b" and line:
                     line = line[:-1]
                 elif len(key) == 1 and key.isprintable():

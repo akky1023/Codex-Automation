@@ -394,16 +394,20 @@ def add_commands(commands):
     commands.add_parser("sync", help=tr("Synchronize linked Nextcloud Tasks lists", "連携した Nextcloud Tasks のリストを同期"))
     parser = commands.add_parser("nextcloud", help=tr("Manage Nextcloud Tasks integration", "Nextcloud Tasks 連携を管理"))
     actions = parser.add_subparsers(dest="nc_action", required=True)
-    for name in ("connect", "disconnect", "lists"):
-        actions.add_parser(name)
-    link = actions.add_parser("link")
-    link.add_argument("--list", required=True)
-    link.add_argument("--project-id", type=int, required=True)
-    resolve = actions.add_parser("resolve")
+    for name, help_text in (
+        ("connect", tr("Connect to Nextcloud", "Nextcloud に接続")),
+        ("disconnect", tr("Disconnect from Nextcloud", "Nextcloud との接続を解除")),
+        ("lists", tr("Show Nextcloud task lists", "Nextcloud のタスクリストを表示")),
+    ):
+        actions.add_parser(name, help=help_text)
+    link = actions.add_parser("link", help=tr("Link a task list to a project", "タスクリストをプロジェクトに連携"))
+    link.add_argument("--list", required=True, help=tr("Nextcloud list ID", "Nextcloud のリスト ID"))
+    link.add_argument("--project-id", type=int, required=True, help=tr("Project ID", "プロジェクト ID"))
+    resolve = actions.add_parser("resolve", help=tr("Resolve a completion conflict", "完了状態の競合を解決"))
     resolve.add_argument("id", type=int)
     choice = resolve.add_mutually_exclusive_group(required=True)
-    choice.add_argument("--complete", action="store_true")
-    choice.add_argument("--keep-remote", action="store_true")
+    choice.add_argument("--complete", action="store_true", help=tr("Mark the Nextcloud task complete", "Nextcloud のタスクを完了にする"))
+    choice.add_argument("--keep-remote", action="store_true", help=tr("Keep the Nextcloud task as is", "Nextcloud 側のタスクを保持"))
 
 
 def dispatch(db, args):
