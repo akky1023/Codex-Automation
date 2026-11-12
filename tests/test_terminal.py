@@ -157,6 +157,21 @@ class SuggestionTest(unittest.TestCase):
         finally:
             language.reset(token)
 
+    def test_ctrl_c_exits_the_screen_without_running_a_command(self):
+        token = language.set("en")
+        try:
+            with patch("codex_queue.terminal.saved_language", return_value="en"), patch(
+                "codex_queue.terminal.windows_input", side_effect=KeyboardInterrupt,
+            ), patch("builtins.input", side_effect=KeyboardInterrupt), patch(
+                "codex_queue.terminal.clear",
+            ), patch("codex_queue.terminal.queue_view", return_value="Queue"), patch(
+                "codex_queue.terminal.main",
+            ) as main, contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(0, screen())
+            main.assert_not_called()
+        finally:
+            language.reset(token)
+
     @unittest.skipUnless(os.name == "nt", "Windows console input")
     def test_help_is_formatted_again_when_terminal_width_changes(self):
         with patch("msvcrt.kbhit", side_effect=[False, True]), patch(

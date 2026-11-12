@@ -538,7 +538,7 @@ def screen():
                 message = str(error)
     except KeyboardInterrupt:
         print()
-        return main(["stop"], interactive=False)
+        return 0
     except EOFError:
         return 0
 
