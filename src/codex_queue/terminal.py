@@ -470,8 +470,15 @@ def fill_project(db, argv):
 def prepare(argv):
     if not argv or argv[0] == "help" or "-h" in argv or "--help" in argv:
         return argv
-    if argv[0] == "task" and len(argv) > 1:
+    if argv[0] == "project" and any(
+        flag.split("=", 1)[0] in ("--planner-model", "--implementation-model", "--allowed-models")
+        for flag in argv[1:]
+    ):
+        return argv
+    if argv[0] in ("task", "todo") and len(argv) > 1:
         argv = argv[1:]
+    if argv[0] == "edit" and any(flag.split("=", 1)[0] in ("--abstract", "--plan") for flag in argv[1:]):
+        return argv
     with open_queue() as db:
         if argv[0] == "add":
             return fill_add(db, argv)
