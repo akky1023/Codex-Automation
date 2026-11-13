@@ -30,7 +30,10 @@ CREATE TABLE IF NOT EXISTS projects (
     prompt TEXT NOT NULL DEFAULT '',
     branch TEXT CHECK (branch IN ('per-task', 'current')),
     base TEXT,
-    retired INTEGER NOT NULL DEFAULT 0
+    retired INTEGER NOT NULL DEFAULT 0,
+    planner_model TEXT,
+    implementation_model TEXT,
+    allowed_models TEXT
 );
 CREATE TABLE IF NOT EXISTS tasks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -39,7 +42,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     prompt TEXT NOT NULL DEFAULT '',
     priority INTEGER NOT NULL CHECK (priority BETWEEN 1 AND 9),
     status TEXT NOT NULL DEFAULT 'QUEUED',
-    completed_at TEXT
+    completed_at TEXT,
+    idea_id INTEGER REFERENCES ideas(id),
+    abstract TEXT NOT NULL DEFAULT '',
+    implementation_model TEXT
 );
 CREATE TABLE IF NOT EXISTS ideas (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -69,6 +75,7 @@ CREATE TABLE IF NOT EXISTS attempts (
     retry_at REAL,
     failures INTEGER NOT NULL DEFAULT 0,
     started_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    implementation_model TEXT,
     UNIQUE(task_id, number)
 );
 CREATE TABLE IF NOT EXISTS task_actions (

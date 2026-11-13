@@ -7,6 +7,9 @@ from .store import get_setting
 from .worker import attempt_folder, latest_attempt
 
 
+OUTCOMES = ("DONE", "ABORTED", "WAITING_FOR_INPUT")
+
+
 def latest_progress(attempt):
     directory = attempt_folder(attempt)
     try:
@@ -48,7 +51,7 @@ def queue_status(db):
     running = []
     tasks = []
     replies = []
-    reply_tasks = []
+    results = []
     for row in rows:
         status = row["status"]
         label = f"{row['id']}  {row['project']}  {row['name']}"
@@ -67,11 +70,11 @@ def queue_status(db):
                 running.append(tr("  Preparing workspace", "  作業フォルダを準備中"))
             continue
         waiting = status == "WAITING_FOR_INPUT"
-        destination = reply_tasks if waiting else tasks
+        destination = results if status in OUTCOMES else tasks
         destination.append(f"{status_label(status)}  {label}")
         if waiting:
             replies.append(str(row["id"]))
-        if status in ("QUEUED", "DONE", "ABORTED"):
+        if status in ("QUEUED", "DONE"):
             continue
         attempt = latest_attempt(db, row["id"])
         if attempt:
@@ -82,14 +85,24 @@ def queue_status(db):
                 destination.append("  " + tr("Retry after {time}", "再試行予定 {time}", time=retry.isoformat()))
         if waiting:
             destination.append(f'  cq reply {row["id"]} "..."')
+    ideas = [
+        f"{row['id']}  {row['project']}  {row['title']}"
+        + (tr("  (planned)", "  （計画済み）") if row["planned_at"] else "")
+        for row in db.execute(
+            """SELECT i.*, p.name AS project FROM ideas i JOIN projects p ON p.id=i.project_id
+               ORDER BY i.id"""
+        )
+    ]
+    lines.extend(["", "Idea", *(ideas or [tr("No ideas", "Idea はありません")])])
+    lines.extend(["", "ToDo", tr("In progress", "実行中"), *(running or [tr("No tasks running", "実行中のタスクはありません")])])
+    lines.extend([tr("Tasks", "タスク一覧"), *(tasks or [tr("No other tasks", "ほかのタスクはありません")])])
+    lines.extend(["", "Done / Abort / Waiting_response"])
     if replies:
         lines.append(tr("Replies needed ({count}): {ids}", "返信待ち（{count}件）：{ids}",
                         count=len(replies), ids=", ".join(replies)))
-        lines.extend(reply_tasks)
     else:
         lines.append(tr("No replies needed", "返信待ちのタスクはありません"))
-    lines.extend(["", tr("In progress", "実行中"), *(running or [tr("No tasks running", "実行中のタスクはありません")])])
-    lines.extend(["", tr("Tasks", "タスク一覧"), *(tasks or [tr("No other tasks", "ほかのタスクはありません")])])
+    lines.extend(results)
     if error := get_setting(db, "nextcloud_error"):
         lines.append(error)
     return "\n".join(lines)

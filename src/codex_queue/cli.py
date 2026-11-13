@@ -10,14 +10,16 @@ import tempfile
 from .actions import queue_control, task_action, wake
 from .arguments import ArgumentParser, parser_candidates
 from .language import LANGUAGES, language, status_label, tr
+from .planner import plan_idea
 from .runtime import register_schedule, setup
-from .status import queue_status
+from .status import OUTCOMES, queue_status
 from .store import DEFAULTS, get_setting, open_queue, saved_language, settings, update, write
 from .text_layout import print_wrapped
 from .worker import latest_attempt, run_worker
 
 
 BRANCH_MODES = ("per-task", "current")
+MODEL_SETTINGS = ("planner_model", "implementation_model", "allowed_models")
 
 
 class QueueError(Exception):
@@ -43,7 +45,8 @@ def by_id(db, table, row_id):
     active = " AND retired = 0" if table == "projects" else ""
     row = db.execute(f"SELECT * FROM {table} WHERE id = ?{active}", (row_id,)).fetchone()
     if row is None:
-        entity = tr("project", "プロジェクト") if table == "projects" else tr("task", "タスク")
+        entity = {"projects": tr("project", "プロジェクト"), "tasks": tr("task", "タスク"),
+                  "ideas": tr("idea", "アイデア")}[table]
         raise QueueError(tr("Unknown {entity} ID {id}", "{entity} ID {id} が見つかりません", entity=entity, id=row_id))
     return row
 
@@ -72,7 +75,8 @@ def path_project(db, root, create=False):
         return by_id(db, "projects", cursor.lastrowid)
     db.execute(
         """UPDATE projects SET retired = 0, name = ?, prompt = '',
-                  branch = NULL, base = NULL WHERE id = ?""",
+                  branch = NULL, base = NULL, planner_model = NULL,
+                  implementation_model = NULL, allowed_models = NULL WHERE id = ?""",
         (root.name, row["id"]),
     )
     return by_id(db, "projects", row["id"])
@@ -112,7 +116,10 @@ def edit_prompt(prompt):
 
 
 def project_options(args):
-    values = changes(args, "name", "prompt", "branch", "base")
+    values = changes(args, "name", "prompt", "branch", "base", *MODEL_SETTINGS)
+    for key in MODEL_SETTINGS:
+        if values.get(key) == "inherit":
+            values[key] = None
     if args.branch == "":
         values["branch"] = None
     if args.base in ("inherit", "unset"):
@@ -132,6 +139,9 @@ def show_project(db, row):
     print(tr("Branch: {branch}\nBase: {base}\nPrompt: {prompt}",
              "ブランチ運用：{branch}\n開始元：{base}\n指示：{prompt}",
              branch=branch, base=base or unset, prompt=row["prompt"]))
+    for key in MODEL_SETTINGS:
+        value = (row[key] or unset) if row[key] is not None else f"{defaults[key] or unset} {inherited}"
+        print(f"{key.replace('_', '-')}  {value}")
 
 
 def manage_project(db, args):
@@ -142,6 +152,9 @@ def manage_project(db, args):
     with write(db):
         if action in ("rm", "remove"):
             row = by_id(db, "projects", args.id)
+            if db.execute("SELECT 1 FROM ideas WHERE project_id = ? AND planned_at IS NULL",
+                          (row["id"],)).fetchone():
+                raise QueueError(tr("Plan or remove outstanding ideas first.", "未計画の Idea を計画するか削除してください。"))
             if db.execute(
                 "SELECT 1 FROM tasks WHERE project_id = ? AND status NOT IN ('DONE', 'ABORTED', 'REMOVED')",
                 (row["id"],),
@@ -175,17 +188,37 @@ def manage_project(db, args):
 
 def manage_task(db, args):
     action = args.command
+    if action == "show":
+        row = db.execute(
+            """SELECT t.*, p.name AS project, i.title AS idea_title FROM tasks t
+               JOIN projects p ON p.id = t.project_id LEFT JOIN ideas i ON i.id = t.idea_id
+               WHERE t.id = ?""", (args.id,),
+        ).fetchone()
+        if row is None:
+            raise QueueError(tr("Unknown task ID {id}", "タスク ID {id} が見つかりません", id=args.id))
+        print(f"{row['id']}  {status_label(row['status'])}  {row['name']}\nProject  {row['project']}")
+        if row["idea_id"] is not None:
+            print(f"Original idea  {row['idea_id']}  {row['idea_title']}\n\nAbstract\n{row['abstract']}")
+        print(f"\nPlan\n{row['prompt']}")
+        if row["implementation_model"]:
+            print(f"\nImplementation model  {row['implementation_model']}")
+        return
     if action in ("ls", "list"):
         if get_setting(db, "enabled") != "1":
             print(tr("Automatic execution paused.", "自動実行は一時停止中です。"))
         if error := get_setting(db, "nextcloud_error"):
             print(error)
+        section = "ToDo"
+        print(section)
         for row in db.execute(
             """SELECT t.*, p.name AS project_name, r.writeback, r.blocked FROM tasks t
                JOIN projects p ON p.id = t.project_id LEFT JOIN remote_tasks r ON r.task_id = t.id
                WHERE t.status <> 'REMOVED'
-               ORDER BY (t.status = 'DONE'), t.priority, t.id"""
+               ORDER BY (t.status IN ('DONE', 'ABORTED', 'WAITING_FOR_INPUT')), t.priority, t.id"""
         ):
+            if row["status"] in OUTCOMES and section == "ToDo":
+                section = "Done / Abort / Waiting_response"
+                print(section)
             print(f"{row['id']}\t{row['project_name']}\t{status_label(row['status'])}\t{row['name']}")
             if row["status"] not in ("DONE", "QUEUED"):
                 attempt = latest_attempt(db, row["id"])
@@ -222,13 +255,63 @@ def manage_task(db, args):
             if action == "edit":
                 if db.execute("SELECT 1 FROM remote_tasks WHERE task_id = ?", (row["id"],)).fetchone():
                     raise QueueError(tr("Edit imported tasks in Nextcloud.", "取り込んだタスクは Nextcloud で編集してください。"))
-                update(db, "tasks", row["id"], changes(args, "name", "prompt", "priority"))
+                values = changes(args, "name", "abstract", "prompt", "priority")
+                if row["idea_id"] is not None and any(
+                    key in values and not values[key].strip() for key in ("name", "abstract", "prompt")
+                ):
+                    raise QueueError(tr("Title, abstract and plan are required.", "タイトル、要約、実装計画は必須です。"))
+                update(db, "tasks", row["id"], values)
                 message = tr("Updated task {id}.", "タスク {id} を更新しました。", id=row["id"])
             else:
                 update(db, "tasks", row["id"], {"status": "REMOVED"})
                 message = tr("Removed task {id}.", "タスク {id} を削除しました。", id=row["id"])
     print(message)
     wake(db)
+
+
+def manage_idea(db, args):
+    action = args.idea_action
+    if action == "plan":
+        ids = plan_idea(db, args.id)
+        print(tr("Added ToDo {ids}.", "ToDo {ids} を追加しました。", ids=", ".join(map(str, ids))))
+        wake(db)
+        return
+    if action in ("ls", "list", "show"):
+        if action == "show":
+            by_id(db, "ideas", args.id)
+        for row in db.execute(
+            """SELECT i.*, p.name AS project FROM ideas i JOIN projects p ON p.id = i.project_id
+               WHERE ? IS NULL OR i.id = ? ORDER BY i.id""",
+            (getattr(args, "id", None), getattr(args, "id", None)),
+        ):
+            state = tr("Planned", "計画済み") if row["planned_at"] else tr("Unplanned", "未計画")
+            print(f"{row['id']}\t{row['project']}\t{state}\t{row['title']}")
+            if action == "show":
+                if row["detail"]:
+                    print(row["detail"])
+                for task in db.execute("SELECT id, name FROM tasks WHERE idea_id = ? AND status <> 'REMOVED' ORDER BY id", (row["id"],)):
+                    print(f"ToDo {task['id']}  {task['name']}")
+        return
+    with write(db):
+        values = changes(args, "title", "detail") if action in ("add", "edit") else {}
+        if "title" in values:
+            values["title"] = values["title"].strip()
+            if not values["title"] or len(values["title"].splitlines()) != 1:
+                raise QueueError(tr("Enter a single-line title.", "タイトルを1行で入力してください。"))
+        if action == "add":
+            project = project_for_task(db, args)
+            cursor = db.execute("INSERT INTO ideas(project_id, title, detail) VALUES (?, ?, ?)",
+                                (project["id"], values["title"], values.get("detail", "")))
+            idea_id = cursor.lastrowid
+        else:
+            idea_id = args.id
+            if by_id(db, "ideas", idea_id)["planned_at"]:
+                raise QueueError(tr("This idea already has ToDos.", "この Idea にはすでに ToDo があります。"))
+            if action == "edit":
+                update(db, "ideas", idea_id, values)
+            else:
+                db.execute("DELETE FROM ideas WHERE id = ?", (idea_id,))
+    print(f"Idea {idea_id}")
 
 
 def configure(db, args):
@@ -255,6 +338,8 @@ def positive(value):
 
 
 def task_commands(subparsers):
+    show = subparsers.add_parser("show", help=tr("Show a ToDo and its plan", "ToDo と実装計画を表示"))
+    show.add_argument("id", type=positive)
     add = subparsers.add_parser("add", help=tr("Add a task", "タスクを追加"))
     add.add_argument("name")
     target = add.add_mutually_exclusive_group()
@@ -268,8 +353,9 @@ def task_commands(subparsers):
     edit = subparsers.add_parser("edit", help=tr("Edit a task", "タスクを編集"))
     edit.add_argument("id", type=positive)
     edit.add_argument("--name", help=tr("Task title", "タスク名"))
+    edit.add_argument("--abstract", help=tr("ToDo summary", "ToDo の要約"))
     prompt = edit.add_mutually_exclusive_group()
-    prompt.add_argument("--prompt", help=tr("Task instructions", "タスクの指示"))
+    prompt.add_argument("--prompt", "--plan", help=tr("Implementation plan", "実装計画"))
     prompt.add_argument("--prompt-file", type=Path, help=tr("Read UTF-8 task instructions from a file", "UTF-8 のファイルからタスクの指示を読み込む"))
     edit.add_argument("--priority", type=int, choices=range(1, 10), metavar="1-9", help=tr("Task priority", "タスクの優先度"))
     remove = subparsers.add_parser("rm", aliases=["remove"], help=tr("Remove a task", "タスクを削除"))
@@ -277,7 +363,27 @@ def task_commands(subparsers):
     subparsers.add_parser("ls", aliases=["list"], help=tr("List tasks", "タスクを一覧表示"))
 
 
+def model_arguments(parser, project=False):
+    suffix = tr(" (use inherit to use the global setting)", "（inherit で全体設定を継承）") if project else ""
+    parser.add_argument("--planner-model", help=tr("Idea planning model", "Idea の計画モデル") + suffix)
+    parser.add_argument("--implementation-model", help=tr("Default ToDo implementation model", "ToDo の既定の実装モデル") + suffix)
+    parser.add_argument("--allowed-models", type=allowed_models,
+                        help=tr("Planner-selectable models, comma-separated, lowest capability first",
+                                "計画モデルが選べる実装モデルを性能の低い順にカンマ区切りで指定") + suffix)
+
+
+def allowed_models(value):
+    if not value.strip():
+        return ""
+    models = [model.strip() for model in value.split(",")]
+    if not all(models) or len(set(models)) != len(models):
+        raise argparse.ArgumentTypeError(tr("Enter distinct model names separated by commas.",
+                                           "異なるモデル名をカンマ区切りで指定してください。"))
+    return ",".join(models)
+
+
 def project_arguments(parser, editing=False):
+    model_arguments(parser, project=True)
     parser.add_argument("--name", help=tr("Project name", "プロジェクト名"))
     parser.add_argument("--path", help=tr("Repository path", "リポジトリのパス"))
     parser.add_argument("--prompt", help=tr("Project instructions", "プロジェクトの共通指示"))
@@ -291,8 +397,28 @@ def make_parser():
     commands = parser.add_subparsers(dest="command")
     task_commands(commands)
     commands.add_parser("status", help=tr("Show queue status and tasks awaiting a reply", "キューの状況と返信待ちのタスクを表示"))
-    task = commands.add_parser("task", help=tr("Manage tasks", "タスクを管理"))
+    task = commands.add_parser("task", aliases=["todo"], help=tr("Manage ToDos", "ToDo を管理"))
     task_commands(task.add_subparsers(dest="command", required=True))
+    idea = commands.add_parser("idea", help=tr("Register ideas and plan ToDos", "Idea の登録と ToDo の計画"))
+    idea_actions = idea.add_subparsers(dest="idea_action", required=True)
+    add_idea = idea_actions.add_parser("add", help=tr("Register an idea", "Idea を登録"))
+    add_idea.add_argument("title")
+    add_idea.add_argument("--detail")
+    target = add_idea.add_mutually_exclusive_group()
+    target.add_argument("--project")
+    target.add_argument("--project-id", type=positive)
+    idea_actions.add_parser("ls", aliases=["list"], help=tr("List ideas", "Idea を一覧表示"))
+    for action, description in (
+        ("show", tr("Show an idea and its ToDos", "Idea と子 ToDo を表示")),
+        ("edit", tr("Edit an unplanned idea", "未計画の Idea を編集")),
+        ("rm", tr("Remove an unplanned idea", "未計画の Idea を削除")),
+        ("plan", tr("Generate and queue ToDos for an idea", "Idea から ToDo を生成してキューに登録")),
+    ):
+        item = idea_actions.add_parser(action, help=description)
+        item.add_argument("id", type=positive)
+        if action == "edit":
+            item.add_argument("--title")
+            item.add_argument("--detail")
     project = commands.add_parser("project", help=tr("Manage projects", "プロジェクトを管理"))
     project_arguments(project)
     actions = project.add_subparsers(dest="project_action")
@@ -305,6 +431,7 @@ def make_parser():
     remove.add_argument("id", type=positive)
 
     config = commands.add_parser("config", aliases=["settings"], help=tr("Manage queue defaults", "キューの設定を管理"))
+    model_arguments(config)
     config.add_argument("--parallel", type=positive, help=tr("Maximum concurrent tasks", "同時に実行するタスク数の上限"))
     config.add_argument("--priority", type=int, choices=range(1, 10), metavar="1-9", help=tr("Default task priority", "タスクの既定の優先度"))
     config.add_argument("--branch", choices=BRANCH_MODES, help=tr("Default branch mode", "既定のブランチ運用"))
@@ -409,6 +536,8 @@ def run_cli(argv, interactive):
         with open_queue() as db:
             if args.command == "project":
                 manage_project(db, args)
+            elif args.command == "idea":
+                manage_idea(db, args)
             elif args.command == "status":
                 print_wrapped(queue_status(db))
             elif args.command in ("config", "settings"):
