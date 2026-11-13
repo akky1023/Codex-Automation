@@ -35,9 +35,18 @@ jobs:
           $wheel = Get-ChildItem dist/*.whl
           python -m pip install $wheel.FullName
           cq --help
+      - name: Record the wheel SHA-256
+        if: inputs.wheel-artifact
+        shell: pwsh
+        run: |
+          $wheel = Get-Item dist/*.whl
+          $hash = (Get-FileHash -LiteralPath $wheel.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText((Join-Path $PWD 'dist/SHA256SUMS'), "${hash}  $($wheel.Name)`n")
       - uses: actions/upload-artifact@v4
         if: inputs.wheel-artifact
         with:
           name: codex-queue-wheel
-          path: dist/*.whl
+          path: |
+            dist/*.whl
+            dist/SHA256SUMS
           if-no-files-found: error
