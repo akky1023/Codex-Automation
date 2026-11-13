@@ -12,6 +12,9 @@ DEFAULTS = {
     "on_abort": "pause",
     "sync": "auto",
     "language": "en",
+    "planner_model": "",
+    "implementation_model": "",
+    "allowed_models": "",
 }
 
 SCHEMA = """
@@ -37,6 +40,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     priority INTEGER NOT NULL CHECK (priority BETWEEN 1 AND 9),
     status TEXT NOT NULL DEFAULT 'QUEUED',
     completed_at TEXT
+);
+CREATE TABLE IF NOT EXISTS ideas (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL REFERENCES projects(id),
+    title TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '',
+    planned_at TEXT
 );
 CREATE INDEX IF NOT EXISTS tasks_queue ON tasks(status, priority, id);
 CREATE TABLE IF NOT EXISTS attempts (
@@ -86,6 +96,15 @@ CREATE TABLE IF NOT EXISTS remote_tasks (
 );
 """
 
+WORKFLOW_COLUMNS = {
+    "projects": ("planner_model TEXT", "implementation_model TEXT", "allowed_models TEXT"),
+    "tasks": (
+        "idea_id INTEGER REFERENCES ideas(id)", "abstract TEXT NOT NULL DEFAULT ''",
+        "implementation_model TEXT",
+    ),
+    "attempts": ("implementation_model TEXT",),
+}
+
 
 def queue_folder(create=True):
     home = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".local" / "share")
@@ -113,6 +132,12 @@ def open_queue():
     try:
         db.execute("PRAGMA foreign_keys = ON")
         db.executescript(SCHEMA)
+        with write(db):
+            for table, definitions in WORKFLOW_COLUMNS.items():
+                existing = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
+                for definition in definitions:
+                    if definition.split()[0] not in existing:
+                        db.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
         yield db
     finally:
         db.close()
