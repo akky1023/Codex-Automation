@@ -129,7 +129,7 @@ def claim(db, scheduled, attempted, authenticated, remote_ready):
                       i.title AS idea_title, i.detail AS idea_detail
                FROM tasks t JOIN projects p ON p.id = t.project_id
                LEFT JOIN ideas i ON i.id = t.idea_id
-               WHERE t.status NOT IN ('DONE', 'ABORTED', 'REMOVED')
+               WHERE t.status NOT IN ('DONE', 'ABORTED', 'REMOVED', 'SUPERSEDED')
                ORDER BY t.priority, t.id"""
         ).fetchall()
         running = {row["path"] for row in rows if row["status"] == "RUNNING"}
@@ -185,16 +185,22 @@ def prepare(db, attempt):
     if attempt["phase"] == "PREPARING":
         if not clean(path):
             raise RuntimeError("The worktree has uncommitted or untracked changes.")
-        if current.startswith("codex/queue-"):
+        task = db.execute("SELECT revision_of FROM tasks WHERE id = ?", (attempt["task_id"],)).fetchone()
+        prior = latest_attempt(db, task["revision_of"]) if task["revision_of"] is not None else None
+        continuing = prior and current == prior["branch"] and attempt["mode"] == "per-task"
+        if current.startswith("codex/queue-") and not continuing:
             raise RuntimeError("Switch away from the previous queue branch first.")
-        base = current if attempt["mode"] == "current" else attempt["base"] or current
+        original = prior["original_branch"] if continuing else current
+        base = current if continuing or attempt["mode"] == "current" else attempt["base"] or current
+        if prior and prior["end_commit"] and attempt["mode"] == "per-task":
+            base = prior["branch"]
         commit = git(path, "rev-parse", "--verify", f"refs/heads/{base}^{{commit}}")
         target = current
         if attempt["mode"] == "per-task":
             target = f"codex/queue-{attempt['task_id']}-{attempt['number']}"
         with write(db):
             update(db, "attempts", attempt["id"], {
-                "original_branch": current, "branch": target, "start_commit": commit,
+                "original_branch": original, "branch": target, "start_commit": commit,
                 "base": base, "phase": "CHECKOUT",
             })
         if target != current:

@@ -46,7 +46,7 @@ def queue_status(db):
     lines = ["Codex Queue", tr("Automatic execution enabled", "自動実行は有効です") if get_setting(db, "enabled") == "1" else tr("Automatic execution paused", "自動実行は一時停止中です")]
     rows = db.execute(
         """SELECT t.*, p.name AS project FROM tasks t JOIN projects p ON p.id=t.project_id
-           WHERE t.status <> 'REMOVED' ORDER BY t.priority, t.id"""
+           WHERE t.status NOT IN ('REMOVED', 'SUPERSEDED') ORDER BY t.priority, t.id"""
     )
     running = []
     tasks = []

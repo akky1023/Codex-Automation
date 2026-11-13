@@ -10,10 +10,10 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
-from codex_queue.cli import make_parser, manage_project, manage_task
+from codex_queue.cli import make_parser, manage_project, manage_idea
 from codex_queue.language import language
 from codex_queue.store import SCHEMA
-from codex_queue.terminal import Suggestion, command_text, completion, draw_prompt, edit_field, fill_project, fill_task, prompt_frame, queue_view, screen, tokens, windows_input
+from codex_queue.terminal import Suggestion, command_text, completion, draw_prompt, edit_field, fill_project, fill_idea, prompt_frame, queue_view, screen, tokens, windows_input
 from codex_queue.text_layout import text_width, wrap_rows
 from codex_queue.windows_console import ConsoleInput, InputRecord, KeyEvent
 
@@ -77,8 +77,8 @@ class SuggestionTest(unittest.TestCase):
         self.assertEqual("project", command_text(line[:start] + choices[0].name))
 
     def test_subcommands_and_options_follow_parser(self):
-        self.assertEqual([Suggestion("edit", "Edit a task")], completion(self.parser, "task e")[1])
-        self.assertEqual([Suggestion("--priority", "Task priority")], completion(self.parser, "task edit 42 --pri")[1])
+        self.assertEqual([], completion(self.parser, "task e")[1])
+        self.assertEqual([Suggestion("--detail")], completion(self.parser, "idea edit 42 --de")[1])
         self.assertEqual([Suggestion("resolve", "Resolve a completion conflict")], completion(self.parser, "/nextcloud re")[1])
         self.assertNotIn("_worker", [candidate.name for candidate in completion(self.parser, "/")[1]])
 
@@ -86,7 +86,7 @@ class SuggestionTest(unittest.TestCase):
         for line, expected in (
             ("config --language j", "ja"),
             ("project edit 3 --branch=per", "per-task"),
-            ("task edit 42 --priority 3", "3"),
+            ("config --priority 3", "3"),
             ("project --base in", "inherit"),
         ):
             with self.subTest(line=line):
@@ -108,7 +108,7 @@ class SuggestionTest(unittest.TestCase):
             completed = line[:start] + choices[0].insertion
             self.assertEqual(["project", "add", "--path=" + str(directory) + os.sep], tokens(command_text(completed)))
             self.assertEqual([nested.name + os.sep], [choice.name for choice in completion(self.parser, completed)[1]])
-            files = completion(self.parser, f'add example --prompt-file "{Path(folder) / "Project i"}')[1]
+            files = completion(self.parser, f'todo revise 1 request --context-file "{Path(folder) / "Project i"}')[1]
             self.assertEqual([file.name], [choice.name for choice in files])
             self.assertTrue(files[0].insertion.endswith(" "))
 
@@ -166,25 +166,20 @@ class SuggestionTest(unittest.TestCase):
                 self.assertEqual("日本", edit_field("name", "Task title", "日"))
 
     @unittest.skipUnless(os.name == "nt", "Windows console input")
-    def test_project_and_task_edits_omit_unchanged_options(self):
+    def test_project_and_idea_edits_omit_unchanged_options(self):
         with contextlib.closing(sqlite3.connect(":memory:")) as db:
             db.row_factory = sqlite3.Row
             db.executescript(SCHEMA)
             db.execute("""INSERT INTO projects(path, path_key, name, prompt, branch, base)
                           VALUES ('old folder', 'old', 'Project', 'Keep me', 'current', 'main')""")
-            db.execute("INSERT INTO tasks(project_id, name, prompt, priority) VALUES (1, 'Task', 'Keep me too', 5)")
-            db.execute("INSERT INTO settings(key, value) VALUES ('priority', '7')")
+            db.execute("INSERT INTO ideas(project_id, title, detail) VALUES (1, 'Idea', 'Keep me too')")
             db.commit()
 
             def complete_field(parser, message, *, show_queue, complete, initial):
                 self.assertEqual((0, []), complete(""))
                 if message.startswith("Project name"):
                     return "New project name"
-                if message.startswith("Priority"):
-                    _, candidates = complete("3")
-                    self.assertEqual([Suggestion("3", insertion="3")], candidates)
-                    return candidates[0].insertion
-                if "instructions" in message:
+                if "instructions" in message or "Idea details" in message:
                     return ""
                 return initial
 
@@ -192,23 +187,23 @@ class SuggestionTest(unittest.TestCase):
                 "codex_queue.terminal.confirmed", side_effect=lambda command, prompted: command,
             ):
                 self.assertEqual(["project", "edit", "1", "--name=New project name", "--prompt="], fill_project(db, ["project", "edit", "1"]))
-                self.assertEqual(["edit", "1", "--prompt=", "--priority=3"], fill_task(db, ["edit", "1"]))
+                self.assertEqual(["edit", "1", "--detail="], fill_idea(db, ["edit", "1"]))
             with patch("codex_queue.terminal.windows_input", side_effect=lambda *args, initial, **kwargs: initial):
                 self.assertIsNone(fill_project(db, ["project", "edit", "1"]))
-                self.assertIsNone(fill_task(db, ["edit", "1"]))
+                self.assertIsNone(fill_idea(db, ["edit", "1"]))
 
             def clear_field(parser, message, *, show_queue, complete, initial):
-                return initial if message.startswith("Repository path") else ""
+                return initial if message.startswith(("Repository path", "Idea title")) else ""
 
             with patch("codex_queue.terminal.windows_input", side_effect=clear_field), patch(
                 "codex_queue.terminal.screen_input", return_value="y",
             ), patch("codex_queue.cli.wake"), contextlib.redirect_stdout(io.StringIO()):
                 project = fill_project(db, ["project", "edit", "1"])
-                task = fill_task(db, ["edit", "1"])
+                idea = fill_idea(db, ["edit", "1"])
                 manage_project(db, self.parser.parse_args(project))
-                manage_task(db, self.parser.parse_args(task))
+                manage_idea(db, self.parser.parse_args(idea))
             self.assertEqual(("", "", None, ""), tuple(db.execute("SELECT name, prompt, branch, base FROM projects").fetchone()))
-            self.assertEqual(("", "", 7), tuple(db.execute("SELECT name, prompt, priority FROM tasks").fetchone()))
+            self.assertEqual(("Idea", ""), tuple(db.execute("SELECT title, detail FROM ideas").fetchone()))
 
     def test_help_completes_nested_topics(self):
         self.assertEqual([Suggestion("help", "Show command help")], completion(self.parser, "/he")[1])
@@ -269,13 +264,13 @@ class SuggestionTest(unittest.TestCase):
             parser = make_parser()
             _, candidates = completion(parser, "/a")
             frame, _, _, _ = prompt_frame("Queue", "", "/a", candidates, 0, (80, 12), 0)
-            self.assertIn("> add: タスクを追加", frame)
-            self.assertIn(Suggestion("remove", "タスクを削除"), completion(parser, "/rem")[1])
+            self.assertIn("> add: Idea を登録", frame)
+            self.assertIn(Suggestion("remove", "未計画の Idea を削除"), completion(parser, "/rem")[1])
         finally:
             language.reset(token)
 
     def test_no_completion_in_argument_values(self):
-        for line in ('add "title --pr', 'add x --prompt --pr', 'add -- --pr'):
+        for line in ('add "title --pr', 'add x --detail --pr', 'add -- --pr'):
             with self.subTest(line=line):
                 self.assertEqual([], completion(self.parser, line)[1])
 
@@ -376,7 +371,7 @@ class QueueViewTest(unittest.TestCase):
 
             self.assertIn("language: en", cq("config"))
             self.assertIn("language: ja", cq("config", "--language", "ja"))
-            self.assertIn("自動実行は一時停止中です。", cq("ls"))
+            self.assertIn("自動実行は一時停止中です。", cq("task", "ls"))
             help_ja = cq("config", "--help")
             for label in ("使い方: cq config", "オプション:", "このヘルプを表示して終了", "表示言語"):
                 self.assertIn(label, help_ja)
@@ -384,7 +379,7 @@ class QueueViewTest(unittest.TestCase):
             self.assertNotIn("show this help message", help_ja)
             all_commands = cq("help")
             self.assertIn("コマンド一覧", all_commands)
-            self.assertIn("add: タスクを追加", all_commands)
+            self.assertIn("add: Idea を登録", all_commands)
             self.assertIn("task list: タスクを一覧表示", all_commands)
             self.assertIn("nextcloud resolve:", all_commands)
             self.assertNotIn("_worker", all_commands)
@@ -394,7 +389,7 @@ class QueueViewTest(unittest.TestCase):
             cq("config", "--language", "de", code=2)
             self.assertIn("language: ja", cq("config"))
             self.assertIn("language: en", cq("config", "--language", "en"))
-            self.assertIn("Automatic execution paused.", cq("ls"))
+            self.assertIn("Automatic execution paused.", cq("task", "ls"))
             help_en = cq("config", "--help")
             self.assertIn("usage: cq config", help_en)
             self.assertIn("show this help message and exit", help_en)

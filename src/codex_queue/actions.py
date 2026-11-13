@@ -15,7 +15,7 @@ def wake(db):
         "SELECT 1 FROM ideas WHERE planned_at IS NULL AND planning_error IS NULL"
     ).fetchone()
     if not automatic_planning and db.execute("SELECT 1 FROM tasks WHERE status IN (?,?,?,?,?)", HOLD).fetchone():
-        print(tr("Queue is waiting. Run cq ls for details.", "キューは待機中です。詳細は cq ls で確認できます。"))
+        print(tr("Queue is waiting. Run cq task ls for details.", "キューは待機中です。詳細は cq task ls で確認できます。"))
         return
     try:
         requested = request_worker(db)
@@ -62,7 +62,7 @@ def task_action(db, args):
             raise RuntimeError(tr("Unknown task ID {id}", "タスク ID {id} が見つかりません", id=args.id))
         status = task["status"]
         attempt = latest_attempt(db, args.id)
-        if status in ("RUNNING", "DONE", "REMOVED") or attempt is None:
+        if status in ("RUNNING", "DONE", "REMOVED", "SUPERSEDED") or attempt is None:
             raise RuntimeError(tr("Cannot {action} task {id} in state {status}.",
                                   "状態が「{status}」のタスク {id} に {action} は実行できません。",
                                   action=action, id=args.id, status=status_label(status)))

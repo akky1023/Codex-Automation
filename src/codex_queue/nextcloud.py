@@ -300,7 +300,7 @@ def apply_snapshot(db, identity, links, snapshot, failed):
         if status == "DONE":
             db.execute("UPDATE remote_tasks SET list=?, url=? WHERE task_id=?", (collection, url, task_id))
             continue
-        if status in ("REMOVED", "ABORTED"):
+        if status in ("REMOVED", "ABORTED", "SUPERSEDED"):
             continue
         moved = project != row["project_id"]
         db.execute(
@@ -314,7 +314,7 @@ def apply_snapshot(db, identity, links, snapshot, failed):
         if not remote_done and (status == "QUEUED" or moved):
             update(db, "tasks", task_id, {"name": title, "prompt": prompt, "priority": priority})
     for row in existing.values():
-        if row["list"] not in links or row["status"] in ("DONE", "REMOVED", "ABORTED"):
+        if row["list"] not in links or row["status"] in ("DONE", "REMOVED", "ABORTED", "SUPERSEDED"):
             continue
         db.execute("UPDATE remote_tasks SET pending_remove=1, pending_project=NULL WHERE task_id=?", (row["task_id"],))
         if row["status"] != "RUNNING":

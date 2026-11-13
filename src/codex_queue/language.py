@@ -26,4 +26,5 @@ def status_label(status):
         "AUTH_REQUIRED": "認証待ち",
         "RETRY_WAIT": "再試行待ち",
         "REMOVED": "削除済み",
+        "SUPERSEDED": "修正 ToDo に移行済み",
     }.get(status, status)

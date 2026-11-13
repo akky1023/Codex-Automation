@@ -46,7 +46,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     completed_at TEXT,
     idea_id INTEGER REFERENCES ideas(id),
     abstract TEXT NOT NULL DEFAULT '',
-    implementation_model TEXT
+    implementation_model TEXT,
+    revision_of INTEGER REFERENCES tasks(id)
 );
 CREATE TABLE IF NOT EXISTS ideas (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -110,7 +111,7 @@ WORKFLOW_COLUMNS = {
     "projects": ("planner_model TEXT", "implementation_model TEXT", "allowed_models TEXT"),
     "tasks": (
         "idea_id INTEGER REFERENCES ideas(id)", "abstract TEXT NOT NULL DEFAULT ''",
-        "implementation_model TEXT",
+        "implementation_model TEXT", "revision_of INTEGER REFERENCES tasks(id)",
     ),
     "attempts": ("implementation_model TEXT",),
 }

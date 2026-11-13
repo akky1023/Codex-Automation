@@ -2,15 +2,13 @@ import argparse
 from datetime import datetime
 import os
 from pathlib import Path
-import shlex
 import sqlite3
 import subprocess
-import tempfile
 
 from .actions import queue_control, task_action, wake
 from .arguments import ArgumentParser, parser_candidates
 from .language import LANGUAGES, language, status_label, tr
-from .planner import plan_idea
+from .planner import plan_idea, revise_task
 from .runtime import register_schedule, setup
 from .status import OUTCOMES, queue_status
 from .store import DEFAULTS, get_setting, open_queue, saved_language, settings, update, write
@@ -82,7 +80,7 @@ def path_project(db, root, create=False):
     return by_id(db, "projects", row["id"])
 
 
-def project_for_task(db, args):
+def project_for_idea(db, args):
     if args.project_id is not None:
         return by_id(db, "projects", args.project_id)
     if args.project is not None:
@@ -97,22 +95,6 @@ def project_for_task(db, args):
         show_projects(active_projects(db))
         raise QueueError(tr("Use --project NAME or --project-id ID outside a Git repository.", "Git リポジトリの外では --project NAME または --project-id ID を指定してください。")) from None
     return path_project(db, root, create=True)
-
-
-def edit_prompt(prompt):
-    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
-    if not editor and os.name != "nt":
-        raise QueueError(tr("Set VISUAL or EDITOR to use --edit.", "--edit を使うには VISUAL または EDITOR を設定してください。"))
-    with tempfile.TemporaryDirectory() as folder:
-        file = Path(folder) / "prompt.txt"
-        file.write_text(prompt, encoding="utf-8")
-        if os.name == "nt":
-            command = f"{editor or 'notepad.exe'} {subprocess.list2cmdline([str(file)])}"
-        else:
-            command = [*shlex.split(editor), str(file)]
-        if subprocess.run(command).returncode:
-            raise QueueError(tr("The editor exited unsuccessfully.", "エディターが正常に終了しませんでした。"))
-        return file.read_text(encoding="utf-8-sig")
 
 
 def project_options(args):
@@ -156,7 +138,7 @@ def manage_project(db, args):
                           (row["id"],)).fetchone():
                 raise QueueError(tr("Plan or remove outstanding ideas first.", "未計画の Idea を計画するか削除してください。"))
             if db.execute(
-                "SELECT 1 FROM tasks WHERE project_id = ? AND status NOT IN ('DONE', 'ABORTED', 'REMOVED')",
+                "SELECT 1 FROM tasks WHERE project_id = ? AND status NOT IN ('DONE', 'ABORTED', 'REMOVED', 'SUPERSEDED')",
                 (row["id"],),
             ).fetchone():
                 raise QueueError(tr("Resolve or remove unfinished tasks before removing this project.", "プロジェクトを削除する前に、未完了のタスクを解決するか削除してください。"))
@@ -188,6 +170,19 @@ def manage_project(db, args):
 
 def manage_task(db, args):
     action = args.command
+    if action == "revise":
+        instruction = args.instruction
+        if args.context_file:
+            instruction += "\n\n# Additional history\n" + args.context_file.read_text(encoding="utf-8-sig")
+        task_id, question = revise_task(db, args.id, instruction)
+        if question:
+            print(question)
+            print(tr("Run the same request again with --context-file or include the answer in the instruction.",
+                     "回答を指示に追記するか、--context-file で補足を渡して再実行してください。"))
+        else:
+            print(tr("Revision queued as ToDo {id}.", "修正計画を ToDo {id} として登録しました。", id=task_id))
+            wake(db)
+        return
     if action == "show":
         row = db.execute(
             """SELECT t.*, p.name AS project, i.title AS idea_title FROM tasks t
@@ -202,6 +197,8 @@ def manage_task(db, args):
         print(f"\nPlan\n{row['prompt']}")
         if row["implementation_model"]:
             print(f"\nImplementation model  {row['implementation_model']}")
+        if row["revision_of"] is not None:
+            print(f"\nRevises ToDo  {row['revision_of']}")
         return
     if action in ("ls", "list"):
         if get_setting(db, "enabled") != "1":
@@ -213,7 +210,7 @@ def manage_task(db, args):
         for row in db.execute(
             """SELECT t.*, p.name AS project_name, r.writeback, r.blocked FROM tasks t
                JOIN projects p ON p.id = t.project_id LEFT JOIN remote_tasks r ON r.task_id = t.id
-               WHERE t.status <> 'REMOVED'
+               WHERE t.status NOT IN ('REMOVED', 'SUPERSEDED')
                ORDER BY (t.status IN ('DONE', 'ABORTED', 'WAITING_FOR_INPUT')), t.priority, t.id"""
         ):
             if row["status"] in OUTCOMES and section == "ToDo":
@@ -236,38 +233,6 @@ def manage_task(db, args):
             if row["blocked"] and row["status"] in ("QUEUED", "RESUME_QUEUED"):
                 print("  " + tr("Waiting for Nextcloud to confirm the task location.", "Nextcloud でタスクの所在を確認中です。"))
         return
-    with write(db):
-        if action == "add":
-            project = project_for_task(db, args)
-            priority = args.priority if args.priority is not None else int(settings(db)["priority"])
-            cursor = db.execute(
-                "INSERT INTO tasks(project_id, name, prompt, priority) VALUES (?, ?, ?, ?)",
-                (project["id"], args.name, args.prompt or "", priority),
-            )
-            message = tr("Added task {id} to {project} (priority {priority}).",
-                         "{project} にタスク {id} を追加しました（優先度 {priority}）。",
-                         id=cursor.lastrowid, project=project["name"], priority=priority)
-        else:
-            row = by_id(db, "tasks", args.id)
-            if row["status"] in ("RUNNING", "REMOVED"):
-                raise QueueError(tr("Task {id} is {status}.", "タスク {id} の状態は「{status}」です。",
-                                    id=row["id"], status=status_label(row["status"])))
-            if action == "edit":
-                if db.execute("SELECT 1 FROM remote_tasks WHERE task_id = ?", (row["id"],)).fetchone():
-                    raise QueueError(tr("Edit imported tasks in Nextcloud.", "取り込んだタスクは Nextcloud で編集してください。"))
-                values = changes(args, "name", "abstract", "prompt", "priority")
-                if row["idea_id"] is not None and any(
-                    key in values and not values[key].strip() for key in ("name", "abstract", "prompt")
-                ):
-                    raise QueueError(tr("Title, abstract and plan are required.", "タイトル、要約、実装計画は必須です。"))
-                update(db, "tasks", row["id"], values)
-                message = tr("Updated task {id}.", "タスク {id} を更新しました。", id=row["id"])
-            else:
-                update(db, "tasks", row["id"], {"status": "REMOVED"})
-                message = tr("Removed task {id}.", "タスク {id} を削除しました。", id=row["id"])
-    print(message)
-    wake(db)
-
 
 def manage_idea(db, args):
     action = args.idea_action
@@ -296,7 +261,7 @@ def manage_idea(db, args):
                     print(row["detail"])
                 if row["planning_error"]:
                     print(row["planning_error"])
-                for task in db.execute("SELECT id, name FROM tasks WHERE idea_id = ? AND status <> 'REMOVED' ORDER BY id", (row["id"],)):
+                for task in db.execute("SELECT id, name FROM tasks WHERE idea_id = ? AND status NOT IN ('REMOVED', 'SUPERSEDED') ORDER BY id", (row["id"],)):
                     print(f"ToDo {task['id']}  {task['name']}")
         return
     with write(db):
@@ -306,7 +271,7 @@ def manage_idea(db, args):
             if not values["title"] or len(values["title"].splitlines()) != 1:
                 raise QueueError(tr("Enter a single-line title.", "タイトルを1行で入力してください。"))
         if action == "add":
-            project = project_for_task(db, args)
+            project = project_for_idea(db, args)
             cursor = db.execute("INSERT INTO ideas(project_id, title, detail) VALUES (?, ?, ?)",
                                 (project["id"], values["title"], values.get("detail", "")))
             idea_id = cursor.lastrowid
@@ -351,27 +316,34 @@ def positive(value):
 def task_commands(subparsers):
     show = subparsers.add_parser("show", help=tr("Show a ToDo and its plan", "ToDo と実装計画を表示"))
     show.add_argument("id", type=positive)
-    add = subparsers.add_parser("add", help=tr("Add a task", "タスクを追加"))
-    add.add_argument("name")
-    target = add.add_mutually_exclusive_group()
-    target.add_argument("--project", help=tr("Project name", "プロジェクト名"))
-    target.add_argument("--project-id", type=positive, help=tr("Project ID", "プロジェクト ID"))
-    prompt = add.add_mutually_exclusive_group()
-    prompt.add_argument("--prompt", help=tr("Task instructions", "タスクの指示"))
-    prompt.add_argument("--prompt-file", type=Path, help=tr("Read UTF-8 task instructions from a file", "UTF-8 のファイルからタスクの指示を読み込む"))
-    add.add_argument("--edit", action="store_true", help=tr("Edit the task prompt before saving", "保存前にタスクの指示を編集"))
-    add.add_argument("--priority", type=int, choices=range(1, 10), metavar="1-9", help=tr("Task priority", "タスクの優先度"))
-    edit = subparsers.add_parser("edit", help=tr("Edit a task", "タスクを編集"))
-    edit.add_argument("id", type=positive)
-    edit.add_argument("--name", help=tr("Task title", "タスク名"))
-    edit.add_argument("--abstract", help=tr("ToDo summary", "ToDo の要約"))
-    prompt = edit.add_mutually_exclusive_group()
-    prompt.add_argument("--prompt", "--plan", help=tr("Implementation plan", "実装計画"))
-    prompt.add_argument("--prompt-file", type=Path, help=tr("Read UTF-8 task instructions from a file", "UTF-8 のファイルからタスクの指示を読み込む"))
-    edit.add_argument("--priority", type=int, choices=range(1, 10), metavar="1-9", help=tr("Task priority", "タスクの優先度"))
-    remove = subparsers.add_parser("rm", aliases=["remove"], help=tr("Remove a task", "タスクを削除"))
-    remove.add_argument("id", type=positive)
     subparsers.add_parser("ls", aliases=["list"], help=tr("List tasks", "タスクを一覧表示"))
+    revise = subparsers.add_parser("revise", help=tr("Ask the planning model to revise a ToDo", "計画モデルに ToDo の修正を依頼"))
+    revise.add_argument("id", type=positive)
+    revise.add_argument("instruction")
+    revise.add_argument("--context-file", type=Path, help=tr("Read additional history from a UTF-8 file", "追加の履歴を UTF-8 ファイルから読み込む"))
+
+
+def idea_commands(subparsers):
+    add_idea = subparsers.add_parser("add", help=tr("Register an idea", "Idea を登録"))
+    add_idea.set_defaults(idea_action="add")
+    add_idea.add_argument("title")
+    add_idea.add_argument("--detail")
+    target = add_idea.add_mutually_exclusive_group()
+    target.add_argument("--project")
+    target.add_argument("--project-id", type=positive)
+    list_ideas = subparsers.add_parser("ls", aliases=["list"], help=tr("List unplanned ideas", "未計画の Idea を一覧表示"))
+    list_ideas.set_defaults(idea_action="ls")
+    list_ideas.add_argument("--planned", action="store_true", help=tr("List planned ideas", "計画済みの Idea を一覧表示"))
+    for action, description in (
+        ("edit", tr("Edit an unplanned idea", "未計画の Idea を編集")),
+        ("rm", tr("Remove an unplanned idea", "未計画の Idea を削除")),
+    ):
+        item = subparsers.add_parser(action, aliases=["remove"] if action == "rm" else [], help=description)
+        item.set_defaults(idea_action=action)
+        item.add_argument("id", type=positive)
+        if action == "edit":
+            item.add_argument("--title")
+            item.add_argument("--detail")
 
 
 def model_arguments(parser, project=False):
@@ -406,31 +378,19 @@ def project_arguments(parser, editing=False):
 def make_parser():
     parser = ArgumentParser(prog="cq", description=tr("Manage the local Codex task queue.", "ローカルの Codex タスクキューを管理します。"))
     commands = parser.add_subparsers(dest="command")
-    task_commands(commands)
+    idea_commands(commands)
     commands.add_parser("status", help=tr("Show queue status and tasks awaiting a reply", "キューの状況と返信待ちのタスクを表示"))
     task = commands.add_parser("task", aliases=["todo"], help=tr("Manage ToDos", "ToDo を管理"))
     task_commands(task.add_subparsers(dest="command", required=True))
     idea = commands.add_parser("idea", help=tr("Register ideas and plan ToDos", "Idea の登録と ToDo の計画"))
     idea_actions = idea.add_subparsers(dest="idea_action", required=True)
-    add_idea = idea_actions.add_parser("add", help=tr("Register an idea", "Idea を登録"))
-    add_idea.add_argument("title")
-    add_idea.add_argument("--detail")
-    target = add_idea.add_mutually_exclusive_group()
-    target.add_argument("--project")
-    target.add_argument("--project-id", type=positive)
-    list_ideas = idea_actions.add_parser("ls", aliases=["list"], help=tr("List unplanned ideas", "未計画の Idea を一覧表示"))
-    list_ideas.add_argument("--planned", action="store_true", help=tr("List planned ideas", "計画済みの Idea を一覧表示"))
+    idea_commands(idea_actions)
     for action, description in (
         ("show", tr("Show an idea and its ToDos", "Idea と子 ToDo を表示")),
-        ("edit", tr("Edit an unplanned idea", "未計画の Idea を編集")),
-        ("rm", tr("Remove an unplanned idea", "未計画の Idea を削除")),
         ("plan", tr("Generate and queue ToDos for an idea", "Idea から ToDo を生成してキューに登録")),
     ):
         item = idea_actions.add_parser(action, help=description)
         item.add_argument("id", type=positive)
-        if action == "edit":
-            item.add_argument("--title")
-            item.add_argument("--detail")
     project = commands.add_parser("project", help=tr("Manage projects", "プロジェクトを管理"))
     project_arguments(project)
     actions = project.add_subparsers(dest="project_action")
@@ -537,10 +497,6 @@ def run_cli(argv, interactive):
         parser.print_help()
         return 0
     try:
-        if getattr(args, "prompt_file", None) is not None:
-            args.prompt = args.prompt_file.read_text(encoding="utf-8-sig")
-        if getattr(args, "edit", False):
-            args.prompt = edit_prompt(args.prompt or "")
         if args.command == "_worker":
             if args.data_dir:
                 os.environ["CQ_WORKER_DATA_DIR"] = args.data_dir
@@ -550,7 +506,7 @@ def run_cli(argv, interactive):
         with open_queue() as db:
             if args.command == "project":
                 manage_project(db, args)
-            elif args.command == "idea":
+            elif getattr(args, "idea_action", None):
                 manage_idea(db, args)
             elif args.command == "status":
                 print_wrapped(queue_status(db))

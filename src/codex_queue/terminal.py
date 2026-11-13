@@ -15,7 +15,7 @@ from .arguments import ArgumentParser, parser_candidates
 from .cli import BRANCH_MODES, QueueError, git_root, main, make_parser
 from .language import language, status_label, tr
 from .status import queue_status
-from .store import open_queue, saved_language, settings
+from .store import open_queue, saved_language
 from .text_layout import fit, print_wrapped, terminal_width, wrap_rows
 from .windows_console import ConsoleInput
 from .worker import latest_attempt
@@ -156,7 +156,7 @@ def value_suggestions(action, prefix, project):
         # A quoted value can still be in the middle of being typed.
         words = [prefix[1:]] if prefix.startswith(("'", '"')) else []
     value = words[0] if words else prefix
-    if action.dest in ("path", "prompt_file"):
+    if action.dest in ("path", "context_file"):
         return path_suggestions(value, directories_only=action.dest == "path")
     choices = action.choices
     if action.dest == "base":
@@ -247,7 +247,6 @@ def form_suggestions(key, prefix):
     choices = {
         "branch": BRANCH_MODES,
         "base": PROJECT_BASE_VALUES,
-        "priority": tuple(map(str, range(1, 10))),
     }.get(key, ())
     return [Suggestion(value, insertion=value) for value in choices if value.startswith(prefix)]
 
@@ -306,7 +305,7 @@ def task_options(db, statuses=None):
         (f"{row['id']}  {row['project']}  {row['name']}  {status_label(row['status'])}", row["id"])
         for row in db.execute(
             """SELECT t.*, p.name AS project FROM tasks t JOIN projects p ON p.id=t.project_id
-               WHERE t.status NOT IN ('RUNNING','REMOVED') ORDER BY t.priority,t.id"""
+               WHERE t.status NOT IN ('RUNNING','REMOVED','SUPERSEDED') ORDER BY t.priority,t.id"""
         )
         if statuses is None or row["status"] in statuses
     ]
@@ -327,16 +326,13 @@ def repo_here():
 
 def fill_add(db, argv):
     parser = ArgumentParser(add_help=False)
-    parser.add_argument("name", nargs="?")
-    parser.add_argument("--project")
-    parser.add_argument("--project-id")
-    prompt = parser.add_mutually_exclusive_group()
-    prompt.add_argument("--prompt")
-    prompt.add_argument("--prompt-file")
-    parser.add_argument("--priority")
-    parser.add_argument("--edit", action="store_true")
+    parser.add_argument("title", nargs="?")
+    target = parser.add_mutually_exclusive_group()
+    target.add_argument("--project")
+    target.add_argument("--project-id")
+    parser.add_argument("--detail")
     args = parser.parse_args(argv[1:])
-    name = args.name
+    title = args.title
     command = ["add"]
     if args.project is None and args.project_id is None:
         options = project_options(db)
@@ -359,79 +355,73 @@ def fill_add(db, argv):
         command = option(command, "--project-id", args.project_id)
     else:
         command = option(command, "--project", args.project)
-    if name is None:
-        name = field(tr("Task title", "タスク名"))
-        if not name.strip():
+    if title is None:
+        title = field(tr("Idea title", "Idea のタイトル"))
+        if not title.strip():
             return None
-    needs_prompt = args.prompt is None and args.prompt_file is None and not args.edit
-    if args.edit:
-        command.append("--edit")
-    if args.prompt_file is not None:
-        command = option(command, "--prompt-file", args.prompt_file)
-    elif needs_prompt or args.prompt is not None:
-        command = option(command, "--prompt", multiline(tr("Task instructions", "タスクの指示")) if needs_prompt else args.prompt)
-    priority = args.priority if args.priority is not None else field(tr("Priority (1-9)", "優先度（1〜9）"), settings(db)["priority"])
-    command = option(command, "--priority", priority) + ["--", name]
-    return confirmed(command, args.name is None or needs_prompt or args.priority is None)
+    detail = args.detail
+    if detail is None:
+        detail = multiline(tr("Idea details (optional)", "Idea の詳細（任意）"))
+    return confirmed(option(command, "--detail", detail) + ["--", title],
+                     args.title is None or args.detail is None)
 
 
-def fill_task(db, argv):
+def fill_idea(db, argv):
     action = argv[0]
     parser = ArgumentParser(prog=f"cq {action}", add_help=False)
     parser.add_argument("id", nargs="?", type=int)
     if action == "edit":
-        parser.add_argument("--name")
-        prompt = parser.add_mutually_exclusive_group()
-        prompt.add_argument("--prompt")
-        prompt.add_argument("--prompt-file")
-        parser.add_argument("--priority")
-    elif action == "reply":
-        parser.add_argument("answer", nargs="?")
+        parser.add_argument("--title")
+        parser.add_argument("--detail")
     args = parser.parse_args(argv[1:])
     target = args.id
     if target is None:
-        statuses = {"WAITING_FOR_INPUT"} if action == "reply" else None
-        options = task_options(db, statuses)
-        if action == "edit":
-            imported = {row[0] for row in db.execute("SELECT task_id FROM remote_tasks")}
-            options = [item for item in options if item[1] not in imported]
-        target = choose(tr("Task", "タスク"), options)
+        options = [
+            (f"{row['id']}  {row['project']}  {row['title']}", row["id"])
+            for row in db.execute(
+                """SELECT i.*, p.name AS project FROM ideas i JOIN projects p ON p.id = i.project_id
+                   WHERE i.planned_at IS NULL ORDER BY i.id"""
+            )
+        ]
+        target = choose("Idea", options)
     if target is None:
         return None
     command = [action, str(target)]
+    if action != "edit":
+        return command
+    idea = db.execute("SELECT * FROM ideas WHERE id = ?", (target,)).fetchone()
+    if idea is None or idea["planned_at"]:
+        return command
     prompted = False
-    task = db.execute("SELECT * FROM tasks WHERE id=?", (target,)).fetchone()
-    if task is None or task["status"] in ("RUNNING", "REMOVED"):
-        return [action, str(target), *([args.answer or ""] if action == "reply" else [])]
-    if action == "reply":
-        answer = args.answer
-        attempt = latest_attempt(db, target)
-        if answer is None and attempt and task["status"] == "WAITING_FOR_INPUT":
-            print_wrapped(attempt["reason"])
-            answer = multiline(tr("Answer", "回答"))
+    for key, label in (("title", tr("Idea title", "Idea のタイトル")),
+                       ("detail", tr("Idea details", "Idea の詳細"))):
+        value = getattr(args, key)
+        if value is None:
             prompted = True
-        command += ["--", answer or ""]
-    if action == "edit":
-        for key, label in (
-            ("name", tr("Task title", "タスク名")), ("prompt", tr("Task instructions", "タスクの指示")),
-            ("priority", tr("Priority (1-9)", "優先度（1〜9）")),
-        ):
-            if key == "prompt" and args.prompt_file is not None:
-                command = option(command, "--prompt-file", args.prompt_file)
-                continue
-            value = getattr(args, key)
-            current = str(task[key])
-            if value is None:
-                prompted = True
-                value = edit_field(key, label, current)
-                if key == "priority" and value == "":
-                    value = settings(db)["priority"]
-                if value == current:
-                    continue
+            value = edit_field(key, label, idea[key])
+        if value != idea[key]:
             command = option(command, f"--{key}", value)
-        if len(command) == 2:
-            return None
-    return confirmed(command, prompted)
+    return confirmed(command, prompted) if len(command) > 2 else None
+
+
+def fill_reply(db, argv):
+    parser = ArgumentParser(prog="cq reply", add_help=False)
+    parser.add_argument("id", nargs="?", type=int)
+    parser.add_argument("answer", nargs="?")
+    args = parser.parse_args(argv[1:])
+    target = args.id if args.id is not None else choose(
+        tr("Task", "タスク"), task_options(db, {"WAITING_FOR_INPUT"}),
+    )
+    if target is None:
+        return None
+    answer = args.answer
+    attempt = latest_attempt(db, target)
+    task = db.execute("SELECT status FROM tasks WHERE id = ?", (target,)).fetchone()
+    prompted = answer is None and attempt and task and task["status"] == "WAITING_FOR_INPUT"
+    if prompted:
+        print_wrapped(attempt["reason"])
+        answer = multiline(tr("Answer", "回答"))
+    return confirmed(["reply", str(target), "--", answer or ""], prompted)
 
 
 def fill_project(db, argv):
@@ -489,15 +479,15 @@ def prepare(argv):
         for flag in argv[1:]
     ):
         return argv
-    if argv[0] in ("task", "todo") and len(argv) > 1:
+    if argv[0] == "idea" and len(argv) > 1 and argv[1] in ("add", "edit", "rm", "remove"):
         argv = argv[1:]
-    if argv[0] == "edit" and any(flag.split("=", 1)[0] in ("--abstract", "--plan") for flag in argv[1:]):
-        return argv
     with open_queue() as db:
         if argv[0] == "add":
             return fill_add(db, argv)
-        if argv[0] in ("edit", "rm", "remove", "reply"):
-            return fill_task(db, argv)
+        if argv[0] in ("edit", "rm", "remove"):
+            return fill_idea(db, argv)
+        if argv[0] == "reply":
+            return fill_reply(db, argv)
         if argv[0] == "project" and len(argv) > 1 and argv[1] in ("add", "edit", "rm", "remove"):
             return fill_project(db, argv)
     return argv

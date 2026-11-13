@@ -51,7 +51,7 @@ def planning_prompt(idea, models, default_model):
     )
 
 
-def generate_plan(db, idea, config, models):
+def generate_plan(db, path, prompt, config, models):
     options = models or [config["implementation_model"]]
     fields = {key: {"type": "string"} for key in ("title", "abstract", "plan")}
     fields["model"] = {"type": "string", "enum": options}
@@ -79,8 +79,7 @@ def generate_plan(db, idea, config, models):
         schema_path.write_text(json.dumps(schema), encoding="utf-8")
         result = subprocess.run(
             [*command, "--output-schema", str(schema_path), "-o", str(output), "-"],
-            input=planning_prompt(idea, models, config["implementation_model"]),
-            cwd=idea["path"], env=codex_env(db), encoding="utf-8", errors="replace",
+            input=prompt, cwd=path, env=codex_env(db), encoding="utf-8", errors="replace",
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
         )
         if result.returncode:
@@ -113,7 +112,8 @@ def save_plan(db, idea_id):
         raise RuntimeError(f"Idea {idea_id} already has a plan.")
     config = planning_config(db, idea)
     models = config["allowed_models"].split(",") if config["allowed_models"] else []
-    question, todos = generate_plan(db, idea, config, models)
+    prompt = planning_prompt(idea, models, config["implementation_model"])
+    question, todos = generate_plan(db, idea["path"], prompt, config, models)
     if question:
         raise RuntimeError(f"{question}\nUse cq idea edit {idea_id} to clarify the idea, then plan again.")
     with write(db):
@@ -135,6 +135,77 @@ def save_plan(db, idea_id):
             (idea_id,),
         )
     return task_ids
+
+
+def revise_task(db, task_id, instruction):
+    task = db.execute(
+        """SELECT t.*, p.path, p.prompt AS project_prompt, p.planner_model,
+                  p.implementation_model AS project_model, p.allowed_models,
+                  i.title AS idea_title, i.detail AS idea_detail
+           FROM tasks t JOIN projects p ON p.id = t.project_id
+           LEFT JOIN ideas i ON i.id = t.idea_id
+           WHERE t.id = ? AND t.status NOT IN ('REMOVED', 'SUPERSEDED') AND p.retired = 0""",
+        (task_id,),
+    ).fetchone()
+    if task is None or not instruction.strip():
+        raise RuntimeError("Specify an existing ToDo and a revision request.")
+    if task["status"] in ("RUNNING", "RESUME_QUEUED"):
+        raise RuntimeError("Wait for the current execution to stop before requesting a revision.")
+    config = planning_config(db, {**dict(task), "implementation_model": task["project_model"]})
+    models = config["allowed_models"].split(",") if config["allowed_models"] else []
+    attempts = [dict(row) for row in db.execute(
+        """SELECT number, phase, branch, start_commit, end_commit, reason, report, answer
+           FROM attempts WHERE task_id = ? ORDER BY number""", (task_id,),
+    )]
+    history = [dict(row) for row in db.execute(
+        "SELECT action, note FROM task_actions WHERE task_id = ? ORDER BY rowid", (task_id,),
+    )]
+    context = {
+        "title": task["name"], "abstract": task["abstract"], "plan": task["prompt"],
+        "status": task["status"], "idea": [task["idea_title"], task["idea_detail"]],
+        "attempts": attempts, "actions": history,
+    }
+    prompt = planning_prompt(
+        {"title": instruction, "detail": json.dumps(context, ensure_ascii=False),
+         "project_prompt": task["project_prompt"]}, models, config["implementation_model"],
+    )
+    prompt += (
+        f"\n\nThis request revises ToDo {task_id}. Use its original plan and execution history. "
+        "Return exactly one replacement plan, or ask for specific missing history or clarification. "
+        "If prior commits are needed, identify the branch or commit in the plan."
+    )
+    question, todos = generate_plan(db, task["path"], prompt, config, models)
+    if question:
+        return None, question
+    if len(todos) != 1:
+        raise RuntimeError("A ToDo revision must produce one replacement plan.")
+    revision = todos[0]
+    with write(db):
+        current = db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        project = db.execute("SELECT * FROM projects WHERE id = ?", (task["project_id"],)).fetchone()
+        if (current is None or any(current[key] != task[key] for key in current.keys())
+                or project["retired"] or project["path"] != task["path"]
+                or project["prompt"] != task["project_prompt"] or planning_config(db, project) != config):
+            raise RuntimeError("The ToDo or its project changed during planning. Request the revision again.")
+        remote = db.execute("SELECT 1 FROM remote_tasks WHERE task_id = ?", (task_id,)).fetchone()
+        if task["status"] == "QUEUED" and not remote:
+            db.execute(
+                "UPDATE tasks SET name = ?, abstract = ?, prompt = ?, implementation_model = ? WHERE id = ?",
+                (revision["title"].strip(), revision["abstract"].strip(), revision["plan"].strip(),
+                 revision["model"] if models else None, task_id),
+            )
+            return task_id, ""
+        cursor = db.execute(
+            """INSERT INTO tasks(project_id, idea_id, name, abstract, prompt, priority, implementation_model, revision_of)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (task["project_id"], task["idea_id"], revision["title"].strip(), revision["abstract"].strip(),
+             revision["plan"].strip(), task["priority"], revision["model"] if models else None, task_id),
+        )
+        if task["status"] not in ("DONE", "ABORTED"):
+            db.execute("UPDATE tasks SET status = 'SUPERSEDED' WHERE id = ?", (task_id,))
+            db.execute("INSERT INTO task_actions(task_id, action, note) VALUES (?, 'revise', ?)",
+                       (task_id, f"Superseded by ToDo {cursor.lastrowid}"))
+    return cursor.lastrowid, ""
 
 
 def plan_next_idea(db):

@@ -32,7 +32,15 @@ if "read-only" in args:
     models = json.loads(Path(args[args.index("--output-schema") + 1]).read_text())
     models = models["properties"]["todos"]["items"]["properties"]["model"]["enum"]
     assert models == ["small", "large"]
-    if "clarify first" in prompt:
+    if "This request revises ToDo" in prompt:
+        assert "Prior verification" in prompt
+        if "trace from user" not in prompt:
+            output.write_text(json.dumps(dict(question="Please provide the failing trace.", todos=[])))
+        else:
+            output.write_text(json.dumps(dict(question="", todos=[
+                dict(title="Handle the failing trace", abstract="Fix regression", plan="Reproduce and verify the fix", model="large"),
+            ])))
+    elif "clarify first" in prompt:
         output.write_text(json.dumps(dict(question="Which screen?", todos=[])))
     else:
         output.write_text(json.dumps(dict(question="", todos=[
@@ -183,9 +191,57 @@ class QueueTest(unittest.TestCase):
         self.sql("INSERT INTO settings VALUES ('enabled', '1') ON CONFLICT(key) DO UPDATE SET value='1'")
         self.sql("INSERT INTO settings VALUES ('stop', '0') ON CONFLICT(key) DO UPDATE SET value='0'")
 
+    def add_task(self, title, priority=5, cwd=None):
+        project = Path(cwd or self.repo).resolve()
+        self.cq("project", "add", cwd=project)
+        self.sql(
+            "INSERT INTO tasks(project_id, name, priority) SELECT id, ?, ? FROM projects WHERE path = ?",
+            (title, priority, str(project)),
+        )
+
+    def test_idea_aliases_and_read_only_tasks(self):
+        self.cq("add", "Original", "--detail", "Details")
+        self.assertIn("Original", self.cq("idea", "list"))
+        self.cq("idea", "edit", "1", "--title", "Updated")
+        self.assertIn("Updated", self.cq("list"))
+        self.cq("edit", "1", "--detail", "Changed")
+        self.assertIn("Changed", self.cq("idea", "show", "1"))
+        self.cq("remove", "1")
+        self.cq("idea", "add", "Another idea")
+        self.cq("idea", "remove", "2")
+        self.assertEqual([], self.sql("SELECT id FROM ideas"))
+        for action in ("add", "rm", "edit"):
+            self.cq("task", action, code=2)
+        self.assertEqual([], self.sql("SELECT id FROM tasks"))
+
+    def test_revision_requests_history_before_queuing_replacement(self):
+        self.add_task("wait for user")
+        self.cq("project", "edit", "1", "--planner-model", "project-planner", "--allowed-models", "small,large")
+        self.enable()
+        self.cq("_worker")
+        self.wait(["WAITING_FOR_INPUT"])
+        self.cq("pause")
+        self.sql(
+            "UPDATE attempts SET report = ? WHERE task_id = 1",
+            (json.dumps({"verification": "Prior verification"}),),
+        )
+        self.assertIn("Please provide the failing trace.", self.cq("todo", "revise", "1", "Fix regression"))
+        self.assertEqual([("WAITING_FOR_INPUT",)], self.sql("SELECT status FROM tasks"))
+        trace = self.root / "trace.txt"
+        trace.write_text("trace from user", encoding="utf-8")
+        self.cq("task", "revise", "1", "Fix regression", "--context-file", str(trace))
+        self.assertEqual([("SUPERSEDED", None), ("QUEUED", 1)], self.sql(
+            "SELECT status, revision_of FROM tasks ORDER BY id",
+        ))
+        self.assertIn("Revises ToDo  1", self.cq("todo", "show", "2"))
+        self.enable()
+        self.cq("_worker")
+        self.wait(["SUPERSEDED", "DONE"])
+        self.assertEqual("main", self.git("branch", "--show-current"))
+
     def test_priority_and_completion(self):
-        self.cq("task", "add", "second")
-        self.cq("add", "first", "--priority", "1")
+        self.add_task("second")
+        self.add_task("first", priority=1)
         self.cq("_worker")
         self.wait(["QUEUED", "QUEUED"])
         self.enable()
@@ -203,7 +259,7 @@ class QueueTest(unittest.TestCase):
         self.assertEqual([(2,)], self.sql("SELECT count(*) FROM attempts"))
 
     def test_start_requests_detached_worker(self):
-        self.cq("add", "first task")
+        self.add_task("first task")
         self.assertIn("Automatic execution enabled", self.cq("start"))
         self.wait(["DONE"])
         self.cq("pause")
@@ -214,14 +270,14 @@ class QueueTest(unittest.TestCase):
         self.assertEqual(("RATE_LIMITED", datetime(2033, 5, 18, 12, 34).timestamp()), result)
 
     def test_question_and_resume(self):
-        self.cq("add", "wait for user")
-        self.cq("add", "later")
+        self.add_task("wait for user")
+        self.add_task("later")
         self.enable()
         self.cq("_worker")
         self.wait(["WAITING_FOR_INPUT", "QUEUED"])
         self.cq("_worker", "--scheduled")
         self.wait(["WAITING_FOR_INPUT", "QUEUED"])
-        self.assertIn("What next?", self.cq("list"))
+        self.assertIn("What next?", self.cq("task", "list"))
         status = self.cq("status")
         self.assertLess(status.index("\nWaiting response (1)\n"), status.index("\nToDo\n"))
         self.assertIn("What next?", status)
@@ -236,7 +292,7 @@ class QueueTest(unittest.TestCase):
         self.assertEqual([(1,)], self.sql("SELECT count(*) FROM attempts WHERE task_id=1"))
 
     def test_limit_waits_for_schedule(self):
-        self.cq("add", "limit task")
+        self.add_task("limit task")
         self.enable()
         self.cq("_worker")
         self.wait(["RATE_LIMITED"])
@@ -250,8 +306,8 @@ class QueueTest(unittest.TestCase):
         self.wait(["DONE"])
 
     def test_authentication_recovers_on_schedule(self):
-        self.cq("add", "auth task")
-        self.cq("add", "later")
+        self.add_task("auth task")
+        self.add_task("later")
         self.enable()
         self.cq("_worker")
         self.wait(["AUTH_REQUIRED", "QUEUED"])
@@ -262,8 +318,8 @@ class QueueTest(unittest.TestCase):
         self.wait(["DONE", "DONE"])
 
     def test_pause_waits_without_starting_next_task(self):
-        self.cq("add", "pause task")
-        self.cq("add", "later")
+        self.add_task("pause task")
+        self.add_task("later")
         self.enable()
         worker = self.worker()
         deadline = time.monotonic() + 8
@@ -284,8 +340,8 @@ class QueueTest(unittest.TestCase):
         self.wait(["DONE", "QUEUED"])
 
     def test_stop_preserves_branch_and_prevents_new_launch(self):
-        self.cq("add", "sleep task")
-        self.cq("add", "later")
+        self.add_task("sleep task")
+        self.add_task("later")
         self.enable()
         worker = self.worker()
         self.wait(["RUNNING", "QUEUED"])
@@ -327,9 +383,9 @@ class QueueTest(unittest.TestCase):
     def test_parallel_excludes_running_repository(self):
         other = self.second_repo()
         self.cq("config", "--parallel", "2")
-        self.cq("add", "sleep task")
-        self.cq("add", "same repository")
-        self.cq("add", "other repository", cwd=other)
+        self.add_task("sleep task")
+        self.add_task("same repository")
+        self.add_task("other repository", cwd=other)
         self.enable()
         worker = self.worker()
         self.wait(["RUNNING", "QUEUED", "DONE"])
