@@ -3,6 +3,7 @@ from pathlib import Path
 import subprocess
 from tempfile import TemporaryDirectory
 
+from .processes import process_lock
 from .runtime import codex_command, codex_env
 from .store import queue_folder, settings, write
 
@@ -100,6 +101,13 @@ def generate_plan(db, idea, config, models):
 
 
 def plan_idea(db, idea_id):
+    with process_lock(f"idea-{idea_id}.lock") as acquired:
+        if not acquired:
+            raise RuntimeError(f"Idea {idea_id} is already being planned.")
+        return save_plan(db, idea_id)
+
+
+def save_plan(db, idea_id):
     idea = idea_record(db, idea_id)
     if idea["planned_at"]:
         raise RuntimeError(f"Idea {idea_id} already has a plan.")
@@ -122,5 +130,33 @@ def plan_idea(db, idea_id):
                  task["plan"].strip(), priority, task["model"] if models else None),
             )
             task_ids.append(cursor.lastrowid)
-        db.execute("UPDATE ideas SET planned_at = CURRENT_TIMESTAMP WHERE id = ?", (idea_id,))
+        db.execute(
+            "UPDATE ideas SET planned_at = CURRENT_TIMESTAMP, planning_error = NULL WHERE id = ?",
+            (idea_id,),
+        )
     return task_ids
+
+
+def plan_next_idea(db):
+    if settings(db)["idea_planning"] != "auto":
+        return False
+    idea = db.execute(
+        """SELECT i.id, i.title, i.detail FROM ideas i JOIN projects p ON p.id = i.project_id
+           WHERE i.planned_at IS NULL AND i.planning_error IS NULL AND p.retired = 0
+           ORDER BY i.id LIMIT 1"""
+    ).fetchone()
+    if idea is None:
+        return False
+    with process_lock(f"idea-{idea['id']}.lock") as acquired:
+        if not acquired:
+            return False
+        try:
+            save_plan(db, idea["id"])
+        except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+            with write(db):
+                db.execute(
+                    """UPDATE ideas SET planning_error = ? WHERE id = ? AND planned_at IS NULL
+                       AND title = ? AND detail = ?""",
+                    (str(error), idea["id"], idea["title"], idea["detail"]),
+                )
+    return True

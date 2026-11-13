@@ -10,6 +10,7 @@ import sys
 import time
 
 from .nextcloud import settle_move, sync
+from .planner import plan_next_idea
 from .processes import process_lock, spawn, stop_tree, wait_for_previous_job
 from .runtime import codex_command, codex_env
 from .store import get_setting, open_queue, queue_folder, set_setting, settings, update, write
@@ -539,6 +540,9 @@ def run_worker(scheduled):
                 if auto_sync and time.monotonic() >= next_sync and sync_future is None:
                     sync_future = sync_pool.submit(sync_in_background)
                     next_sync = time.monotonic() + 30
+                if not running and get_setting(db, "enabled") == "1":
+                    if plan_next_idea(db):
+                        continue
                 attempt = claim(
                     db, scheduled, attempted, authenticated,
                     not auto_sync or (remote_ready and sync_future is None),

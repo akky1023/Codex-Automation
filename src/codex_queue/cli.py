@@ -308,10 +308,12 @@ def manage_idea(db, args):
             if by_id(db, "ideas", idea_id)["planned_at"]:
                 raise QueueError(tr("This idea already has ToDos.", "この Idea にはすでに ToDo があります。"))
             if action == "edit":
-                update(db, "ideas", idea_id, values)
+                update(db, "ideas", idea_id, {**values, "planning_error": None})
             else:
                 db.execute("DELETE FROM ideas WHERE id = ?", (idea_id,))
     print(f"Idea {idea_id}")
+    if action in ("add", "edit") and settings(db)["idea_planning"] == "auto":
+        wake(db)
 
 
 def configure(db, args):
@@ -328,6 +330,8 @@ def configure(db, args):
     language.set(current["language"])
     for key, value in current.items():
         print(f"{key.replace('_', '-')}: {value or tr('unset', '未設定')}")
+    if values.get("idea_planning") == "auto":
+        wake(db)
 
 
 def positive(value):
@@ -432,6 +436,8 @@ def make_parser():
 
     config = commands.add_parser("config", aliases=["settings"], help=tr("Manage queue defaults", "キューの設定を管理"))
     model_arguments(config)
+    config.add_argument("--idea-planning", choices=("auto", "manual"),
+                        help=tr("When to plan new ideas", "Idea を自動で計画するか手動で計画するか"))
     config.add_argument("--parallel", type=positive, help=tr("Maximum concurrent tasks", "同時に実行するタスク数の上限"))
     config.add_argument("--priority", type=int, choices=range(1, 10), metavar="1-9", help=tr("Default task priority", "タスクの既定の優先度"))
     config.add_argument("--branch", choices=BRANCH_MODES, help=tr("Default branch mode", "既定のブランチ運用"))

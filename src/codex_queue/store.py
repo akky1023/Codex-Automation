@@ -15,6 +15,7 @@ DEFAULTS = {
     "planner_model": "",
     "implementation_model": "",
     "allowed_models": "",
+    "idea_planning": "manual",
 }
 
 SCHEMA = """
@@ -52,7 +53,8 @@ CREATE TABLE IF NOT EXISTS ideas (
     project_id INTEGER NOT NULL REFERENCES projects(id),
     title TEXT NOT NULL,
     detail TEXT NOT NULL DEFAULT '',
-    planned_at TEXT
+    planned_at TEXT,
+    planning_error TEXT
 );
 CREATE INDEX IF NOT EXISTS tasks_queue ON tasks(status, priority, id);
 CREATE TABLE IF NOT EXISTS attempts (
@@ -104,6 +106,7 @@ CREATE TABLE IF NOT EXISTS remote_tasks (
 """
 
 WORKFLOW_COLUMNS = {
+    "ideas": ("planning_error TEXT",),
     "projects": ("planner_model TEXT", "implementation_model TEXT", "allowed_models TEXT"),
     "tasks": (
         "idea_id INTEGER REFERENCES ideas(id)", "abstract TEXT NOT NULL DEFAULT ''",
