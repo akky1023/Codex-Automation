@@ -73,4 +73,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.release.outputs.tag }}
-        run: gh release upload "$TAG" dist/*.whl --clobber
+        run: |
+          gh release upload "$TAG" dist/*.whl --clobber
+          if [[ "$TAG" == 'v0.1.0' ]]; then
+            gh release edit "$TAG" --notes '初版'
+          fi
