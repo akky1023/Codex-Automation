@@ -51,10 +51,16 @@ def choose(title, options, default=0):
     if not options:
         print(tr("No available choices.", "選択できる項目がありません。"))
         return None
+    if os.name == "nt":
+        with virtual_terminal() as vt:
+            return choose_options(title, options, default, vt)
+    return choose_options(title, options, default, False)
+
+
+def choose_options(title, options, default, vt):
     index = default
     console = ConsoleInput() if os.name == "nt" else None
     while True:
-        clear()
         columns, height = shutil.get_terminal_size()
         width = max(1, columns - 1)
         heading = list(wrap_rows(title + " " + tr(
@@ -68,12 +74,20 @@ def choose(title, options, default=0):
             rows.extend(wrap_rows(f"{marker} {label}", width))
         page = max(1, height - len(heading) - 1)
         start = min(max(0, selected_row - page // 2), max(0, len(rows) - page))
-        print("\n".join([*heading, *rows[start:start + page]]))
+        visible = [*heading, *rows[start:start + page]]
+        if vt:
+            output = "".join(f"\033[{row};1H{text}" for row, text in enumerate(visible, 1))
+            print("\033[2J" + output, end="", flush=True)
+        else:
+            clear()
+            print("\n".join(visible))
         if console is None:
             key = keys()
         else:
             while (key := console.read()) is None:
                 time.sleep(0.03)
+                if shutil.get_terminal_size() != (columns, height):
+                    break
         if key == "up":
             index = (index - 1) % len(options)
         elif key == "down":
@@ -505,6 +519,13 @@ def command_output(argv):
 
 
 def screen():
+    if os.name == "nt":
+        with virtual_terminal(alternate=True):
+            return run_screen()
+    return run_screen()
+
+
+def run_screen():
     message = ""
     showing_output = False
     help_argv = None
@@ -551,7 +572,7 @@ def screen():
 
 
 @contextmanager
-def virtual_terminal():
+def virtual_terminal(alternate=False):
     import ctypes
     from ctypes import wintypes
 
@@ -565,10 +586,16 @@ def virtual_terminal():
     enabled = bool(kernel.GetConsoleMode(handle, ctypes.byref(mode))
                    and kernel.SetConsoleMode(handle, mode.value | 0x0004))
     try:
+        if enabled and alternate:
+            print("\033[?1049h", end="", flush=True)
         yield enabled
     finally:
         if enabled:
-            kernel.SetConsoleMode(handle, mode.value)
+            try:
+                if alternate:
+                    print("\033[?1049l", end="", flush=True)
+            finally:
+                kernel.SetConsoleMode(handle, mode.value)
 
 
 def prompt_frame(view, message, line, candidates, selected, size, offset, form=False):
@@ -609,9 +636,10 @@ def prompt_frame(view, message, line, candidates, selected, size, offset, form=F
 def draw_prompt(view, message, line, candidates, selected, size, offset, vt, form=False):
     frame, page, offset, max_offset = prompt_frame(view, message, line, candidates, selected, size, offset, form)
     if vt:
-        body, _, prompt = frame.rpartition("\n")
-        upper = body.replace("\n", "\033[K\n") + "\033[K\n" if "\n" in frame else ""
-        print(f"\033[H{upper}\r\033[2K\033[97;44m{prompt}\033[K\033[0m", end="", flush=True)
+        *body, prompt = frame.split("\n")
+        # Advancing with newlines can scroll the terminal if it shrinks mid-frame.
+        upper = "".join(f"\033[{row};1H\033[2K{text}" for row, text in enumerate(body, 1))
+        print(f"{upper}\033[{len(body) + 1};1H\033[2K\033[97;44m{prompt}\033[K\033[0m", end="", flush=True)
     else:
         clear()
         print(frame, end="", flush=True)

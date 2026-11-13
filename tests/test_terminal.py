@@ -301,12 +301,13 @@ class SuggestionTest(unittest.TestCase):
         self.assertTrue(frame.endswith("end"))
         self.assertEqual(5, len(frame.split("\n")))
 
-    def test_virtual_terminal_clears_input_row_before_redrawing_shorter_text(self):
+    def test_virtual_terminal_positions_each_row_without_scrolling(self):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             draw_prompt("Queue", "", "日本", [], 0, (80, 8), 0, vt=True)
-            draw_prompt("Queue", "", "日", [], 0, (80, 8), 0, vt=True)
-        self.assertTrue(output.getvalue().endswith("\r\033[2K\033[97;44mcq> 日\033[K\033[0m"))
+            draw_prompt("Queue", "", "日", [], 0, (40, 4), 0, vt=True)
+        self.assertNotIn("\n", output.getvalue())
+        self.assertTrue(output.getvalue().endswith("\033[4;1H\033[2K\033[97;44mcq> 日\033[K\033[0m"))
 
     @unittest.skipUnless(os.name == "nt", "Windows console input")
     def test_arrow_selects_tab_completes_and_enter_submits(self):
