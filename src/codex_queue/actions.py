@@ -122,6 +122,8 @@ def show_logs(db, task_id):
                         branch=attempt["branch"], commit=attempt["end_commit"]))
         print("  " + tr("Session: {session}  Logs: {path}", "セッション：{session}  ログ：{path}",
                         session=attempt["session"], path=attempt_folder(attempt)))
+        if attempt["implementation_model"]:
+            print(f"  Implementation model  {attempt['implementation_model']}")
         if attempt["reason"]:
             print(f"  {attempt['reason']}")
         if attempt["report"]:

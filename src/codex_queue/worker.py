@@ -20,7 +20,7 @@ RETRY = ("RESUME_QUEUED", "RATE_LIMITED", "AUTH_REQUIRED", "RETRY_WAIT", "INTERR
 REPORT_SCHEMA = {
     "type": "object",
     "properties": {
-        "status": {"type": "string", "enum": ["COMPLETED", "WAITING_FOR_INPUT", "NEEDS_REVIEW"]},
+        "status": {"type": "string", "enum": ["COMPLETED", "ABORTED", "WAITING_FOR_INPUT", "NEEDS_REVIEW"]},
         "reason": {"type": "string"},
         "verification": {"type": "string"},
         "question": {"type": "string"},
@@ -78,6 +78,8 @@ def record(db, attempt, status, reason=None, **values):
             reason = "Nextcloud task moved or was removed."
             values["phase"] = "INTERRUPTED"
         update(db, "attempts", attempt["id"], {"reason": reason, **values})
+        if status == "ABORTED" and get_setting(db, "on_abort", "pause") == "pause":
+            set_setting(db, "enabled", "0")
         db.execute(
             """UPDATE tasks SET status = ?, completed_at =
                CASE WHEN ? = 'DONE' THEN CURRENT_TIMESTAMP ELSE NULL END WHERE id = ?""",
@@ -93,16 +95,25 @@ def record(db, attempt, status, reason=None, **values):
 
 
 def prompt_for(task):
+    details = task["prompt"]
+    if task["idea_id"] is not None:
+        details = (
+            f"## Abstract\n{task['abstract']}\n\n"
+            f"## Original idea\n{task['idea_title']}\n\n{task['idea_detail']}\n\n"
+            f"## Implementation plan\n{details}"
+        )
     return (
         f"# Project instructions\n{task['project_prompt']}\n\n"
-        f"# Task\n{task['name']}\n\n{task['prompt']}\n\n"
+        f"# Task\n{task['name']}\n\n{details}\n\n"
         "# Execution and reporting\n"
         "Task-specific requirements override project defaults. Follow repository instructions. "
         "Keep your assigned branch checked out. Commit task changes in reviewable commits, "
         "without merging or pushing. Leave the worktree clean on completion. "
         "Report COMPLETED only when the task is complete. Include the reason and verification. "
         "If user input is required, report WAITING_FOR_INPUT and put a concrete question in "
-        "question. Otherwise leave question empty. Report unresolved failures as NEEDS_REVIEW."
+        "question. Otherwise leave question empty. Report ABORTED and explain the reason "
+        "when implementation is refused, for example for security reasons. "
+        "Report unresolved execution failures as NEEDS_REVIEW."
     )
 
 
@@ -112,8 +123,11 @@ def claim(db, scheduled, attempted, authenticated, remote_ready):
             return None
         config = settings(db)
         rows = db.execute(
-            """SELECT t.*, p.path, p.prompt AS project_prompt, p.base, p.branch
+            """SELECT t.*, p.path, p.prompt AS project_prompt, p.base, p.branch,
+                      p.implementation_model AS project_model,
+                      i.title AS idea_title, i.detail AS idea_detail
                FROM tasks t JOIN projects p ON p.id = t.project_id
+               LEFT JOIN ideas i ON i.id = t.idea_id
                WHERE t.status NOT IN ('DONE', 'ABORTED', 'REMOVED')
                ORDER BY t.priority, t.id"""
         ).fetchall()
@@ -148,10 +162,13 @@ def claim(db, scheduled, attempted, authenticated, remote_ready):
             if status == "QUEUED" or attempt is None:
                 number = 1 if attempt is None else attempt["number"] + 1
                 base = config["base"] if row["base"] is None else row["base"]
+                model = row["implementation_model"]
+                if model is None:
+                    model = config["implementation_model"] if row["project_model"] is None else row["project_model"]
                 cursor = db.execute(
-                    """INSERT INTO attempts(task_id, number, path, mode, base, prompt)
-                       VALUES (?, ?, ?, ?, ?, ?)""",
-                    (row["id"], number, row["path"], row["branch"] or config["branch"], base, prompt_for(row)),
+                    """INSERT INTO attempts(task_id, number, path, mode, base, prompt, implementation_model)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (row["id"], number, row["path"], row["branch"] or config["branch"], base, prompt_for(row), model),
                 )
                 attempt = row_attempt(db, cursor.lastrowid)
             update(db, "tasks", row["id"], {"status": "RUNNING"})
@@ -192,7 +209,12 @@ def prepare(db, attempt):
 
 def finalize(db, attempt):
     path = attempt["path"]
+    report = json.loads(attempt["report"]) if attempt["report"] else {}
+    aborted = report.get("status") == "ABORTED"
     if not clean(path):
+        if aborted:
+            record(db, attempt, "ABORTED", report["reason"], phase="FINISHED")
+            return
         raise RuntimeError("Codex left uncommitted or untracked changes.")
     current = branch(path)
     if attempt["phase"] == "RESTORE":
@@ -212,7 +234,8 @@ def finalize(db, attempt):
             update(db, "attempts", attempt["id"], {"end_commit": end, "phase": "RESTORE"})
     if attempt["mode"] == "per-task" and current != attempt["original_branch"]:
         git(path, "switch", attempt["original_branch"])
-    record(db, attempt, "DONE", phase="FINISHED")
+    record(db, attempt, "ABORTED" if aborted else "DONE",
+           report["reason"] if aborted else None, phase="FINISHED")
 
 
 def classify(events, stderr):
@@ -312,6 +335,8 @@ def execute(db, attempt):
     stdout = folder / "events.jsonl"
     stderr = folder / "stderr.log"
     command = [*codex_command(db), "-a", "never", "exec", "-s", "workspace-write"]
+    if attempt["implementation_model"]:
+        command += ["-m", attempt["implementation_model"]]
     if attempt["session"]:
         command += ["resume", attempt["session"]]
     elif attempt["phase"] != "READY":
@@ -423,7 +448,7 @@ def process_result(db, attempt, folder, code, events, completed, failed, started
         raise RuntimeError("Invalid Codex final report.")
     status = report["status"]
     report_json = json.dumps(report, ensure_ascii=False)
-    if status == "COMPLETED":
+    if status in ("COMPLETED", "ABORTED"):
         with write(db):
             update(db, "attempts", attempt["id"], {"phase": "REPORTED", "report": report_json})
         finalize(db, row_attempt(db, attempt["id"]))

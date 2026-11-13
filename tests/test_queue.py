@@ -27,13 +27,29 @@ if args == ["login", "status"]:
     sys.exit(0 if authorized else 1)
 prompt = sys.stdin.read()
 output = Path(args[args.index("-o") + 1])
+if "read-only" in args:
+    assert args[args.index("-m") + 1] == "project-planner"
+    models = json.loads(Path(args[args.index("--output-schema") + 1]).read_text())
+    models = models["properties"]["todos"]["items"]["properties"]["model"]["enum"]
+    assert models == ["small", "large"]
+    if "clarify first" in prompt:
+        output.write_text(json.dumps(dict(question="Which screen?", todos=[])))
+    else:
+        output.write_text(json.dumps(dict(question="", todos=[
+            dict(title="Add access controls", abstract="Restrict access", plan="Implement and test access", model="small"),
+            dict(title="Decline unsafe change", abstract="Assess request", plan="Check policy", model="large"),
+        ])))
+    sys.exit(0)
 def event(kind, **data):
     print(json.dumps(dict(type=kind, **data)), flush=True)
 if "auth task" in prompt and not authorized:
     event("error", message="Not logged in")
     sys.exit(1)
 event("thread.started", thread_id="test-session")
-if "wait for user" in prompt and "test answer" not in prompt:
+if "Decline unsafe change" in prompt:
+    assert args[args.index("-m") + 1] == "large"
+    report = dict(status="ABORTED", reason="Refused by policy", question="")
+elif "wait for user" in prompt and "test answer" not in prompt:
     report = dict(status="WAITING_FOR_INPUT", reason="Need a decision", question="What next?")
 elif "sleep task" in prompt and "resume" not in args:
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
@@ -43,6 +59,9 @@ elif "limit task" in prompt and "resume" not in args:
     event("turn.failed", error={"codex_error_info": "usageLimitExceeded"})
     sys.exit(1)
 else:
+    if "Add access controls" in prompt:
+        assert args[args.index("-m") + 1] == "small"
+        assert "Restrict access" in prompt and "Implement and test access" in prompt
     if "pause task" in prompt:
         Path(__file__).with_name("pause-ready").touch()
         while not Path(__file__).with_name("pause-release").exists():
@@ -77,6 +96,28 @@ class QueueTest(unittest.TestCase):
 
     def git(self, *args, cwd=None):
         return subprocess.check_output(["git", *args], cwd=cwd or self.repo, text=True).strip()
+
+    def test_idea_planning_and_execution(self):
+        self.cq("config", "--planner-model", "global-planner", "--allowed-models", "global-model")
+        self.cq("project", "add", "--planner-model", "project-planner", "--allowed-models", "small, large")
+        self.cq("idea", "add", "Improve access", "--detail", "clarify first")
+        self.cq("idea", "plan", "1", code=1)
+        self.assertEqual([], self.sql("SELECT id FROM tasks"))
+        self.cq("idea", "edit", "1", "--detail", "Apply to the settings screen")
+        self.cq("idea", "plan", "1")
+        self.cq("idea", "plan", "1", code=1)
+        self.assertEqual([(1, "small"), (1, "large")], self.sql(
+            "SELECT idea_id, implementation_model FROM tasks ORDER BY id",
+        ))
+        self.assertIn("Improve access", self.cq("todo", "show", "1"))
+        self.assertIn("Implement and test access", self.cq("todo", "show", "1"))
+        self.cq("start")
+        self.wait(["DONE", "ABORTED"])
+        self.assertEqual("main", self.git("branch", "--show-current"))
+        view = self.cq("status")
+        self.assertLess(view.index("\nIdea\n"), view.index("\nToDo\n"))
+        self.assertIn("Done / Abort / Waiting_response", view)
+        self.assertIn("Refused by policy", view)
 
     def sql(self, sql, params=()):
         db = sqlite3.connect(self.database)
