@@ -1,0 +1,76 @@
+name: Release Please
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  workflow_call:
+
+permissions: {}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    outputs:
+      tag: ${{ steps.publish.outputs.tag_name || steps.prepare.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: prepare
+        with:
+          release-type: python
+          target-branch: main
+          include-component-in-tag: false
+      - name: Merge the Release Please PR
+        if: steps.prepare.outputs.prs != '' && !fromJSON(steps.prepare.outputs.prs)[0].draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ fromJSON(steps.prepare.outputs.prs || '[{}]')[0].number }}
+        run: |
+          pr=$(gh api "repos/$GH_REPO/pulls/$PR_NUMBER")
+          sha=$(jq -er --arg repo "$GH_REPO" '
+            select(.user.login == "github-actions[bot]" and .base.ref == "main"
+              and .head.repo.full_name == $repo
+              and .head.ref == "release-please--branches--main"
+              and (.draft | not) and .state == "open")
+            | .head.sha' <<< "$pr")
+          gh pr merge "$PR_NUMBER" --squash --match-head-commit "$sha"
+      - uses: googleapis/release-please-action@v4
+        id: publish
+        if: steps.prepare.outputs.prs != '' && !fromJSON(steps.prepare.outputs.prs)[0].draft
+        with:
+          release-type: python
+          target-branch: main
+          include-component-in-tag: false
+          skip-github-pull-request: true
+
+  wheel:
+    needs: release
+    if: needs.release.outputs.tag != ''
+    permissions:
+      contents: read
+    uses: ./.github/workflows/verify.yml
+    with:
+      ref: refs/tags/${{ needs.release.outputs.tag }}
+      wheel-artifact: true
+
+  attach:
+    needs: [release, wheel]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: codex-queue-wheel
+          path: dist
+      - name: Attach the wheel
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.release.outputs.tag }}
+        run: gh release upload "$TAG" dist/*.whl --clobber
