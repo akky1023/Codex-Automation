@@ -13,7 +13,7 @@ from unittest.mock import patch
 from codex_queue.cli import make_parser, manage_project, manage_idea
 from codex_queue.language import language
 from codex_queue.store import SCHEMA
-from codex_queue.terminal import Suggestion, command_text, completion, draw_prompt, edit_field, fill_project, fill_idea, prompt_frame, queue_view, screen, tokens, windows_input
+from codex_queue.terminal import Suggestion, command_text, completion, draw_prompt, edit_field, fill_project, fill_idea, prepare, prompt_frame, queue_view, screen, tokens, windows_input
 from codex_queue.text_layout import text_width, wrap_rows
 from codex_queue.windows_console import ConsoleInput, InputRecord, KeyEvent
 
@@ -217,6 +217,52 @@ class SuggestionTest(unittest.TestCase):
             self.assertEqual(("", "", None, ""), tuple(db.execute("SELECT name, prompt, branch, base FROM projects").fetchone()))
             self.assertEqual(("Idea", ""), tuple(db.execute("SELECT title, detail FROM ideas").fetchone()))
 
+    def test_command_forms_supply_missing_arguments_and_keep_explicit_defaults(self):
+        with contextlib.closing(sqlite3.connect(":memory:")) as db:
+            db.row_factory = sqlite3.Row
+            db.executescript(SCHEMA)
+            db.execute("INSERT INTO projects(path, path_key, name) VALUES ('repo', 'repo', 'Notes')")
+            db.execute("INSERT INTO ideas(project_id, title, detail) VALUES (1, 'Idea', '')")
+            db.execute("INSERT INTO tasks(project_id, name, priority, status) VALUES (1, 'Task', 5, 'ABORTED')")
+            db.execute("INSERT INTO settings(key, value) VALUES ('nextcloud_connection', 'server')")
+            db.execute(
+                "INSERT INTO remote_tasks(connection, uid, task_id, list, url, writeback) "
+                "VALUES ('server', 'item', 1, 'list', 'url', 'conflict')"
+            )
+            with patch("codex_queue.terminal.open_queue", side_effect=lambda: contextlib.nullcontext(db)), patch(
+                "codex_queue.terminal.choose", side_effect=lambda label, options, default: options[default][1],
+            ), patch("codex_queue.terminal.field", side_effect=lambda label, default: default or "15"), patch(
+                "codex_queue.terminal.edit_field", side_effect=lambda key, label, initial: initial,
+            ), patch("codex_queue.terminal.project_field", side_effect=lambda key, label, default: default), patch(
+                "codex_queue.terminal.multiline", return_value="revise it",
+            ), patch(
+                "codex_queue.terminal.screen_input", return_value="y",
+            ):
+                def parsed(*argv):
+                    return self.parser.parse_args(prepare(list(argv)))
+
+                self.assertEqual(15, parsed("schedule").every_minutes)
+                self.assertEqual(30, parsed("schedule", "--every-minutes=30").every_minutes)
+                self.assertEqual(1, parsed("idea", "show").id)
+                self.assertEqual(1, parsed("todo", "show").id)
+                self.assertEqual("revise it", parsed("task", "revise").instruction)
+                self.assertIsNone(parsed("task", "revise").context_file)
+                self.assertEqual("history.txt", str(parsed(
+                    "task", "revise", "1", "adjust plan", "--context-file=history.txt",
+                ).context_file))
+                self.assertEqual("15", parsed("done", "1").note)
+                self.assertFalse(parsed("retry").fresh)
+                self.assertTrue(parsed("retry", "--fresh").fresh)
+                self.assertTrue(parsed("idea", "list", "--planned").planned)
+                self.assertEqual("ja", parsed("settings", "--language=ja").language)
+                self.assertEqual("model", parsed("project", "--planner-model=model").planner_model)
+                linked = parsed("nextcloud", "link")
+                self.assertEqual(("15", 1), (linked.list, linked.project_id))
+                self.assertTrue(parsed("nextcloud", "resolve").complete)
+                resolved = parsed("nextcloud", "resolve", "--keep-remote")
+                self.assertTrue(resolved.keep_remote)
+                self.assertFalse(resolved.complete)
+
     def test_help_completes_nested_topics(self):
         self.assertEqual([Suggestion("help", "Show command help")], completion(self.parser, "/he")[1])
         self.assertEqual([Suggestion("add", "Register a Git repository")], completion(self.parser, "/help project a")[1])
@@ -227,7 +273,9 @@ class SuggestionTest(unittest.TestCase):
         try:
             with patch("codex_queue.terminal.saved_language", return_value="en"), patch(
                 "codex_queue.cli.saved_language", return_value="en",
-            ), patch("codex_queue.terminal.windows_input", side_effect=["/help project add", "q"]) as prompt:
+            ), patch("codex_queue.terminal.field", side_effect=lambda label, default: default), patch(
+                "codex_queue.terminal.windows_input", side_effect=["/help project add", "q"],
+            ) as prompt:
                 self.assertEqual(0, screen())
             self.assertIn("--path", prompt.call_args.args[1])
             self.assertFalse(prompt.call_args.kwargs["show_queue"])

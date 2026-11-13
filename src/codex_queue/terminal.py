@@ -15,7 +15,7 @@ from .arguments import ArgumentParser, parser_candidates
 from .cli import BRANCH_MODES, QueueError, git_root, main, make_parser, model_arguments
 from .language import language, status_label, tr
 from .status import queue_status
-from .store import open_queue, saved_language
+from .store import get_setting, open_queue, saved_language, settings
 from .text_layout import fit, print_wrapped, terminal_width, wrap_rows
 from .windows_console import ConsoleInput
 from .worker import latest_attempt
@@ -145,7 +145,9 @@ def path_suggestions(prefix, directories_only, quote=True):
         else:
             insertion = shlex.quote(path)
         label = tr("Directory", "フォルダー") if directory else tr("File", "ファイル")
-        candidates.append(Suggestion(display, label, insertion if directory else insertion + " "))
+        if quote and not directory:
+            insertion += " "
+        candidates.append(Suggestion(display, label, insertion))
     return candidates
 
 
@@ -242,8 +244,8 @@ def project_field(key, label, default):
 def form_suggestions(key, prefix):
     if not prefix:
         return []
-    if key == "path":
-        return path_suggestions(prefix, directories_only=True, quote=False)
+    if key in ("path", "context_file"):
+        return path_suggestions(prefix, directories_only=key == "path", quote=False)
     choices = {
         "branch": BRANCH_MODES,
         "base": PROJECT_BASE_VALUES,
@@ -310,14 +312,14 @@ def choose_value(title, options, supplied=None, default=0):
     return choose(title, options, default)
 
 
-def task_options(db, statuses=None):
+def task_options(db, statuses=None, excluded=("RUNNING", "REMOVED", "SUPERSEDED")):
     return [
         (f"{row['id']}  {row['project']}  {row['name']}  {status_label(row['status'])}", row["id"])
         for row in db.execute(
             """SELECT t.*, p.name AS project FROM tasks t JOIN projects p ON p.id=t.project_id
-               WHERE t.status NOT IN ('RUNNING','REMOVED','SUPERSEDED') ORDER BY t.priority,t.id"""
+               ORDER BY t.priority,t.id"""
         )
-        if statuses is None or row["status"] in statuses
+        if row["status"] not in excluded and (statuses is None or row["status"] in statuses)
     ]
 
 
@@ -371,10 +373,22 @@ def fill_add(db, argv):
         command = option(command, "--project-id", selected)
     title = field(tr("Idea title", "Idea のタイトル"), args.title or "")
     if not title.strip():
+        print_wrapped(tr("Enter a single-line title.", "タイトルを1行で入力してください。"))
         return None
     label = tr("Idea details (optional)", "Idea の詳細（任意）")
     detail = multiline(label) if args.detail is None else edit_field("detail", label, args.detail)
     return confirmed(option(command, "--detail", detail) + ["--", title], True)
+
+
+def idea_options(db, include_planned=False):
+    return [
+        (f"{row['id']}  {row['project']}  {row['title']}", row["id"])
+        for row in db.execute(
+            """SELECT i.*, p.name AS project FROM ideas i JOIN projects p ON p.id = i.project_id
+               WHERE ? OR i.planned_at IS NULL ORDER BY i.id""",
+            (include_planned,),
+        )
+    ]
 
 
 def fill_idea(db, argv):
@@ -385,13 +399,7 @@ def fill_idea(db, argv):
         parser.add_argument("--title")
         parser.add_argument("--detail")
     args = parser.parse_args(argv[1:])
-    options = [
-        (f"{row['id']}  {row['project']}  {row['title']}", row["id"])
-        for row in db.execute(
-            """SELECT i.*, p.name AS project FROM ideas i JOIN projects p ON p.id = i.project_id
-               WHERE i.planned_at IS NULL ORDER BY i.id"""
-        )
-    ]
+    options = idea_options(db)
     target = choose_value("Idea", options, args.id)
     if target is None:
         return None
@@ -430,28 +438,27 @@ def fill_reply(db, argv):
 
 
 def fill_project(db, argv):
-    action = argv[1]
-    parser = ArgumentParser(prog=f"cq project {action}", add_help=False)
-    if action != "add":
+    action = argv[1] if len(argv) > 1 and not argv[1].startswith("-") else None
+    command = argv[:2] if action else argv[:1]
+    parser = ArgumentParser(prog="cq " + " ".join(command), add_help=False)
+    if action in ("edit", "rm", "remove"):
         parser.add_argument("id", nargs="?", type=int)
     fields = (
         ("path", tr("Repository path", "リポジトリのパス"), field), ("name", tr("Project name", "プロジェクト名"), field),
         ("prompt", tr("Project instructions", "プロジェクトの共通指示"), multiline), ("branch", tr("Branch mode (per-task/current)", "ブランチ運用（per-task/current）"), field),
         ("base", tr("Base branch (inherit/unset/branch)", "開始元ブランチ（inherit/unset/ブランチ名）"), field),
     )
-    if action in ("add", "edit"):
+    if action in (None, "add", "edit"):
         for key, _, _ in fields:
             parser.add_argument(f"--{key}")
-        models = ArgumentParser(add_help=False)
-        model_arguments(models, project=True)
-        _, options = parser_candidates(models)
-        fields += tuple((option.dest, option.help, field) for option in options.values())
-        for flag, argument in options.items():
-            parser.add_argument(flag, type=argument.type)
-    args = parser.parse_args(argv[2:])
-    command = ["project", action]
+        model_arguments(parser, project=True)
+        _, options = parser_candidates(parser)
+        field_keys = {key for key, _, _ in fields}
+        fields += tuple((argument.dest, argument.help, field) for argument in options.values()
+                        if argument.dest not in field_keys)
+    args = parser.parse_args(argv[len(command):])
     row = None
-    if action != "add":
+    if action in ("edit", "rm", "remove"):
         target = choose_value(tr("Project", "プロジェクト"), project_options(db), args.id)
         if target is None:
             return None
@@ -461,7 +468,8 @@ def fill_project(db, argv):
         row = db.execute("SELECT * FROM projects WHERE id=? AND retired=0", (target,)).fetchone()
         if row is None:
             return command
-    defaults = dict(row) if row else {"path": str(repo_here() or "."), "name": "", "prompt": "", "branch": ""}
+    default_path = str(repo_here() or ".") if action == "add" else "."
+    defaults = dict(row) if row else {"path": default_path, "name": "", "prompt": "", "branch": ""}
     for key in ("base", "planner_model", "implementation_model", "allowed_models"):
         if defaults.get(key) is None:
             defaults[key] = "inherit"
@@ -469,7 +477,7 @@ def fill_project(db, argv):
         current = defaults[key] or ""
         supplied = getattr(args, key)
         initial = current if supplied is None else supplied
-        if action == "edit" or (read is multiline and supplied is not None):
+        if action == "edit" or supplied is not None:
             value = edit_field(key, label, initial)
         elif read is multiline:
             value = read(label, initial)
@@ -479,24 +487,158 @@ def fill_project(db, argv):
             command = option(command, f"--{key.replace('_', '-')}", value)
     if action == "edit" and len(command) == 3:
         return None
-    return confirmed(command, True)
+    return confirmed(command, len(command) > 1)
+
+
+TASK_STATUS_CHOICES = {
+    "retry": {"NEEDS_REVIEW", "INTERRUPTED", "AUTH_REQUIRED", "RETRY_WAIT", "ABORTED"},
+    "abort": {"NEEDS_REVIEW", "WAITING_FOR_INPUT"},
+}
+POSITIONAL_LABELS = {
+    "instruction": ("Revision request", "修正指示"),
+}
+
+
+def argument_choices(db, command, argument):
+    if argument.dest == "project_id":
+        return tr("Project", "プロジェクト"), project_options(db)
+    if argument.dest != "id":
+        return None
+    if command[0] == "idea":
+        return "Idea", idea_options(db, include_planned=command[-1] == "show")
+    action = command[-1]
+    excluded = () if action in ("show", "logs", "resolve") else ("RUNNING", "REMOVED", "SUPERSEDED")
+    if action == "done":
+        excluded += ("DONE", "QUEUED")
+    if action == "revise":
+        excluded += ("RESUME_QUEUED",)
+    options = task_options(db, TASK_STATUS_CHOICES.get(action), excluded)
+    if action == "resolve":
+        conflicts = {row["task_id"] for row in db.execute(
+            "SELECT task_id FROM remote_tasks WHERE connection = ? AND writeback = 'conflict'",
+            (get_setting(db, "nextcloud_connection"),),
+        )}
+        options = [(label, value) for label, value in options if value in conflicts]
+    return tr("Task", "タスク"), options
+
+
+def prompt_argument(db, command, argument, supplied, current=None):
+    target = argument_choices(db, command, argument)
+    if target is not None:
+        return choose_value(*target, supplied)
+    label = argument.help
+    if not label or label == argparse.SUPPRESS:
+        label = tr(*POSITIONAL_LABELS.get(argument.dest, (argument.dest, argument.dest)))
+    initial = supplied if supplied is not None else current
+    if argument.dest == "topic":
+        return tokens(field(label, " ".join(initial or [])))
+    if isinstance(argument, argparse._StoreTrueAction):
+        return choose_value(label, [(tr("No", "いいえ"), False), (tr("Yes", "はい"), True)], bool(initial))
+    if argument.choices is not None:
+        return choose_value(label, [(str(choice), str(choice)) for choice in argument.choices], initial)
+    if argument.dest == "instruction" and initial is None:
+        return multiline(label)
+    if argument.dest in ("context_file", "instruction") or initial is not None:
+        return edit_field(argument.dest, label, "" if initial is None else str(initial))
+    return field(label, "" if initial is None else str(initial))
+
+
+def fill_arguments(db, parser, command, argv):
+    # This parser belongs to this prompt only. The normal CLI parser validates
+    # the completed command, including required arguments and choices.
+    arguments = [argument for argument in parser._actions if not isinstance(
+        argument, (argparse._HelpAction, argparse._SubParsersAction)
+    )]
+    groups = parser._mutually_exclusive_groups
+    group_members = {argument for group in groups for argument in group._group_actions}
+    required = {argument for argument in arguments if argument.required}
+    for argument in arguments:
+        argument.required = False
+        if not argument.option_strings and argument.nargs is None:
+            argument.nargs = "?"
+    required_groups = {group for group in groups if group.required}
+    for group in groups:
+        group.required = False
+    supplied = parser.parse_args(argv)
+    current = settings(db) if command[0] in ("config", "settings") else {}
+    options, positionals = [], []
+    for argument in arguments:
+        if argument in group_members:
+            continue
+        original = current.get(argument.dest)
+        value = prompt_argument(db, command, argument, getattr(supplied, argument.dest), original)
+        if value is None:
+            return None
+        if argument in required and isinstance(value, str) and not value.strip():
+            print_wrapped(tr("A value is required.", "値を入力してください。"))
+            return None
+        if not argument.option_strings:
+            positionals.extend(value if isinstance(value, list) else [str(value)])
+        elif isinstance(argument, argparse._StoreTrueAction):
+            if value:
+                options.append(argument.option_strings[0])
+        elif value != original and (value != "" or original is not None or getattr(supplied, argument.dest) == ""):
+            options.append(f"{argument.option_strings[0]}={value}")
+    for group in groups:
+        choices = [(argument.help, argument.option_strings[0]) for argument in group._group_actions]
+        if group not in required_groups:
+            choices.insert(0, (tr("Skip", "指定しない"), ""))
+        default = next((argument.option_strings[0] for argument in group._group_actions
+                        if getattr(supplied, argument.dest)), None)
+        selected = choose_value(tr("Choose an action", "操作を選択"), choices, default)
+        if selected is None:
+            return None
+        if selected:
+            options.append(selected)
+    separator = ["--"] if positionals and command[0] != "help" else []
+    result = [*command, *options, *separator, *positionals]
+    return confirmed(result, bool(current and options))
 
 
 def prepare(argv):
-    if not argv or argv[0] == "help" or "-h" in argv or "--help" in argv:
+    if not argv:
         return argv
-    if argv[0] == "idea" and len(argv) > 1 and argv[1] in ("add", "edit", "rm", "remove"):
-        argv = argv[1:]
+    args_before_separator = argv[:argv.index("--")] if "--" in argv else argv
+    if "-h" in args_before_separator or "--help" in args_before_separator:
+        return argv
+    parser = make_parser()
+    command = []
+    remaining = list(argv)
+    while children := next((action for action in parser._actions
+                            if isinstance(action, argparse._SubParsersAction)), None):
+        if remaining and remaining[0] in children.choices:
+            name = remaining.pop(0)
+        elif command and not remaining and children.required:
+            candidates, _ = parser_candidates(parser)
+            name = choose(tr("Command", "コマンド"), [
+                (f"{key}  {description}", key) for key, (_, description) in candidates.items()
+            ])
+            if name is None:
+                return None
+        else:
+            break
+        command.append(name)
+        parser = children.choices[name]
+    if not command:
+        return argv
+    if command[0] == "project" and len(command) == 1 and remaining and not remaining[0].startswith("-"):
+        return argv
+    action = command[-1]
+    if command == ["help"]:
+        return fill_arguments(None, parser, command, remaining)
+    if not remaining and all(isinstance(argument, argparse._HelpAction) for argument in parser._actions):
+        return command
     with open_queue() as db:
-        if argv[0] == "add":
-            return fill_add(db, argv)
-        if argv[0] in ("edit", "rm", "remove"):
-            return fill_idea(db, argv)
-        if argv[0] == "reply":
-            return fill_reply(db, argv)
-        if argv[0] == "project" and len(argv) > 1 and argv[1] in ("add", "edit", "rm", "remove"):
-            return fill_project(db, argv)
-    return argv
+        if command[0] in ("add", "edit", "rm", "remove", "idea"):
+            if action == "add":
+                return fill_add(db, [action, *remaining])
+            if action in ("edit", "rm", "remove"):
+                return fill_idea(db, [action, *remaining])
+        if command[0] == "reply":
+            return fill_reply(db, [*command, *remaining])
+        if command[0] == "project" and action not in ("ls", "list"):
+            return fill_project(db, [*command, *remaining])
+        return fill_arguments(db, parser, command, remaining)
 
 
 def queue_view():
