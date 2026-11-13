@@ -12,7 +12,7 @@ from typing import NamedTuple
 import unicodedata
 
 from .arguments import ArgumentParser, parser_candidates
-from .cli import BRANCH_MODES, QueueError, git_root, main, make_parser
+from .cli import BRANCH_MODES, QueueError, git_root, main, make_parser, model_arguments
 from .language import language, status_label, tr
 from .status import queue_status
 from .store import open_queue, saved_language
@@ -300,6 +300,16 @@ def option(command, flag, value):
     return [*command, f"{flag}={value}"]
 
 
+def choose_value(title, options, supplied=None, default=0):
+    if supplied is not None:
+        for index, (_, value) in enumerate(options):
+            if value == supplied:
+                return choose(title, options, index)
+        options = [(str(supplied), supplied), *options]
+        default = 0
+    return choose(title, options, default)
+
+
 def task_options(db, statuses=None):
     return [
         (f"{row['id']}  {row['project']}  {row['name']}  {status_label(row['status'])}", row["id"])
@@ -329,41 +339,42 @@ def fill_add(db, argv):
     parser.add_argument("title", nargs="?")
     target = parser.add_mutually_exclusive_group()
     target.add_argument("--project")
-    target.add_argument("--project-id")
+    target.add_argument("--project-id", type=int)
     parser.add_argument("--detail")
     args = parser.parse_args(argv[1:])
-    title = args.title
     command = ["add"]
-    if args.project is None and args.project_id is None:
-        options = project_options(db)
-        root = repo_here()
-        default = 0
-        if root:
-            current = db.execute(
-                "SELECT id FROM projects WHERE path_key=? AND retired=0", (os.path.normcase(str(root)),),
-            ).fetchone()
-            if current:
-                default = next(i for i, (_, key) in enumerate(options) if key == current["id"])
-            else:
-                options.insert(0, (f"{root.name}  {root} " + tr("(register)", "（新規登録）"), "current"))
-        selected = choose(tr("Project", "プロジェクト"), options, default)
-        if selected is None:
-            return None
-        if selected != "current":
-            command = option(command, "--project-id", selected)
-    elif args.project_id is not None:
-        command = option(command, "--project-id", args.project_id)
-    else:
-        command = option(command, "--project", args.project)
-    if title is None:
-        title = field(tr("Idea title", "Idea のタイトル"))
-        if not title.strip():
-            return None
-    detail = args.detail
-    if detail is None:
-        detail = multiline(tr("Idea details (optional)", "Idea の詳細（任意）"))
-    return confirmed(option(command, "--detail", detail) + ["--", title],
-                     args.title is None or args.detail is None)
+    options = project_options(db)
+    root = repo_here()
+    default = 0
+    if root:
+        current = db.execute(
+            "SELECT id FROM projects WHERE path_key=? AND retired=0", (os.path.normcase(str(root)),),
+        ).fetchone()
+        if current:
+            default = next(i for i, (_, key) in enumerate(options) if key == current["id"])
+        else:
+            options.insert(0, (f"{root.name}  {root} " + tr("(register)", "（新規登録）"), "current"))
+    supplied = args.project_id
+    if args.project is not None:
+        matches = [row["id"] for row in db.execute(
+            "SELECT id FROM projects WHERE retired=0 AND name=?", (args.project,),
+        )]
+        supplied = matches[0] if len(matches) == 1 else ("--project", args.project)
+        if isinstance(supplied, tuple):
+            options.insert(0, (args.project, supplied))
+    selected = choose_value(tr("Project", "プロジェクト"), options, supplied, default)
+    if selected is None:
+        return None
+    if isinstance(selected, tuple):
+        command = option(command, *selected)
+    elif selected != "current":
+        command = option(command, "--project-id", selected)
+    title = field(tr("Idea title", "Idea のタイトル"), args.title or "")
+    if not title.strip():
+        return None
+    label = tr("Idea details (optional)", "Idea の詳細（任意）")
+    detail = multiline(label) if args.detail is None else edit_field("detail", label, args.detail)
+    return confirmed(option(command, "--detail", detail) + ["--", title], True)
 
 
 def fill_idea(db, argv):
@@ -374,16 +385,14 @@ def fill_idea(db, argv):
         parser.add_argument("--title")
         parser.add_argument("--detail")
     args = parser.parse_args(argv[1:])
-    target = args.id
-    if target is None:
-        options = [
-            (f"{row['id']}  {row['project']}  {row['title']}", row["id"])
-            for row in db.execute(
-                """SELECT i.*, p.name AS project FROM ideas i JOIN projects p ON p.id = i.project_id
-                   WHERE i.planned_at IS NULL ORDER BY i.id"""
-            )
-        ]
-        target = choose("Idea", options)
+    options = [
+        (f"{row['id']}  {row['project']}  {row['title']}", row["id"])
+        for row in db.execute(
+            """SELECT i.*, p.name AS project FROM ideas i JOIN projects p ON p.id = i.project_id
+               WHERE i.planned_at IS NULL ORDER BY i.id"""
+        )
+    ]
+    target = choose_value("Idea", options, args.id)
     if target is None:
         return None
     command = [action, str(target)]
@@ -392,16 +401,13 @@ def fill_idea(db, argv):
     idea = db.execute("SELECT * FROM ideas WHERE id = ?", (target,)).fetchone()
     if idea is None or idea["planned_at"]:
         return command
-    prompted = False
     for key, label in (("title", tr("Idea title", "Idea のタイトル")),
                        ("detail", tr("Idea details", "Idea の詳細"))):
         value = getattr(args, key)
-        if value is None:
-            prompted = True
-            value = edit_field(key, label, idea[key])
+        value = edit_field(key, label, idea[key] if value is None else value)
         if value != idea[key]:
             command = option(command, f"--{key}", value)
-    return confirmed(command, prompted) if len(command) > 2 else None
+    return confirmed(command, True) if len(command) > 2 else None
 
 
 def fill_reply(db, argv):
@@ -409,19 +415,18 @@ def fill_reply(db, argv):
     parser.add_argument("id", nargs="?", type=int)
     parser.add_argument("answer", nargs="?")
     args = parser.parse_args(argv[1:])
-    target = args.id if args.id is not None else choose(
-        tr("Task", "タスク"), task_options(db, {"WAITING_FOR_INPUT"}),
-    )
+    target = choose_value(tr("Task", "タスク"), task_options(db, {"WAITING_FOR_INPUT"}), args.id)
     if target is None:
         return None
     answer = args.answer
     attempt = latest_attempt(db, target)
     task = db.execute("SELECT status FROM tasks WHERE id = ?", (target,)).fetchone()
-    prompted = answer is None and attempt and task and task["status"] == "WAITING_FOR_INPUT"
-    if prompted:
-        print_wrapped(attempt["reason"])
-        answer = multiline(tr("Answer", "回答"))
-    return confirmed(["reply", str(target), "--", answer or ""], prompted)
+    if not (attempt and task and task["status"] == "WAITING_FOR_INPUT"):
+        return ["reply", str(target), "--", answer or ""]
+    print_wrapped(attempt["reason"] or "")
+    label = tr("Answer", "回答")
+    answer = multiline(label) if answer is None else edit_field("answer", label, answer)
+    return confirmed(["reply", str(target), "--", answer], True)
 
 
 def fill_project(db, argv):
@@ -437,11 +442,17 @@ def fill_project(db, argv):
     if action in ("add", "edit"):
         for key, _, _ in fields:
             parser.add_argument(f"--{key}")
+        models = ArgumentParser(add_help=False)
+        model_arguments(models, project=True)
+        _, options = parser_candidates(models)
+        fields += tuple((option.dest, option.help, field) for option in options.values())
+        for flag, argument in options.items():
+            parser.add_argument(flag, type=argument.type)
     args = parser.parse_args(argv[2:])
     command = ["project", action]
     row = None
     if action != "add":
-        target = args.id if args.id is not None else choose(tr("Project", "プロジェクト"), project_options(db))
+        target = choose_value(tr("Project", "プロジェクト"), project_options(db), args.id)
         if target is None:
             return None
         command += [str(target)]
@@ -450,34 +461,29 @@ def fill_project(db, argv):
         row = db.execute("SELECT * FROM projects WHERE id=? AND retired=0", (target,)).fetchone()
         if row is None:
             return command
-    defaults = dict(row) if row else {"path": str(repo_here() or "."), "name": "", "prompt": "", "branch": "", "base": None}
-    if defaults["base"] is None:
-        defaults["base"] = "inherit"
-    prompted = False
+    defaults = dict(row) if row else {"path": str(repo_here() or "."), "name": "", "prompt": "", "branch": ""}
+    for key in ("base", "planner_model", "implementation_model", "allowed_models"):
+        if defaults.get(key) is None:
+            defaults[key] = "inherit"
     for key, label, read in fields:
-        value = getattr(args, key)
-        if value is None:
-            prompted = True
-            current = defaults[key] or ""
-            if action == "edit":
-                value = edit_field(key, label, current)
-            else:
-                value = project_field(key, label, current) if read is field else read(label, current)
-            if value == current:
-                continue
-        command = option(command, f"--{key}", value)
+        current = defaults[key] or ""
+        supplied = getattr(args, key)
+        initial = current if supplied is None else supplied
+        if action == "edit" or (read is multiline and supplied is not None):
+            value = edit_field(key, label, initial)
+        elif read is multiline:
+            value = read(label, initial)
+        else:
+            value = project_field(key, label, initial)
+        if value != current or (action == "add" and (key == "path" or supplied is not None)):
+            command = option(command, f"--{key.replace('_', '-')}", value)
     if action == "edit" and len(command) == 3:
         return None
-    return confirmed(command, prompted)
+    return confirmed(command, True)
 
 
 def prepare(argv):
     if not argv or argv[0] == "help" or "-h" in argv or "--help" in argv:
-        return argv
-    if argv[0] == "project" and any(
-        flag.split("=", 1)[0] in ("--planner-model", "--implementation-model", "--allowed-models")
-        for flag in argv[1:]
-    ):
         return argv
     if argv[0] == "idea" and len(argv) > 1 and argv[1] in ("add", "edit", "rm", "remove"):
         argv = argv[1:]

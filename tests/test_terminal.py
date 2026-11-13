@@ -183,19 +183,31 @@ class SuggestionTest(unittest.TestCase):
                     return ""
                 return initial
 
-            with patch("codex_queue.terminal.windows_input", side_effect=complete_field), patch(
+            with patch("codex_queue.terminal.choose", side_effect=lambda label, options, default: options[default][1]), patch(
+                "codex_queue.terminal.windows_input", side_effect=complete_field,
+            ), patch(
                 "codex_queue.terminal.confirmed", side_effect=lambda command, prompted: command,
             ):
                 self.assertEqual(["project", "edit", "1", "--name=New project name", "--prompt="], fill_project(db, ["project", "edit", "1"]))
                 self.assertEqual(["edit", "1", "--detail="], fill_idea(db, ["edit", "1"]))
-            with patch("codex_queue.terminal.windows_input", side_effect=lambda *args, initial, **kwargs: initial):
+            with patch("codex_queue.terminal.choose", return_value=1), patch(
+                "codex_queue.terminal.windows_input", side_effect=lambda *args, initial, **kwargs: initial,
+            ):
                 self.assertIsNone(fill_project(db, ["project", "edit", "1"]))
                 self.assertIsNone(fill_idea(db, ["edit", "1"]))
+            with patch("codex_queue.terminal.choose", return_value=1), patch(
+                "codex_queue.terminal.edit_field", side_effect=lambda key, label, initial: initial,
+            ) as prompt, patch("codex_queue.terminal.screen_input", return_value="y"):
+                command = fill_project(db, ["project", "edit", "1", "--planner-model=custom"])
+                self.assertEqual("custom", self.parser.parse_args(command).planner_model)
+                self.assertIn("custom", [call.args[2] for call in prompt.call_args_list])
 
             def clear_field(parser, message, *, show_queue, complete, initial):
                 return initial if message.startswith(("Repository path", "Idea title")) else ""
 
-            with patch("codex_queue.terminal.windows_input", side_effect=clear_field), patch(
+            with patch("codex_queue.terminal.choose", return_value=1), patch(
+                "codex_queue.terminal.windows_input", side_effect=clear_field,
+            ), patch(
                 "codex_queue.terminal.screen_input", return_value="y",
             ), patch("codex_queue.cli.wake"), contextlib.redirect_stdout(io.StringIO()):
                 project = fill_project(db, ["project", "edit", "1"])
