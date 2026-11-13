@@ -217,7 +217,7 @@ def manage_task(db, args):
                ORDER BY (t.status IN ('DONE', 'ABORTED', 'WAITING_FOR_INPUT')), t.priority, t.id"""
         ):
             if row["status"] in OUTCOMES and section == "ToDo":
-                section = "Done / Abort / Waiting_response"
+                section = "Done / Abort / Waiting response"
                 print(section)
             print(f"{row['id']}\t{row['project_name']}\t{status_label(row['status'])}\t{row['name']}")
             if row["status"] not in ("DONE", "QUEUED"):

@@ -46,17 +46,17 @@ def queue_status(db):
     lines = ["Codex Queue", tr("Automatic execution enabled", "自動実行は有効です") if get_setting(db, "enabled") == "1" else tr("Automatic execution paused", "自動実行は一時停止中です")]
     rows = db.execute(
         """SELECT t.*, p.name AS project FROM tasks t JOIN projects p ON p.id=t.project_id
-           WHERE t.status <> 'REMOVED' ORDER BY (t.status = 'DONE'), t.priority, t.id"""
+           WHERE t.status <> 'REMOVED' ORDER BY t.priority, t.id"""
     )
     running = []
     tasks = []
-    replies = []
-    results = []
+    results = {status: [] for status in OUTCOMES}
+    counts = dict.fromkeys(OUTCOMES, 0)
     for row in rows:
         status = row["status"]
         label = f"{row['id']}  {row['project']}  {row['name']}"
         if status == "RUNNING":
-            running.append(label)
+            running.append(f"{status_label(status)}  {label}")
             attempt = latest_attempt(db, row["id"])
             if attempt:
                 progress = latest_progress(attempt)
@@ -70,10 +70,13 @@ def queue_status(db):
                 running.append(tr("  Preparing workspace", "  作業フォルダを準備中"))
             continue
         waiting = status == "WAITING_FOR_INPUT"
-        destination = results if status in OUTCOMES else tasks
-        destination.append(f"{status_label(status)}  {label}")
-        if waiting:
-            replies.append(str(row["id"]))
+        if status in results:
+            counts[status] += 1
+            destination = results[status]
+            destination.append(label)
+        else:
+            destination = tasks
+            destination.append(f"{status_label(status)}  {label}")
         if status in ("QUEUED", "DONE"):
             continue
         attempt = latest_attempt(db, row["id"])
@@ -98,18 +101,16 @@ def queue_status(db):
             ideas.append(label)
             if row["planning_error"]:
                 ideas.append(f"  {row['planning_error']}")
+    for status, heading in (("WAITING_FOR_INPUT", "Waiting response"), ("ABORTED", "Abort")):
+        if counts[status]:
+            lines.extend(["", f"{heading} ({counts[status]})", *results[status]])
     lines.extend(["", "Idea", *(ideas or [tr("No ideas", "Idea はありません")])])
     if planned:
         lines.extend(["Planned", *planned])
-    lines.extend(["", "ToDo", tr("In progress", "実行中"), *(running or [tr("No tasks running", "実行中のタスクはありません")])])
-    lines.extend([tr("Tasks", "タスク一覧"), *(tasks or [tr("No other tasks", "ほかのタスクはありません")])])
-    lines.extend(["", "Done / Abort / Waiting_response"])
-    if replies:
-        lines.append(tr("Replies needed ({count}): {ids}", "返信待ち（{count}件）：{ids}",
-                        count=len(replies), ids=", ".join(replies)))
-    else:
-        lines.append(tr("No replies needed", "返信待ちのタスクはありません"))
-    lines.extend(results)
+    todos = running + tasks
+    lines.extend(["", "ToDo", *(todos or [tr("No ToDos", "ToDo はありません")])])
+    if results["DONE"]:
+        lines.extend(["", "Done", *results["DONE"]])
     if error := get_setting(db, "nextcloud_error"):
         lines.append(error)
     return "\n".join(lines)

@@ -351,12 +351,13 @@ class QueueViewTest(unittest.TestCase):
                     japanese_view = queue_view()
                 finally:
                     language.reset(token)
-            self.assertLess(view.index("Index notes"), view.index("Tasks\n"))
+            self.assertLess(view.index("\nToDo\n"), view.index("Index notes"))
+            self.assertLess(view.index("Index notes"), view.index("Fix search"))
             self.assertIn("Running: git status", view)
             self.assertLess(view.index("Fix search"), view.index("Update docs"))
             self.assertLess(view.index("Update docs"), view.index("First release"))
             self.assertNotIn("Discarded task", view)
-            self.assertIn("タスク一覧", japanese_view)
+            self.assertNotIn("タスク一覧", japanese_view)
             self.assertIn("待機中  2  Notes  Fix search", japanese_view)
             self.assertIn("実行中: git status", japanese_view)
 
