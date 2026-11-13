@@ -1,0 +1,112 @@
+name: Promote develop
+
+on:
+  workflow_dispatch:
+  pull_request_review:
+    types: [submitted]
+
+permissions: {}
+
+concurrency:
+  group: promote-develop
+  cancel-in-progress: false
+
+jobs:
+  open-pr:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Open the promotion PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          existing=$(gh pr list --base main --head develop --state open --json url --jq '.[0].url // ""')
+          if [[ -n "$existing" ]]; then
+            echo "$existing"
+          else
+            gh pr create --base main --head develop --title 'develop を main に反映' \
+              --body '- 検証済みの develop を main に取り込み、GitHub Release を公開します。'
+          fi
+
+  review:
+    if: >-
+      github.event_name == 'pull_request_review' &&
+      github.event.review.state == 'approved' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.ref == 'develop' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.review.commit_id == github.event.pull_request.head.sha &&
+      !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      approved: ${{ steps.review.outputs.approved }}
+    steps:
+      - name: Check reviewer permissions
+        id: review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REVIEWER: ${{ github.event.review.user.login }}
+        run: |
+          permission=$(gh api "repos/$GH_REPO/collaborators/$REVIEWER/permission" --jq .permission)
+          case "$permission" in
+            admin|maintain|write) echo 'approved=true' >> "$GITHUB_OUTPUT" ;;
+          esac
+
+  verify:
+    needs: review
+    if: needs.review.outputs.approved == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/verify.yml
+    with:
+      ref: ${{ github.sha }}
+
+  merge:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      merged: ${{ steps.merge.outputs.merged }}
+    steps:
+      - name: Merge the approved commit
+        id: merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REVIEW_ID: ${{ github.event.review.id }}
+          REVIEWER: ${{ github.event.review.user.login }}
+          HEAD_SHA: ${{ github.event.review.commit_id }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          pr=$(gh api "repos/$GH_REPO/pulls/$PR_NUMBER")
+          jq -e --arg head "$HEAD_SHA" --arg base "$BASE_SHA" --arg repo "$GH_REPO" '
+            .state == "open" and (.draft | not)
+            and .head.ref == "develop" and .head.repo.full_name == $repo and .head.sha == $head
+            and .base.ref == "main" and .base.sha == $base
+          ' <<< "$pr" > /dev/null
+          gh api --paginate --slurp "repos/$GH_REPO/pulls/$PR_NUMBER/reviews" |
+            jq -e --arg reviewer "$REVIEWER" --argjson id "$REVIEW_ID" '
+              [ .[][] | select(.user.login == $reviewer and .state != "COMMENTED" and .state != "PENDING") ]
+              | max_by(.id) | .id == $id and .state == "APPROVED"
+            ' > /dev/null
+          gh pr merge "$PR_NUMBER" --merge --match-head-commit "$HEAD_SHA"
+          echo 'merged=true' >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: merge
+    if: needs.merge.outputs.merged == 'true'
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    uses: ./.github/workflows/release.yml

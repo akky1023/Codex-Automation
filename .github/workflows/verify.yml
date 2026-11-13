@@ -1,0 +1,43 @@
+name: Verify
+
+on:
+  pull_request:
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        required: true
+      wheel-artifact:
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+      - run: python -m unittest discover -s tests -v
+        env:
+          PYTHONPATH: src
+      - run: python -m pip wheel --no-deps --wheel-dir dist .
+      - name: Verify the installed command
+        shell: pwsh
+        run: |
+          $wheel = Get-ChildItem dist/*.whl
+          python -m pip install $wheel.FullName
+          cq --help
+      - uses: actions/upload-artifact@v4
+        if: inputs.wheel-artifact
+        with:
+          name: codex-queue-wheel
+          path: dist/*.whl
+          if-no-files-found: error

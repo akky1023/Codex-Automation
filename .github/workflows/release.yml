@@ -1,40 +1,65 @@
-name: Verify and release
+name: Release Please
 
 on:
   push:
-    tags: ['v*']
-  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  workflow_call:
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
-  verify:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.10'
-      - run: python -m unittest discover -s tests -v
-        env:
-          PYTHONPATH: src
-      - run: python -m pip wheel --no-deps --wheel-dir dist .
-      - name: Verify the installed command
-        shell: pwsh
-        run: |
-          $wheel = Get-ChildItem dist/*.whl
-          python -m pip install $wheel.FullName
-          cq --help
-      - uses: actions/upload-artifact@v4
-        if: startsWith(github.ref, 'refs/tags/')
-        with:
-          name: codex-queue-wheel
-          path: dist/*.whl
-
   release:
-    needs: verify
-    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    outputs:
+      tag: ${{ steps.publish.outputs.tag_name || steps.prepare.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: prepare
+        with:
+          release-type: python
+          target-branch: main
+          include-component-in-tag: false
+      - name: Merge the Release Please PR
+        if: steps.prepare.outputs.prs != '' && !fromJSON(steps.prepare.outputs.prs)[0].draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ fromJSON(steps.prepare.outputs.prs || '[{}]')[0].number }}
+        run: |
+          pr=$(gh api "repos/$GH_REPO/pulls/$PR_NUMBER")
+          sha=$(jq -er --arg repo "$GH_REPO" '
+            select(.user.login == "github-actions[bot]" and .base.ref == "main"
+              and .head.repo.full_name == $repo
+              and .head.ref == "release-please--branches--main"
+              and (.draft | not) and .state == "open")
+            | .head.sha' <<< "$pr")
+          gh pr merge "$PR_NUMBER" --squash --match-head-commit "$sha"
+      - uses: googleapis/release-please-action@v4
+        id: publish
+        if: steps.prepare.outputs.prs != '' && !fromJSON(steps.prepare.outputs.prs)[0].draft
+        with:
+          release-type: python
+          target-branch: main
+          include-component-in-tag: false
+          skip-github-pull-request: true
+
+  wheel:
+    needs: release
+    if: needs.release.outputs.tag != ''
+    permissions:
+      contents: read
+    uses: ./.github/workflows/verify.yml
+    with:
+      ref: refs/tags/${{ needs.release.outputs.tag }}
+      wheel-artifact: true
+
+  attach:
+    needs: [release, wheel]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -43,14 +68,9 @@ jobs:
         with:
           name: codex-queue-wheel
           path: dist
-      - name: Publish wheel
+      - name: Attach the wheel
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ github.ref_name }}
-        run: |
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/*.whl --clobber
-          else
-            gh release create "$TAG" dist/*.whl --verify-tag --generate-notes
-          fi
+          TAG: ${{ needs.release.outputs.tag }}
+        run: gh release upload "$TAG" dist/*.whl --clobber
