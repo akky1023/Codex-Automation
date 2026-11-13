@@ -279,16 +279,23 @@ def manage_idea(db, args):
     if action in ("ls", "list", "show"):
         if action == "show":
             by_id(db, "ideas", args.id)
+        planned = getattr(args, "planned", False)
         for row in db.execute(
             """SELECT i.*, p.name AS project FROM ideas i JOIN projects p ON p.id = i.project_id
-               WHERE ? IS NULL OR i.id = ? ORDER BY i.id""",
-            (getattr(args, "id", None), getattr(args, "id", None)),
+               WHERE CASE WHEN ? IS NULL THEN (i.planned_at IS NOT NULL) = ? ELSE i.id = ? END
+               ORDER BY i.id""",
+            (getattr(args, "id", None), planned, getattr(args, "id", None)),
         ):
             state = tr("Planned", "計画済み") if row["planned_at"] else tr("Unplanned", "未計画")
             print(f"{row['id']}\t{row['project']}\t{state}\t{row['title']}")
             if action == "show":
+                print(f"Planned  {'yes' if row['planned_at'] else 'no'}")
+                if row["planned_at"]:
+                    print(f"Planned at  {row['planned_at']} UTC")
                 if row["detail"]:
                     print(row["detail"])
+                if row["planning_error"]:
+                    print(row["planning_error"])
                 for task in db.execute("SELECT id, name FROM tasks WHERE idea_id = ? AND status <> 'REMOVED' ORDER BY id", (row["id"],)):
                     print(f"ToDo {task['id']}  {task['name']}")
         return
@@ -411,7 +418,8 @@ def make_parser():
     target = add_idea.add_mutually_exclusive_group()
     target.add_argument("--project")
     target.add_argument("--project-id", type=positive)
-    idea_actions.add_parser("ls", aliases=["list"], help=tr("List ideas", "Idea を一覧表示"))
+    list_ideas = idea_actions.add_parser("ls", aliases=["list"], help=tr("List unplanned ideas", "未計画の Idea を一覧表示"))
+    list_ideas.add_argument("--planned", action="store_true", help=tr("List planned ideas", "計画済みの Idea を一覧表示"))
     for action, description in (
         ("show", tr("Show an idea and its ToDos", "Idea と子 ToDo を表示")),
         ("edit", tr("Edit an unplanned idea", "未計画の Idea を編集")),

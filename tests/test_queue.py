@@ -119,6 +119,27 @@ class QueueTest(unittest.TestCase):
         self.assertIn("Done / Abort / Waiting_response", view)
         self.assertIn("Refused by policy", view)
 
+    def test_automatic_planning_updates_idea_state(self):
+        self.cq("project", "add", "--planner-model", "project-planner", "--allowed-models", "small,large")
+        self.cq("idea", "add", "Improve access", "--detail", "clarify first")
+        self.assertIn("Planned  no", self.cq("idea", "show", "1"))
+        self.sql("INSERT INTO settings VALUES ('enabled', '1')")
+        self.cq("_worker")
+        self.assertEqual([], self.sql("SELECT id FROM tasks"))
+        self.sql("UPDATE settings SET value='0' WHERE key='enabled'")
+        self.cq("config", "--idea-planning", "auto")
+        self.sql("UPDATE settings SET value='1' WHERE key='enabled'")
+        self.cq("_worker")
+        self.assertIn("Which screen?", self.cq("idea", "show", "1"))
+        self.assertEqual([], self.sql("SELECT id FROM tasks"))
+        self.cq("idea", "edit", "1", "--detail", "Apply to the settings screen")
+        self.wait(["DONE", "ABORTED"])
+        self.assertIn("Planned  yes", self.cq("idea", "show", "1"))
+        self.assertNotIn("Improve access", self.cq("idea", "ls"))
+        self.assertIn("Improve access", self.cq("idea", "ls", "--planned"))
+        self.assertIn("\nPlanned\n1  repo  Improve access", self.cq("status"))
+        self.assertEqual([(None,)], self.sql("SELECT planning_error FROM ideas"))
+
     def sql(self, sql, params=()):
         db = sqlite3.connect(self.database)
         try:

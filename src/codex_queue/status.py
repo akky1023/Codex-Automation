@@ -85,15 +85,22 @@ def queue_status(db):
                 destination.append("  " + tr("Retry after {time}", "再試行予定 {time}", time=retry.isoformat()))
         if waiting:
             destination.append(f'  cq reply {row["id"]} "..."')
-    ideas = [
-        f"{row['id']}  {row['project']}  {row['title']}"
-        + (tr("  (planned)", "  （計画済み）") if row["planned_at"] else "")
-        for row in db.execute(
-            """SELECT i.*, p.name AS project FROM ideas i JOIN projects p ON p.id=i.project_id
-               ORDER BY i.id"""
-        )
-    ]
+    ideas = []
+    planned = []
+    for row in db.execute(
+        """SELECT i.*, p.name AS project FROM ideas i JOIN projects p ON p.id=i.project_id
+           ORDER BY i.id"""
+    ):
+        label = f"{row['id']}  {row['project']}  {row['title']}"
+        if row["planned_at"]:
+            planned.append(label)
+        else:
+            ideas.append(label)
+            if row["planning_error"]:
+                ideas.append(f"  {row['planning_error']}")
     lines.extend(["", "Idea", *(ideas or [tr("No ideas", "Idea はありません")])])
+    if planned:
+        lines.extend(["Planned", *planned])
     lines.extend(["", "ToDo", tr("In progress", "実行中"), *(running or [tr("No tasks running", "実行中のタスクはありません")])])
     lines.extend([tr("Tasks", "タスク一覧"), *(tasks or [tr("No other tasks", "ほかのタスクはありません")])])
     lines.extend(["", "Done / Abort / Waiting_response"])
