@@ -63,18 +63,39 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      attestations: write
+      id-token: write
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: codex-queue-wheel
           path: dist
-      - name: Attach the wheel
+      - name: Verify the wheel SHA-256
+        working-directory: dist
+        run: sha256sum --check --strict SHA256SUMS
+      - name: Sign the wheel build provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/*.whl
+      - name: Attach and verify the wheel
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.release.outputs.tag }}
         run: |
-          gh release upload "$TAG" dist/*.whl --clobber
+          for file in dist/*.whl dist/SHA256SUMS; do
+            name=${file##*/}
+            expected="sha256:$(sha256sum "$file" | cut -d ' ' -f 1)"
+            actual=$(gh api "repos/$GH_REPO/releases/tags/$TAG" --jq ".assets[] | select(.name == \"$name\") | .digest")
+            if [[ -z "$actual" ]]; then
+              gh release upload "$TAG" "$file"
+              actual=$(gh api "repos/$GH_REPO/releases/tags/$TAG" --jq ".assets[] | select(.name == \"$name\") | .digest")
+            fi
+            if [[ "$actual" != "$expected" ]]; then
+              echo "::error::SHA-256 mismatch for $name"
+              exit 1
+            fi
+          done
           if [[ "$TAG" == 'v0.1.0' ]]; then
             gh release edit "$TAG" --notes '初版'
           fi
