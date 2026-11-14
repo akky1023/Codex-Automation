@@ -8,12 +8,13 @@ import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+from codex_queue.editor import edit_text
 from codex_queue.cli import make_parser, manage_project, manage_idea
 from codex_queue.language import language
 from codex_queue.store import SCHEMA
-from codex_queue.terminal import Suggestion, command_text, completion, draw_prompt, edit_field, fill_project, fill_idea, prepare, prompt_frame, queue_view, screen, tokens, windows_input
+from codex_queue.terminal import Suggestion, choose_options, command_text, completion, draw_prompt, edit_field, fill_project, fill_idea, prepare, prompt_frame, queue_view, screen, tokens, windows_input
 from codex_queue.text_layout import text_width, wrap_rows
 from codex_queue.windows_console import ConsoleInput, InputRecord, KeyEvent
 
@@ -120,8 +121,10 @@ class SuggestionTest(unittest.TestCase):
             replies = iter([(str(Path(folder) / "Project "), str(directory) + os.sep),
                             ("per", "per-task"), ("un", "unset")])
 
-            def complete_field(parser, message, *, show_queue, complete):
+            def complete_field(parser, message, *, show_queue, complete, initial, editor=None):
                 self.assertEqual((0, []), complete(""))
+                if not message.startswith(("Repository path", "Branch mode", "Base branch")):
+                    return initial
                 prefix, expected = next(replies)
                 start, choices = complete(prefix)
                 self.assertEqual(0, start)
@@ -131,8 +134,6 @@ class SuggestionTest(unittest.TestCase):
 
             with patch("codex_queue.terminal.windows_input", side_effect=complete_field), patch(
                 "codex_queue.terminal.repo_here", return_value=None,
-            ), patch("codex_queue.terminal.field", return_value=""), patch(
-                "codex_queue.terminal.multiline", return_value="",
             ), patch("codex_queue.terminal.confirmed", side_effect=lambda command, prompted: command):
                 command = fill_project(None, ["project", "add"])
             self.assertIn(f"--path={directory}{os.sep}", command)
@@ -156,6 +157,33 @@ class SuggestionTest(unittest.TestCase):
             self.assertEqual((current, []), draw.call_args_list[0].args[2:4])
 
     @unittest.skipUnless(os.name == "nt", "Windows console input")
+    def test_multiline_editor_applies_or_discards_changes_to_blue_field(self):
+        for exit_key, expected in (("\x13", "日本\n語"), ("\x1b", "日本")):
+            with self.subTest(exit_key=exit_key), patch(
+                "codex_queue.terminal.ConsoleInput.read",
+                side_effect=["\x05", "\r", "語", exit_key, "\r"],
+            ), patch("codex_queue.terminal.virtual_terminal", return_value=contextlib.nullcontext(True)), (
+                contextlib.redirect_stdout(io.StringIO())
+            ) as output:
+                self.assertEqual(expected, edit_field("detail", "Details", "日本"))
+            self.assertIn("\x1b[97;44mcq> 日本", output.getvalue())
+            self.assertIn("Ctrl+S", output.getvalue())
+
+    def test_editor_can_edit_existing_lines_at_the_cursor(self):
+        console = Mock()
+        console.read.side_effect = ["up", "home", "delete", "新", "down", "home", "\b", "\x13"]
+        with patch("codex_queue.editor.draw_editor", return_value=0):
+            self.assertEqual("新行次", edit_text(console, "Details", "前行\n次", True))
+
+    def test_choice_shows_selected_value_in_blue_field(self):
+        with patch("codex_queue.terminal.ConsoleInput.read", side_effect=["down", "\r"]), patch(
+            "codex_queue.terminal.PosixInput.read", side_effect=["down", "\n"],
+        ), contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(2, choose_options("Task", [("First", 1), ("Second", 2)], 0, True))
+        self.assertIn("\x1b[97;44mcq> First", output.getvalue())
+        self.assertIn("\x1b[97;44mcq> Second", output.getvalue())
+
+    @unittest.skipUnless(os.name == "nt", "Windows console input")
     def test_backspace_removes_japanese_characters_in_edit_field(self):
         for backspace in ("\b", "\x7f"):
             with self.subTest(backspace=backspace), patch(
@@ -175,7 +203,7 @@ class SuggestionTest(unittest.TestCase):
             db.execute("INSERT INTO ideas(project_id, title, detail) VALUES (1, 'Idea', 'Keep me too')")
             db.commit()
 
-            def complete_field(parser, message, *, show_queue, complete, initial):
+            def complete_field(parser, message, *, show_queue, complete, initial, editor=None):
                 self.assertEqual((0, []), complete(""))
                 if message.startswith("Project name"):
                     return "New project name"
@@ -197,18 +225,18 @@ class SuggestionTest(unittest.TestCase):
                 self.assertIsNone(fill_idea(db, ["edit", "1"]))
             with patch("codex_queue.terminal.choose", return_value=1), patch(
                 "codex_queue.terminal.edit_field", side_effect=lambda key, label, initial: initial,
-            ) as prompt, patch("codex_queue.terminal.screen_input", return_value="y"):
+            ) as prompt, patch("codex_queue.terminal.field", return_value="y"):
                 command = fill_project(db, ["project", "edit", "1", "--planner-model=custom"])
                 self.assertEqual("custom", self.parser.parse_args(command).planner_model)
                 self.assertIn("custom", [call.args[2] for call in prompt.call_args_list])
 
-            def clear_field(parser, message, *, show_queue, complete, initial):
+            def clear_field(parser, message, *, show_queue, complete, initial, editor=None):
                 return initial if message.startswith(("Repository path", "Idea title")) else ""
 
             with patch("codex_queue.terminal.choose", return_value=1), patch(
                 "codex_queue.terminal.windows_input", side_effect=clear_field,
             ), patch(
-                "codex_queue.terminal.screen_input", return_value="y",
+                "codex_queue.terminal.field", return_value="y",
             ), patch("codex_queue.cli.wake"), contextlib.redirect_stdout(io.StringIO()):
                 project = fill_project(db, ["project", "edit", "1"])
                 idea = fill_idea(db, ["edit", "1"])
@@ -231,13 +259,11 @@ class SuggestionTest(unittest.TestCase):
             )
             with patch("codex_queue.terminal.open_queue", side_effect=lambda: contextlib.nullcontext(db)), patch(
                 "codex_queue.terminal.choose", side_effect=lambda label, options, default: options[default][1],
-            ), patch("codex_queue.terminal.field", side_effect=lambda label, default: default or "15"), patch(
-                "codex_queue.terminal.edit_field", side_effect=lambda key, label, initial: initial,
-            ), patch("codex_queue.terminal.project_field", side_effect=lambda key, label, default: default), patch(
-                "codex_queue.terminal.multiline", return_value="revise it",
-            ), patch(
-                "codex_queue.terminal.screen_input", return_value="y",
-            ):
+            ), patch("codex_queue.terminal.field", side_effect=lambda label, default="": (
+                "y" if label.startswith("Save changes") else default or "15"
+            )), patch("codex_queue.terminal.edit_field", side_effect=lambda key, label, initial: (
+                initial or {"instruction": "revise it", "note": "15"}.get(key, "")
+            )):
                 def parsed(*argv):
                     return self.parser.parse_args(prepare(list(argv)))
 
@@ -256,6 +282,9 @@ class SuggestionTest(unittest.TestCase):
                 self.assertTrue(parsed("idea", "list", "--planned").planned)
                 self.assertEqual("ja", parsed("settings", "--language=ja").language)
                 self.assertEqual("model", parsed("project", "--planner-model=model").planner_model)
+                self.assertEqual("https://cloud.example", parsed(
+                    "nextcloud", "connect", "--server=https://cloud.example",
+                ).server)
                 linked = parsed("nextcloud", "link")
                 self.assertEqual(("15", 1), (linked.list, linked.project_id))
                 self.assertTrue(parsed("nextcloud", "resolve").complete)
@@ -286,8 +315,8 @@ class SuggestionTest(unittest.TestCase):
         token = language.set("en")
         try:
             with patch("codex_queue.terminal.saved_language", return_value="en"), patch(
-                "codex_queue.terminal.windows_input", side_effect=KeyboardInterrupt,
-            ), patch("builtins.input", side_effect=KeyboardInterrupt), patch(
+                "codex_queue.terminal.prompt_input", side_effect=KeyboardInterrupt,
+            ), patch(
                 "codex_queue.terminal.clear",
             ), patch("codex_queue.terminal.queue_view", return_value="Queue"), patch(
                 "codex_queue.terminal.main",

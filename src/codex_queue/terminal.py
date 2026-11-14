@@ -1,5 +1,6 @@
 import argparse
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+import codecs
+from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from collections import deque
 from functools import partial
 from io import StringIO
@@ -13,6 +14,7 @@ import unicodedata
 
 from .arguments import ArgumentParser, parser_candidates
 from .cli import BRANCH_MODES, QueueError, git_root, main, make_parser, model_arguments
+from .editor import edit_text
 from .language import language, status_label, tr
 from .status import queue_status
 from .store import get_setting, open_queue, saved_language, settings
@@ -21,23 +23,50 @@ from .windows_console import ConsoleInput
 from .worker import latest_attempt
 
 
-def keys():
-    import sys
-    import termios
-    import tty
-    from select import select
+class PosixInput:
+    def __init__(self):
+        import sys
 
-    fd = sys.stdin.fileno()
-    saved = termios.tcgetattr(fd)
-    try:
-        tty.setcbreak(fd)
-        key = sys.stdin.read(1)
-        if key == "\x1b" and select([fd], [], [], 0.08)[0]:
-            suffix = os.read(fd, 2)
-            return {b"[A": "up", b"[B": "down"}.get(suffix, "")
-        return key
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        self.decoder = codecs.getincrementaldecoder(sys.stdin.encoding or "utf-8")(errors="replace")
+
+    def read(self):
+        import sys
+        import termios
+        import tty
+        from select import select
+
+        fd = sys.stdin.fileno()
+        saved = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd, termios.TCSANOW)
+            mode = termios.tcgetattr(fd)
+            mode[0] &= ~termios.IXON
+            termios.tcsetattr(fd, termios.TCSANOW, mode)
+            if not select([fd], [], [], 0.03)[0]:
+                return None
+            byte = os.read(fd, 1)
+            if not byte:
+                raise EOFError
+            if byte == b"\x1b":
+                suffix = b""
+                while len(suffix) < 3 and select([fd], [], [], 0.08)[0]:
+                    suffix += os.read(fd, 1)
+                    if suffix[-1:] in b"ABCDFH~":
+                        break
+                return {
+                    b"": "\x1b", b"[A": "up", b"[B": "down", b"[C": "right", b"[D": "left",
+                    b"[H": "home", b"[F": "end", b"[3~": "delete",
+                    b"[5~": "pageup", b"[6~": "pagedown",
+                }.get(suffix, "")
+            return self.decoder.decode(byte) or None
+        finally:
+            termios.tcsetattr(fd, termios.TCSANOW, saved)
+
+
+def prompt_input(parser, message, **kwargs):
+    if os.name == "nt":
+        return windows_input(parser, message, **kwargs)
+    return read_prompt(parser, message, True, console=PosixInput(), **kwargs)
 
 
 def clear():
@@ -51,43 +80,29 @@ def choose(title, options, default=0):
     if not options:
         print(tr("No available choices.", "選択できる項目がありません。"))
         return None
-    if os.name == "nt":
-        with virtual_terminal() as vt:
-            return choose_options(title, options, default, vt)
-    return choose_options(title, options, default, False)
+    output = virtual_terminal() if os.name == "nt" else nullcontext(True)
+    with output as vt:
+        return choose_options(title, options, default, vt)
 
 
 def choose_options(title, options, default, vt):
     index = default
-    console = ConsoleInput() if os.name == "nt" else None
+    console = ConsoleInput() if os.name == "nt" else PosixInput()
+    hint = tr("Up/Down select  Enter accept  Esc cancel", "上下キーで選択  Enter で確定  Esc で戻る")
     while True:
-        columns, height = shutil.get_terminal_size()
-        width = max(1, columns - 1)
-        heading = list(wrap_rows(title + " " + tr(
-            "(Up/Down, Enter, Esc)", "（上下キーで選択、Enter で確定、Esc で戻る）",
-        ), width))[:max(0, height - 2)]
-        rows = []
-        for i, (label, _) in enumerate(options):
-            if i == index:
-                selected_row = len(rows)
-            marker = ">" if i == index else " "
-            rows.extend(wrap_rows(f"{marker} {label}", width))
-        page = max(1, height - len(heading) - 1)
-        start = min(max(0, selected_row - page // 2), max(0, len(rows) - page))
-        visible = [*heading, *rows[start:start + page]]
-        if vt:
-            output = "".join(f"\033[{row};1H{text}" for row, text in enumerate(visible, 1))
-            print("\033[2J" + output, end="", flush=True)
-        else:
-            clear()
-            print("\n".join(visible))
-        if console is None:
-            key = keys()
-        else:
-            while (key := console.read()) is None:
-                time.sleep(0.03)
-                if shutil.get_terminal_size() != (columns, height):
-                    break
+        size = shutil.get_terminal_size()
+        title_rows = len(list(wrap_rows(title, max(1, size.columns - 1))))
+        capacity = max(1, size.lines - title_rows - 4)
+        first = min(max(0, index - capacity // 2), max(0, len(options) - capacity))
+        visible = [
+            fit(("> " if i == index else "  ") + label, max(1, size.columns - 1))
+            for i, (label, _) in enumerate(options[first:first + capacity], first)
+        ]
+        draw_prompt(title, "\n".join(visible), options[index][0], [], 0, size, 0, vt, hint=hint)
+        while (key := console.read()) is None:
+            time.sleep(0.03)
+            if shutil.get_terminal_size() != size:
+                break
         if key == "up":
             index = (index - 1) % len(options)
         elif key == "down":
@@ -96,6 +111,10 @@ def choose_options(title, options, default, vt):
             return options[index][1]
         elif key in ("\x1b", "\x04"):
             return None
+        elif key == "\x03":
+            raise KeyboardInterrupt
+        elif key == "\x1a":
+            raise EOFError
 
 
 def tokens(line):
@@ -226,19 +245,7 @@ def completion(parser, line):
 
 
 def field(label, default=""):
-    result = screen_input(f"{label} [{default}]: ")
-    return default if result == "" else result
-
-
-def project_field(key, label, default):
-    if os.name != "nt" or key not in ("path", "branch", "base"):
-        return field(label, default)
-
-    def complete(prefix):
-        return 0, form_suggestions(key, prefix)
-
-    value = windows_input(None, f"{label} [{default}]", show_queue=False, complete=complete)
-    return value or default
+    return edit_field("", label, default)
 
 
 def form_suggestions(key, prefix):
@@ -253,38 +260,23 @@ def form_suggestions(key, prefix):
     return [Suggestion(value, insertion=value) for value in choices if value.startswith(prefix)]
 
 
+MULTILINE_FIELDS = {"prompt", "detail", "answer", "instruction", "note"}
+
+
 def edit_field(key, label, current):
     def complete(prefix):
         return 0, form_suggestions(key, prefix)
 
-    if os.name == "nt":
-        heading = label + "\n" + tr("Ctrl+U clear", "Ctrl+U で全消去")
-        if key == "prompt":
-            heading += "  |  " + tr("Ctrl+J insert newline", "Ctrl+J で改行")
-        return windows_input(None, heading, show_queue=False, complete=complete, initial=current)
-
-    import readline
-
-    readline.set_pre_input_hook(lambda: readline.insert_text(current))
-    try:
-        return screen_input(label)
-    finally:
-        readline.set_pre_input_hook()
-
-
-def multiline(label, default=""):
-    print_wrapped(label + " " + tr("(finish with a line containing only .; enter . first to keep current text)",
-                                 "（. だけの行で入力終了。最初に . を入力すると現在の内容を保持）"))
-    if default:
-        print_wrapped(default)
-    lines = []
-    while (line := input()) != ".":
-        lines.append(line)
-    return "\n".join(lines) if lines else default
+    heading = label + "\n" + tr("Ctrl+U clear", "Ctrl+U で全消去")
+    kwargs = {"show_queue": False, "complete": complete, "initial": current}
+    if key in MULTILINE_FIELDS:
+        heading += "  |  " + tr("Ctrl+E open editor", "Ctrl+E でエディタを開く")
+        kwargs["editor"] = label.splitlines()[-1]
+    return prompt_input(None, heading, **kwargs)
 
 
 def confirmed(argv, prompted):
-    if prompted and screen_input(tr("Save changes? [y/N] ", "変更を保存しますか？ [y/N] ")).strip().lower() not in ("y", "yes"):
+    if prompted and field(tr("Save changes? [y/N]", "変更を保存しますか？ [y/N]")).strip().lower() not in ("y", "yes"):
         return None
     return argv
 
@@ -376,7 +368,7 @@ def fill_add(db, argv):
         print_wrapped(tr("Enter a single-line title.", "タイトルを1行で入力してください。"))
         return None
     label = tr("Idea details (optional)", "Idea の詳細（任意）")
-    detail = multiline(label) if args.detail is None else edit_field("detail", label, args.detail)
+    detail = edit_field("detail", label, args.detail or "")
     return confirmed(option(command, "--detail", detail) + ["--", title], True)
 
 
@@ -431,9 +423,8 @@ def fill_reply(db, argv):
     task = db.execute("SELECT status FROM tasks WHERE id = ?", (target,)).fetchone()
     if not (attempt and task and task["status"] == "WAITING_FOR_INPUT"):
         return ["reply", str(target), "--", answer or ""]
-    print_wrapped(attempt["reason"] or "")
-    label = tr("Answer", "回答")
-    answer = multiline(label) if answer is None else edit_field("answer", label, answer)
+    label = "\n".join(filter(None, (attempt["reason"], tr("Answer", "回答"))))
+    answer = edit_field("answer", label, answer or "")
     return confirmed(["reply", str(target), "--", answer], True)
 
 
@@ -444,17 +435,19 @@ def fill_project(db, argv):
     if action in ("edit", "rm", "remove"):
         parser.add_argument("id", nargs="?", type=int)
     fields = (
-        ("path", tr("Repository path", "リポジトリのパス"), field), ("name", tr("Project name", "プロジェクト名"), field),
-        ("prompt", tr("Project instructions", "プロジェクトの共通指示"), multiline), ("branch", tr("Branch mode (per-task/current)", "ブランチ運用（per-task/current）"), field),
-        ("base", tr("Base branch (inherit/unset/branch)", "開始元ブランチ（inherit/unset/ブランチ名）"), field),
+        ("path", tr("Repository path", "リポジトリのパス")),
+        ("name", tr("Project name", "プロジェクト名")),
+        ("prompt", tr("Project instructions", "プロジェクトの共通指示")),
+        ("branch", tr("Branch mode (per-task/current)", "ブランチ運用（per-task/current）")),
+        ("base", tr("Base branch (inherit/unset/branch)", "開始元ブランチ（inherit/unset/ブランチ名）")),
     )
     if action in (None, "add", "edit"):
-        for key, _, _ in fields:
+        for key, _ in fields:
             parser.add_argument(f"--{key}")
         model_arguments(parser, project=True)
         _, options = parser_candidates(parser)
-        field_keys = {key for key, _, _ in fields}
-        fields += tuple((argument.dest, argument.help, field) for argument in options.values()
+        field_keys = {key for key, _ in fields}
+        fields += tuple((argument.dest, argument.help) for argument in options.values()
                         if argument.dest not in field_keys)
     args = parser.parse_args(argv[len(command):])
     row = None
@@ -473,16 +466,11 @@ def fill_project(db, argv):
     for key in ("base", "planner_model", "implementation_model", "allowed_models"):
         if defaults.get(key) is None:
             defaults[key] = "inherit"
-    for key, label, read in fields:
+    for key, label in fields:
         current = defaults[key] or ""
         supplied = getattr(args, key)
         initial = current if supplied is None else supplied
-        if action == "edit" or supplied is not None:
-            value = edit_field(key, label, initial)
-        elif read is multiline:
-            value = read(label, initial)
-        else:
-            value = project_field(key, label, initial)
+        value = edit_field(key, label, initial)
         if value != current or (action == "add" and (key == "path" or supplied is not None)):
             command = option(command, f"--{key.replace('_', '-')}", value)
     if action == "edit" and len(command) == 3:
@@ -536,9 +524,7 @@ def prompt_argument(db, command, argument, supplied, current=None):
         return choose_value(label, [(tr("No", "いいえ"), False), (tr("Yes", "はい"), True)], bool(initial))
     if argument.choices is not None:
         return choose_value(label, [(str(choice), str(choice)) for choice in argument.choices], initial)
-    if argument.dest == "instruction" and initial is None:
-        return multiline(label)
-    if argument.dest in ("context_file", "instruction") or initial is not None:
+    if argument.dest in MULTILINE_FIELDS or argument.dest == "context_file" or initial is not None:
         return edit_field(argument.dest, label, "" if initial is None else str(initial))
     return field(label, "" if initial is None else str(initial))
 
@@ -569,7 +555,8 @@ def fill_arguments(db, parser, command, argv):
         value = prompt_argument(db, command, argument, getattr(supplied, argument.dest), original)
         if value is None:
             return None
-        if argument in required and isinstance(value, str) and not value.strip():
+        needs_value = argument in required or (command == ["nextcloud", "connect"] and argument.dest == "server")
+        if needs_value and isinstance(value, str) and not value.strip():
             print_wrapped(tr("A value is required.", "値を入力してください。"))
             return None
         if not argument.option_strings:
@@ -670,16 +657,7 @@ def run_screen():
     try:
         while True:
             language.set(saved_language())
-            if os.name == "nt":
-                line = windows_input(make_parser(), message, show_queue=not showing_output, help_argv=help_argv)
-            else:
-                clear()
-                if not showing_output:
-                    print_wrapped(queue_view())
-                if message:
-                    print_wrapped(message)
-                print_wrapped("add / edit / rm / ls / project / start / pause / stop / sync / q")
-                line = input("cq> ")
+            line = prompt_input(make_parser(), message, show_queue=not showing_output, help_argv=help_argv)
             line = command_text(line)
             if line.strip() in ("q", "quit", "exit"):
                 return 0
@@ -736,7 +714,7 @@ def virtual_terminal(alternate=False):
                 kernel.SetConsoleMode(handle, mode.value)
 
 
-def prompt_frame(view, message, line, candidates, selected, size, offset, form=False):
+def prompt_frame(view, message, line, candidates, selected, size, offset, form=False, hint=None):
     columns, rows = size
     width = max(0, columns - 1)
     body = list(wrap_rows(view, width))
@@ -754,6 +732,8 @@ def prompt_frame(view, message, line, candidates, selected, size, offset, form=F
                 marker = ">" if index == selected else " "
                 description = f": {candidate.help}" if candidate.help else ""
                 footer.append(f"{marker} {candidate.name}{description}")
+        elif hint:
+            footer.append(hint)
         elif form:
             footer.append(tr("Enter accept  Tab complete", "Enter で確定  Tab で補完"))
         else:
@@ -766,13 +746,15 @@ def prompt_frame(view, message, line, candidates, selected, size, offset, form=F
     if max_offset and footer:
         footer[0] += "  |  PgUp/PgDn" if candidates else f"  |  {offset + 1}-{offset + len(visible)}/{len(body)}"
     prompt = "cq> "
-    visible_input = fit(line.replace("\r\n", "\n").replace("\n", "↵"), max(0, width - len(prompt)), tail=True)
+    preview = line.replace("\r\n", "\n").replace("\n", "↵").expandtabs(4)
+    preview = "".join(char for char in preview if unicodedata.category(char) != "Cc")
+    visible_input = fit(preview, max(0, width - len(prompt)), tail=True)
     lines = [*visible, *([""] * (available - len(visible))), *footer, *separator, prompt + visible_input]
     return "\n".join(fit(row, width) for row in lines), available, offset, max_offset
 
 
-def draw_prompt(view, message, line, candidates, selected, size, offset, vt, form=False):
-    frame, page, offset, max_offset = prompt_frame(view, message, line, candidates, selected, size, offset, form)
+def draw_prompt(view, message, line, candidates, selected, size, offset, vt, form=False, hint=None):
+    frame, page, offset, max_offset = prompt_frame(view, message, line, candidates, selected, size, offset, form, hint)
     if vt:
         *body, prompt = frame.split("\n")
         # Advancing with newlines can scroll the terminal if it shrinks mid-frame.
@@ -784,13 +766,15 @@ def draw_prompt(view, message, line, candidates, selected, size, offset, vt, for
     return page, offset, max_offset
 
 
-def windows_input(parser, message, show_queue=True, help_argv=None, complete=None, initial=None):
+def windows_input(parser, message, show_queue=True, help_argv=None, complete=None, initial=None, editor=None):
     with virtual_terminal() as vt:
-        return read_windows_prompt(parser, message, vt, show_queue, help_argv, complete, initial)
+        return read_prompt(parser, message, vt, show_queue, help_argv, complete, initial, editor)
 
 
-def read_windows_prompt(parser, message, vt, show_queue, help_argv, complete, initial):
-    console = ConsoleInput()
+def read_prompt(parser, message, vt, show_queue=True, help_argv=None, complete=None, initial=None,
+                editor=None, console=None):
+    if console is None:
+        console = ConsoleInput()
     line = initial or ""
     form = complete is not None
     suggest = complete if form else partial(completion, parser)
@@ -804,14 +788,20 @@ def read_windows_prompt(parser, message, vt, show_queue, help_argv, complete, in
         redraw = False
         key = console.read()
         if key is not None:
-            if key == "\r" or (key == "\n" and initial is None):
+            if key == "\r" or (key == "\n" and (not editor or os.name != "nt")):
                 print()
                 return line
             if key == "\x03":
                 raise KeyboardInterrupt
-            if key == "\x1a":
+            if key in ("\x1a", "\x04"):
                 raise EOFError
-            if key == "\x1b" and candidates:
+            if key == "\x05" and editor:
+                line = edit_text(console, editor, line, vt)
+                start, candidates = len(line), []
+                selected = 0
+                size = shutil.get_terminal_size()
+                redraw = True
+            elif key == "\x1b" and candidates:
                 candidates = []
                 redraw = True
             elif key in ("up", "down") and candidates:
@@ -834,7 +824,7 @@ def read_windows_prompt(parser, message, vt, show_queue, help_argv, complete, in
                     line = line[:end]
                 elif key == "\x15" and initial is not None:
                     line = ""
-                elif key == "\n" and initial is not None:
+                elif key == "\n" and editor:
                     line += key
                 elif len(key) == 1 and key.isprintable():
                     line += key

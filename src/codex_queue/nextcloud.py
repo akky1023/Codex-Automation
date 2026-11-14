@@ -188,8 +188,10 @@ def connection(db):
     return Client(server, auth), get_setting(db, "nextcloud_connection")
 
 
-def connect(db):
-    server = input(tr("Nextcloud HTTPS URL: ", "Nextcloud の HTTPS URL：")).strip().rstrip("/")
+def connect(db, server=None):
+    if server is None:
+        server = input(tr("Nextcloud HTTPS URL: ", "Nextcloud の HTTPS URL："))
+    server = server.strip().rstrip("/")
     if urlsplit(server).query or urlsplit(server).fragment:
         raise RuntimeError(tr("Enter the server base URL.", "サーバーのベース URL を入力してください。"))
     credentials.api()
@@ -399,7 +401,9 @@ def add_commands(commands):
         ("disconnect", tr("Disconnect from Nextcloud", "Nextcloud との接続を解除")),
         ("lists", tr("Show Nextcloud task lists", "Nextcloud のタスクリストを表示")),
     ):
-        actions.add_parser(name, help=help_text)
+        action = actions.add_parser(name, help=help_text)
+        if name == "connect":
+            action.add_argument("--server", help=tr("Nextcloud HTTPS URL", "Nextcloud の HTTPS URL"))
     link = actions.add_parser("link", help=tr("Link a task list to a project", "タスクリストをプロジェクトに連携"))
     link.add_argument("--list", required=True, help=tr("Nextcloud list ID", "Nextcloud のリスト ID"))
     link.add_argument("--project-id", type=int, required=True, help=tr("Project ID", "プロジェクト ID"))
@@ -441,7 +445,7 @@ def dispatch(db, args):
 def manage_connection(db, args):
     action = args.nc_action
     if action == "connect":
-        connect(db)
+        connect(db, args.server)
         return
     if action == "disconnect":
         disconnect(db)
