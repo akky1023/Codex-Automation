@@ -18,6 +18,9 @@ class InputRecord(ctypes.Structure):
     _fields_ = [("type", wintypes.WORD), ("key", KeyEvent)]
 
 
+VK_RETURN = 0x0D
+CTRL_PRESSED = 0x0004 | 0x0008
+
 NAVIGATION_KEYS = {
     0x21: "pageup", 0x22: "pagedown", 0x23: "end", 0x24: "home",
     0x25: "left", 0x26: "up", 0x27: "right", 0x28: "down", 0x2E: "delete",
@@ -68,7 +71,10 @@ class ConsoleInput:
                 if self.high_surrogate is None:
                     continue
                 code = 0x10000 + ((self.high_surrogate - 0xD800) << 10) + (code - 0xDC00)
-            key = chr(code) if code else NAVIGATION_KEYS.get(event.virtual_key)
+            if event.virtual_key == VK_RETURN and event.control_state & CTRL_PRESSED:
+                key = "ctrl+enter"
+            else:
+                key = chr(code) if code else NAVIGATION_KEYS.get(event.virtual_key)
             if key is not None:
                 self.high_surrogate = None
                 self.repeated_key = key

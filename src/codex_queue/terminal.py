@@ -49,14 +49,18 @@ class PosixInput:
                 raise EOFError
             if byte == b"\x1b":
                 suffix = b""
-                while len(suffix) < 3 and select([fd], [], [], 0.08)[0]:
-                    suffix += os.read(fd, 1)
-                    if suffix[-1:] in b"ABCDFH~":
+                while len(suffix) < 8 and select([fd], [], [], 0.08)[0]:
+                    following = os.read(fd, 1)
+                    if not following:
+                        break
+                    suffix += following
+                    if suffix[0] != ord("[") or (len(suffix) > 1 and 0x40 <= suffix[-1] <= 0x7E):
                         break
                 return {
                     b"": "\x1b", b"[A": "up", b"[B": "down", b"[C": "right", b"[D": "left",
                     b"[H": "home", b"[F": "end", b"[3~": "delete",
                     b"[5~": "pageup", b"[6~": "pagedown",
+                    b"[13;5u": "ctrl+enter", b"[27;5;13~": "ctrl+enter",
                 }.get(suffix, "")
             return self.decoder.decode(byte) or None
         finally:
@@ -270,7 +274,10 @@ def edit_field(key, label, current):
     heading = label + "\n" + tr("Ctrl+U clear", "Ctrl+U で全消去")
     kwargs = {"show_queue": False, "complete": complete, "initial": current}
     if key in MULTILINE_FIELDS:
-        heading += "  |  " + tr("Ctrl+E open editor", "Ctrl+E でエディタを開く")
+        heading = label + "\n" + tr(
+            "Ctrl+Enter newline  |  Ctrl+E open editor  |  Ctrl+U clear",
+            "Ctrl+Enter で改行  |  Ctrl+E でエディタ  |  Ctrl+U で全消去",
+        )
         kwargs["editor"] = label.splitlines()[-1]
     return prompt_input(None, heading, **kwargs)
 
@@ -824,8 +831,8 @@ def read_prompt(parser, message, vt, show_queue=True, help_argv=None, complete=N
                     line = line[:end]
                 elif key == "\x15" and initial is not None:
                     line = ""
-                elif key == "\n" and editor:
-                    line += key
+                elif editor and key in ("ctrl+enter", "\n"):
+                    line += "\n"
                 elif len(key) == 1 and key.isprintable():
                     line += key
                 if line != previous:

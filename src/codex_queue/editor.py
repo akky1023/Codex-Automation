@@ -80,7 +80,7 @@ def edit_text(console, label, original, vt):
                 column = 0
         elif key in ("home", "end"):
             column = len(line) if key == "end" else 0
-        elif key in ("\r", "\n"):
+        elif key in ("\r", "\n", "ctrl+enter"):
             lines[row:row + 1] = [line[:column], line[column:]]
             row += 1
             column = 0

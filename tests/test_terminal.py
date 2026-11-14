@@ -52,6 +52,8 @@ class SuggestionTest(unittest.TestCase):
             KeyEvent(True, 5, 0x41, 30, ord("a"), 0),
             KeyEvent(True, 1, 8, 14, 8, 0),
             KeyEvent(True, 1, 13, 28, 13, 0),
+            KeyEvent(True, 2, 13, 28, 13, 0x0008),
+            KeyEvent(True, 1, 13, 28, 10, 0x0004),
         ])
         records = iter(InputRecord(1, event) for event in events)
 
@@ -69,7 +71,10 @@ class SuggestionTest(unittest.TestCase):
             kernel.GetNumberOfConsoleInputEvents.side_effect = count_events
             kernel.ReadConsoleInputW.side_effect = read_event
             console = ConsoleInput()
-            self.assertEqual(list("あいうえおaaaaa\b\r"), [console.read() for _ in range(12)])
+            self.assertEqual(
+                list("あいうえおaaaaa\b\r") + ["ctrl+enter"] * 3,
+                [console.read() for _ in range(15)],
+            )
 
     def test_slash_command_replaces_only_prefix(self):
         line = "  /proj"
@@ -147,6 +152,7 @@ class SuggestionTest(unittest.TestCase):
             (["\t", "\r"], current),
             (["\x15", "\r"], ""),
             (["\x15", "a", "\n", "b", "\r"], "a\nb"),
+            (["ctrl+enter", "続", "\r"], current + "\n続"),
         ):
             with self.subTest(keys=keys), patch(
                 "codex_queue.terminal.ConsoleInput.read", side_effect=keys,
@@ -187,7 +193,7 @@ class SuggestionTest(unittest.TestCase):
     def test_backspace_removes_japanese_characters_in_edit_field(self):
         for backspace in ("\b", "\x7f"):
             with self.subTest(backspace=backspace), patch(
-                "codex_queue.terminal.ConsoleInput.read", side_effect=["本", "か", "\u3099", backspace, "\r"],
+                "codex_queue.terminal.ConsoleInput.read", side_effect=["本", "か", "\u3099", backspace, "ctrl+enter", "\r"],
             ), patch(
                 "codex_queue.terminal.draw_prompt", return_value=(8, 0, 0),
             ), contextlib.redirect_stdout(io.StringIO()):
