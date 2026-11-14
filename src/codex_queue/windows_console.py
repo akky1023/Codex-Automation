@@ -18,7 +18,10 @@ class InputRecord(ctypes.Structure):
     _fields_ = [("type", wintypes.WORD), ("key", KeyEvent)]
 
 
-NAVIGATION_KEYS = {0x21: "pageup", 0x22: "pagedown", 0x26: "up", 0x28: "down"}
+NAVIGATION_KEYS = {
+    0x21: "pageup", 0x22: "pagedown", 0x23: "end", 0x24: "home",
+    0x25: "left", 0x26: "up", 0x27: "right", 0x28: "down", 0x2E: "delete",
+}
 
 
 class ConsoleInput:
