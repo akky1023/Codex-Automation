@@ -1011,12 +1011,18 @@ def run_screen():
                     message = ""
                     continue
                 board = argv[:2] == ["nextcloud", "sync"] or argv[0] == "nextcloud-board"
+                grilling = argv[:2] == ["idea", "plan"] and "--grilling" in argv
                 live = (
                     argv[:2] == ["nextcloud", "connect"]
                     or argv[0] in ("setup", "pause", "stop")
+                    or grilling
                     or (board and ("--watch" in argv or any(arg.startswith("--dev-port=") for arg in argv)))
                 )
                 if live:
+                    if grilling:
+                        clear()
+                        print(tr("Opening Grilling. Waiting for Codex…", "Grilling を開いています。Codex の応答を待っています…"),
+                              flush=True)
                     try:
                         main(argv, interactive=False)
                     except SystemExit:

@@ -487,6 +487,25 @@ class SuggestionTest(unittest.TestCase):
         finally:
             language.reset(token)
 
+    def test_grilling_runs_with_live_terminal_output(self):
+        argv = ["idea", "plan", "9", "--grilling"]
+        output = io.StringIO()
+
+        def run_command(*args, **kwargs):
+            self.assertIs(sys.stdout, output)
+            self.assertIn("Grilling", output.getvalue())
+            print("Grilling question")
+
+        with patch("codex_queue.terminal.prompt_input", side_effect=["idea plan 9 --grilling", "exit"]), patch(
+            "codex_queue.terminal.prepare", return_value=argv,
+        ), patch("codex_queue.terminal.main", side_effect=run_command) as main, patch(
+            "codex_queue.terminal.screen_input",
+        ), contextlib.redirect_stdout(output):
+            self.assertEqual(0, screen())
+
+        main.assert_called_once_with(argv, interactive=False)
+        self.assertIn("Grilling question", output.getvalue())
+
     @unittest.skipUnless(os.name == "nt", "Windows console input")
     def test_help_is_formatted_again_when_terminal_width_changes(self):
         with patch(
