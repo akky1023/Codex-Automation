@@ -10,6 +10,11 @@ DEFAULTS = {
     "branch": "per-idea",
     "base": "",
     "on_abort": "pause",
+    "completion_approval": "report",
+    "merge_mode": "off",
+    "on_conflict": "hold",
+    "test_retries": "1",
+    "test_commands": "",
     "sync": "auto",
     "language": "en",
     "planner_model": "",
@@ -35,6 +40,8 @@ CREATE TABLE IF NOT EXISTS projects (
     planner_model TEXT,
     implementation_model TEXT,
     allowed_models TEXT,
+    merge_mode TEXT,
+    test_commands TEXT,
     nextcloud_sync TEXT NOT NULL DEFAULT 'on' CHECK (nextcloud_sync IN ('on', 'off'))
 );
 CREATE TABLE IF NOT EXISTS tasks (
@@ -59,7 +66,8 @@ CREATE TABLE IF NOT EXISTS ideas (
     planned_at TEXT,
     planning_error TEXT,
     branch_mode TEXT,
-    draft_plan TEXT
+    draft_plan TEXT,
+    planner_session TEXT
 );
 CREATE TABLE IF NOT EXISTS grilling_sessions (
     session_id TEXT PRIMARY KEY,
@@ -106,6 +114,15 @@ CREATE TABLE IF NOT EXISTS attempts (
     failures INTEGER NOT NULL DEFAULT 0,
     started_at TEXT DEFAULT CURRENT_TIMESTAMP,
     implementation_model TEXT,
+    test_result TEXT,
+    test_details TEXT,
+    test_repairs INTEGER NOT NULL DEFAULT 0,
+    completion_approved INTEGER NOT NULL DEFAULT 0,
+    merge_status TEXT,
+    merge_details TEXT,
+    planner_questions TEXT NOT NULL DEFAULT '[]',
+    parked INTEGER NOT NULL DEFAULT 0,
+    parked_stash TEXT,
     UNIQUE(task_id, number)
 );
 CREATE TABLE IF NOT EXISTS task_actions (
@@ -140,16 +157,23 @@ CREATE TABLE IF NOT EXISTS remote_tasks (
 """
 
 WORKFLOW_COLUMNS = {
-    "ideas": ("planning_error TEXT", "branch_mode TEXT", "draft_plan TEXT"),
+    "ideas": ("planning_error TEXT", "branch_mode TEXT", "draft_plan TEXT", "planner_session TEXT"),
     "projects": (
         "planner_model TEXT", "implementation_model TEXT", "allowed_models TEXT",
+        "merge_mode TEXT", "test_commands TEXT",
         "nextcloud_sync TEXT NOT NULL DEFAULT 'on' CHECK (nextcloud_sync IN ('on', 'off'))",
     ),
     "tasks": (
         "idea_id INTEGER REFERENCES ideas(id)", "abstract TEXT NOT NULL DEFAULT ''",
         "implementation_model TEXT", "revision_of INTEGER REFERENCES tasks(id)", "idea_order INTEGER",
     ),
-    "attempts": ("implementation_model TEXT",),
+    "attempts": (
+        "implementation_model TEXT", "test_result TEXT", "test_details TEXT",
+        "test_repairs INTEGER NOT NULL DEFAULT 0", "completion_approved INTEGER NOT NULL DEFAULT 0",
+        "merge_status TEXT", "merge_details TEXT",
+        "planner_questions TEXT NOT NULL DEFAULT '[]'",
+        "parked INTEGER NOT NULL DEFAULT 0", "parked_stash TEXT",
+    ),
 }
 
 

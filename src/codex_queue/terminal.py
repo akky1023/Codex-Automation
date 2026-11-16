@@ -439,11 +439,49 @@ def choose_value(title, options, supplied=None, default=0):
     return choose(title, options, default)
 
 
+WORKFLOW_VALUE_LABELS = {
+    "on_abort": {
+        "pause": "キューを一時停止",
+        "continue": "キューを続行",
+        "next-idea": "失敗した Idea を保留し、別の Idea へ進む",
+    },
+    "completion_approval": {
+        "report": "Codex の完了報告で承認",
+        "manual": "人が完了を承認",
+        "tests": "全テスト合格で自動承認",
+        "planner": "全テスト合格と計画モデルのレビューで自動承認",
+    },
+    "merge_mode": {
+        "auto": "検証に合格したら自動マージ",
+        "clean-only": "検証に合格し、競合がなければ自動マージ",
+        "approval": "マージは人の承認待ちにして次の ToDo へ進む",
+        "off": "マージしない",
+        "inherit": "全体設定を継承",
+    },
+    "on_conflict": {
+        "resolve": "Codex が解決し、計画モデルのレビューと再テストを行う",
+        "hold": "競合を保留する",
+    },
+}
+
+
+def workflow_value_label(key, value):
+    description = WORKFLOW_VALUE_LABELS.get(key, {}).get(value)
+    return tr(value, description) if description else value
+
+
 def option_preview(key, value):
     if value is None:
         return tr("default", "既定値")
     if key == "branch" and value in BRANCH_MODES:
         return branch_label(value)
+    if key in WORKFLOW_VALUE_LABELS:
+        return workflow_value_label(key, value)
+    if key == "test_commands":
+        if value == "inherit":
+            return inherited_label()
+        if value in ("", "[]"):
+            return unset_label()
     if (key in ("base", *MODEL_SETTINGS) and value == "inherit") or (key == "branch" and value == ""):
         return inherited_label()
     if (key == "base" and value in ("unset", "")) or (key in MODEL_SETTINGS and value == ""):
@@ -653,6 +691,8 @@ def fill_reply(db, argv):
 
 
 def fill_project(db, argv):
+    from .cli import workflow_arguments
+
     action = argv[1] if len(argv) > 1 and not argv[1].startswith("-") else None
     command = argv[:2] if action else argv[:1]
     parser = ArgumentParser(prog="cq " + " ".join(command), add_help=False)
@@ -669,6 +709,7 @@ def fill_project(db, argv):
         for key, _ in fields:
             parser.add_argument(f"--{key}")
         model_arguments(parser, project=True)
+        workflow_arguments(parser, project=True)
         _, options = parser_candidates(parser)
         field_keys = {key for key, _ in fields}
         fields += tuple((argument.dest, argument.help) for argument in options.values()
@@ -688,11 +729,12 @@ def fill_project(db, argv):
         if row is None:
             return command
     defaults = {"prompt": "", "branch": "", "base": "inherit", "nextcloud_sync": "on",
+                "merge_mode": "inherit", "test_commands": "inherit",
                 **dict.fromkeys(MODEL_SETTINGS, "inherit")}
     current = dict(row) if row else {"path": ".", "name": "", **defaults}
     current["branch"] = current["branch"] or ""
     current.setdefault("nextcloud_sync", defaults["nextcloud_sync"])
-    for key in ("base", *MODEL_SETTINGS):
+    for key in ("base", "merge_mode", "test_commands", *MODEL_SETTINGS):
         if current.get(key) is None:
             current[key] = "inherit"
     if current["base"] == "":
@@ -727,6 +769,13 @@ def fill_project(db, argv):
             return model_setting(key, label, value, models(), project=True)
         if key == "nextcloud_sync":
             return choose_value(label, [("on", "on"), ("off", "off")], value)
+        if key == "merge_mode":
+            return choose_value(label, [(workflow_value_label(key, mode), mode)
+                                        for mode in options["--merge-mode"].choices], value)
+        if key == "test_commands":
+            argument = options["--test-commands"]
+            return validated_input(label, value, lambda heading, initial: edit_field(key, heading, initial),
+                                   argument.type)
         if key == "path":
             return validated_input(label, value, lambda heading, initial: edit_field(key, heading, initial),
                                    lambda text: str(repository_path(text)))
@@ -801,7 +850,8 @@ def prompt_argument(db, command, argument, supplied, current=None, heading=None)
             *((branch_label(mode), mode) for mode in ("per-idea", "per-task")),
         ], initial)
     if argument.choices is not None:
-        return choose_value(label, [(str(choice), str(choice)) for choice in argument.choices], initial)
+        return choose_value(label, [(workflow_value_label(argument.dest, str(choice)), str(choice))
+                                    for choice in argument.choices], initial)
     if argument.dest in MULTILINE_FIELDS or argument.dest == "context_file" or initial is not None:
         return edit_field(argument.dest, label, "" if initial is None else str(initial))
     return field(label, "" if initial is None else str(initial))

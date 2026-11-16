@@ -74,6 +74,9 @@ def queue_status(db, expanded=None):
         if idea_id is not None:
             completed_ideas[idea_id] = completed_ideas.get(idea_id, True) and status == "DONE"
         if status == "DONE":
+            attempt = latest_attempt(db, row["id"])
+            if attempt and attempt["merge_status"] in ("PENDING", "CONFLICT", "BLOCKED", "FAILED"):
+                tasks.append(f"{label}  {tr('Merge', 'マージ')}  {attempt['merge_status']}")
             done.append((row["completed_at"] or "", row["id"], label))
             continue
         if status == "RUNNING":

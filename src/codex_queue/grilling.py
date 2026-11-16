@@ -244,10 +244,14 @@ def _create_confirmed_plan(db, session, idea, prompt):
     models = config["allowed_models"].split(",") if config["allowed_models"] else []
     prompt += "\n\n# User-confirmed specification\n" + session["summary"]
     auto = session["branch_mode"] == "auto"
+    sessions = []
     if auto:
-        question, todos, recommendation, reason = generate_plan(db, idea["path"], prompt, config, models, review_branch=True)
+        question, todos, recommendation, reason = generate_plan(
+            db, idea["path"], prompt, config, models, review_branch=True, sessions=sessions,
+        )
     else:
-        question, todos = generate_plan(db, idea["path"], prompt, config, models)
+        question, todos = generate_plan(db, idea["path"], prompt, config, models, sessions=sessions)
+    planner_session = next(iter(sessions), None)
     if question:
         raise RuntimeError(question)
     with write(db):
@@ -259,7 +263,8 @@ def _create_confirmed_plan(db, session, idea, prompt):
             raise RuntimeError("The Idea was planned by another request.")
         if auto:
             context = plan_context(db, idea)
-            draft = {"context": context, "todos": todos, "branch_mode": recommendation, "reason": reason}
+            draft = {"context": context, "todos": todos, "branch_mode": recommendation, "reason": reason,
+                     "planner_session": planner_session}
             db.execute("UPDATE ideas SET draft_plan = ?, planning_error = NULL WHERE id = ?",
                        (json.dumps(draft, ensure_ascii=False), idea["id"]))
             db.execute("UPDATE grilling_sessions SET status = 'CONFIRMED', approved = 1 WHERE session_id = ?",
@@ -273,8 +278,9 @@ def _create_confirmed_plan(db, session, idea, prompt):
                 (idea["project_id"], idea["id"], task["title"].strip(), task["abstract"].strip(), task["plan"].strip(),
                  priority, task["model"] if models else None, position))
             task_ids.append(cursor.lastrowid)
-        db.execute("UPDATE ideas SET planned_at = CURRENT_TIMESTAMP, planning_error = NULL, branch_mode = ? WHERE id = ?",
-                   (session["branch_mode"], idea["id"]))
+        db.execute("""UPDATE ideas SET planned_at = CURRENT_TIMESTAMP, planning_error = NULL,
+                      branch_mode = ?, planner_session = ? WHERE id = ?""",
+                   (session["branch_mode"], planner_session, idea["id"]))
         db.execute("UPDATE grilling_sessions SET status = 'CONFIRMED', approved = 1 WHERE session_id = ?",
                    (session["session_id"],))
         return {"status": "PLANNED", "task_ids": task_ids}

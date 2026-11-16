@@ -7,6 +7,7 @@ import sqlite3
 import subprocess
 
 from .actions import queue_control, task_action, wake
+from .autonomy import APPROVAL_MODES, MERGE_MODES, parse_test_commands
 from .arguments import ArgumentParser, parser_candidates
 from .language import LANGUAGES, language, status_label, tr
 from .planner import plan_idea, revise_task
@@ -97,7 +98,8 @@ def path_project(db, root, create=False):
     db.execute(
         """UPDATE projects SET retired = 0, name = ?, prompt = '',
                   branch = NULL, base = NULL, planner_model = NULL,
-                  implementation_model = NULL, allowed_models = NULL WHERE id = ?""",
+                  implementation_model = NULL, allowed_models = NULL,
+                  merge_mode = NULL, test_commands = NULL WHERE id = ?""",
         (root.name, row["id"]),
     )
     return by_id(db, "projects", row["id"])
@@ -121,8 +123,9 @@ def project_for_idea(db, args):
 
 
 def project_options(args):
-    values = changes(args, "name", "prompt", "branch", "base", "nextcloud_sync", *MODEL_SETTINGS)
-    for key in MODEL_SETTINGS:
+    values = changes(args, "name", "prompt", "branch", "base", "nextcloud_sync",
+                     "merge_mode", "test_commands", *MODEL_SETTINGS)
+    for key in (*MODEL_SETTINGS, "merge_mode", "test_commands"):
         if values.get(key) == "inherit":
             values[key] = None
     if args.branch == "":
@@ -144,7 +147,7 @@ def show_project(db, row):
     print(tr("Branch: {branch}\nBase: {base}\nPrompt: {prompt}",
              "ブランチ運用：{branch}\n開始元：{base}\n指示：{prompt}",
              branch=branch, base=base or unset, prompt=row["prompt"]))
-    for key in MODEL_SETTINGS:
+    for key in (*MODEL_SETTINGS, "merge_mode", "test_commands"):
         value = (row[key] or unset) if row[key] is not None else f"{defaults[key] or unset} {inherited}"
         print(f"{key.replace('_', '-')}  {value}")
     print(tr("Nextcloud board sync: {value}", "Nextcloud ボード同期：{value}", value=row["nextcloud_sync"]))
@@ -241,8 +244,12 @@ def manage_task(db, args):
                 section = "Done / Abort / Waiting response"
                 print(section)
             print(f"{row['id']}\t{row['project_name']}\t{status_label(row['status'])}\t{row['name']}")
+            attempt = latest_attempt(db, row["id"])
+            if attempt and attempt["test_result"]:
+                print("  " + tr("Tests", "テスト") + f"  {attempt['test_result']}")
+            if attempt and attempt["merge_status"]:
+                print("  " + tr("Merge", "マージ") + f"  {attempt['merge_status']}  {attempt['merge_details']}")
             if row["status"] not in ("DONE", "QUEUED"):
-                attempt = latest_attempt(db, row["id"])
                 if attempt and attempt["reason"]:
                     print(f"  {attempt['reason']}")
                 if attempt and attempt["retry_at"]:
@@ -399,6 +406,37 @@ def positive(value):
     return number
 
 
+def non_negative(value):
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError(tr("must be zero or greater", "0 以上の整数を指定してください"))
+    return number
+
+
+def test_commands(value):
+    try:
+        return json.dumps(parse_test_commands(value or "[]"), ensure_ascii=False)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
+def workflow_arguments(parser, *, project=False):
+    parser.add_argument("--merge-mode", choices=(*MERGE_MODES, "inherit") if project else MERGE_MODES,
+                        help=tr("Merge into the starting branch", "開始元ブランチへのマージ方式"))
+    parser.add_argument("--test-commands",
+                        type=(lambda value: value if value == "inherit" else test_commands(value))
+                        if project else test_commands,
+                        help=tr("Test commands as JSON argument arrays", "テストコマンド（引数配列の JSON）"))
+    if not project:
+        parser.add_argument("--completion-approval", choices=APPROVAL_MODES,
+                            help=tr("Task completion approval", "ToDo 完了の承認方式"))
+        parser.add_argument("--on-conflict", choices=("resolve", "hold"),
+                            help=tr("Merge conflict handling", "マージ競合時の動作"))
+        parser.add_argument("--test-retries", type=non_negative,
+                            help=tr("Automatic repair attempts after a test failure or blocker",
+                                    "テスト失敗・実行不能時の自動修正回数"))
+
+
 def task_commands(subparsers):
     show = subparsers.add_parser("show", help=tr("Show a ToDo and its plan", "ToDo と実装計画を表示"))
     show.add_argument("id", type=positive)
@@ -453,6 +491,7 @@ def allowed_models(value):
 
 def project_arguments(parser, editing=False):
     model_arguments(parser, project=True)
+    workflow_arguments(parser, project=True)
     parser.add_argument("--name", help=tr("Project name", "プロジェクト名"))
     parser.add_argument("--path", help=tr("Repository path", "リポジトリのパス"))
     parser.add_argument("--prompt", help=tr("Project instructions", "プロジェクトの共通指示"))
@@ -498,13 +537,14 @@ def make_parser():
 
     config = commands.add_parser("config", aliases=["settings"], help=tr("Manage queue defaults", "キューの設定を管理"))
     model_arguments(config)
+    workflow_arguments(config)
     config.add_argument("--idea-planning", choices=("auto", "manual"),
                         help=tr("When to plan new ideas", "Idea を自動で計画するか手動で計画するか"))
     config.add_argument("--parallel", type=positive, help=tr("Maximum concurrent tasks", "同時に実行するタスク数の上限"))
     config.add_argument("--priority", type=int, choices=range(1, 10), metavar="1-9", help=tr("Default task priority", "タスクの既定の優先度"))
     config.add_argument("--branch", choices=BRANCH_MODES, help=tr("Default branch mode", "既定のブランチ運用"))
     config.add_argument("--base", help=tr("Default base branch", "既定の開始元ブランチ"))
-    config.add_argument("--on-abort", choices=["pause", "continue"], help=tr("Queue behavior after an abort", "タスク中止後のキューの動作"))
+    config.add_argument("--on-abort", choices=("pause", "continue", "next-idea"), help=tr("Queue behavior after an abort", "タスク中止後のキューの動作"))
     config.add_argument("--sync", choices=["auto", "manual"], help=tr("Nextcloud sync mode", "Nextcloud の同期方式"))
     config.add_argument("--language", choices=LANGUAGES, help=tr(
         "Display language (en: English, ja: Japanese)",
@@ -525,6 +565,7 @@ def make_parser():
         ("abort", tr("Abort a task", "タスクを中止")),
         ("logs", tr("Show task logs", "タスクのログを表示")),
         ("done", tr("Mark a task as complete", "タスクを完了にする")),
+        ("merge", tr("Approve or retry a held merge", "保留中のマージを承認・再試行")),
     ):
         action = commands.add_parser(name, help=help_text)
         action.add_argument("id", type=positive)
@@ -614,7 +655,7 @@ def run_cli(argv, interactive):
                 setup(db)
             elif args.command == "schedule":
                 register_schedule(db, args.every_minutes)
-            elif args.command in ("retry", "reply", "abort", "logs", "done"):
+            elif args.command in ("retry", "reply", "abort", "logs", "done", "merge"):
                 task_action(db, args)
             elif args.command in ("nextcloud", "deck", "sync"):
                 from .nextcloud import dispatch

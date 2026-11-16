@@ -2,6 +2,8 @@ import json
 import time
 
 from .language import status_label, tr
+from .autonomy import merge_task, verification_folder, workflow
+from .processes import process_lock
 
 from .runtime import request_worker
 from .store import get_setting, set_setting, update, write
@@ -14,7 +16,11 @@ def wake(db):
     automatic_planning = get_setting(db, "idea_planning") == "auto" and db.execute(
         "SELECT 1 FROM ideas WHERE planned_at IS NULL AND planning_error IS NULL AND draft_plan IS NULL"
     ).fetchone()
-    if not automatic_planning and db.execute("SELECT 1 FROM tasks WHERE status IN (?,?,?,?,?)", HOLD).fetchone():
+    holds = tuple(status for status in HOLD
+                  if status != "NEEDS_REVIEW" or get_setting(db, "on_abort") != "next-idea")
+    if not automatic_planning and db.execute(
+        f"SELECT 1 FROM tasks WHERE status IN ({','.join('?' for _ in holds)})", holds
+    ).fetchone():
         print(tr("Queue is waiting. Run cq task ls for details.", "キューは待機中です。詳細は cq task ls で確認できます。"))
         return
     try:
@@ -55,6 +61,9 @@ def task_action(db, args, *, expected_status=None):
     action = args.command
     if action == "logs":
         show_logs(db, args.id)
+        return
+    if action == "merge":
+        approve_merge(db, args.id)
         return
     with write(db):
         task = db.execute("SELECT status FROM tasks WHERE id = ?", (args.id,)).fetchone()
@@ -102,6 +111,9 @@ def task_action(db, args, *, expected_status=None):
                 raise RuntimeError(tr("Only a stopped, started task can be marked done.", "完了にできるのは実行を開始した後で停止したタスクです。"))
             target = "DONE"
             note = args.note
+            if attempt["phase"] == "RESTORE" and status == "NEEDS_REVIEW":
+                target = "RESUME_QUEUED"
+                update(db, "attempts", attempt["id"], {"completion_approved": 1})
         db.execute(
             """UPDATE tasks SET status = ?, completed_at =
                CASE WHEN ? = 'DONE' THEN CURRENT_TIMESTAMP ELSE NULL END WHERE id = ?""",
@@ -110,6 +122,28 @@ def task_action(db, args, *, expected_status=None):
         db.execute("INSERT INTO task_actions(task_id, action, note) VALUES (?, ?, ?)", (args.id, action, note))
     print(tr("Task {id}: {status}", "タスク {id}：{status}", id=args.id, status=status_label(target)))
     wake(db)
+
+
+def approve_merge(db, task_id):
+    with process_lock("worker.lock") as acquired:
+        if not acquired:
+            raise RuntimeError(tr("Wait for the worker to finish before approving a merge.",
+                                  "ワーカーが終了してからマージを承認してください。"))
+        attempt = latest_attempt(db, task_id)
+        task = db.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if (not task or task["status"] != "DONE" or not attempt or attempt["test_result"] != "OK"
+                or attempt["merge_status"] not in ("PENDING", "CONFLICT", "BLOCKED", "FAILED")):
+            raise RuntimeError(tr("This task has no eligible merge to approve.", "承認できるマージがありません。"))
+        _, config = workflow(db, attempt)
+        try:
+            status, detail = merge_task(db, attempt, config, verification_folder(attempt), manual=True)
+        except (RuntimeError, OSError, ValueError) as error:
+            status, detail = "BLOCKED", str(error)
+        with write(db):
+            update(db, "attempts", attempt["id"], {"merge_status": status, "merge_details": detail})
+        print(f"{status}  {detail}")
+        if status != "MERGED":
+            raise RuntimeError(tr("The merge requires attention.", "マージの確認が必要です。"))
 
 
 def show_logs(db, task_id):
@@ -132,6 +166,10 @@ def show_logs(db, task_id):
             print(f"  Implementation model  {attempt['implementation_model']}")
         if attempt["reason"]:
             print(f"  {attempt['reason']}")
+        if attempt["test_result"]:
+            print("  " + tr("Tests", "テスト") + f"  {attempt['test_result']}  {attempt['test_details']}")
+        if attempt["merge_status"]:
+            print("  " + tr("Merge", "マージ") + f"  {attempt['merge_status']}  {attempt['merge_details']}")
         if attempt["report"]:
             report = json.loads(attempt["report"])
             print(f"  {report['status']}: {report['reason']}")

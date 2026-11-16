@@ -30,8 +30,18 @@ if args == ["login", "status"]:
 prompt = sys.stdin.read()
 output = Path(args[args.index("-o") + 1])
 if "read-only" in args:
-    assert args[args.index("-m") + 1] == "project-planner"
     models = json.loads(Path(args[args.index("--output-schema") + 1]).read_text())
+    if "approved" in models["properties"]:
+        if "Question from the implementation session" in prompt:
+            approved = "ask planner" in prompt and "resume" in args and "plan-session" in args
+            answer = "test answer" if approved else "Needs the user's decision."
+        else:
+            approved = "Independently review" in prompt or "Review merge commit" in prompt
+            answer = "Reviewed the committed implementation."
+        output.write_text(json.dumps(dict(approved=approved, reason=answer)))
+        sys.exit(0)
+    assert args[args.index("-m") + 1] == "project-planner"
+    print(json.dumps(dict(type="thread.started", thread_id="plan-session")), flush=True)
     models = models["properties"]["todos"]["items"]["properties"]["model"]["enum"]
     assert models == ["small", "large"]
     if "This request revises ToDo" in prompt:
@@ -53,6 +63,10 @@ if "read-only" in args:
             proposal.update(branch_mode="per-idea", branch_reason="Review the changes together.")
         output.write_text(json.dumps(proposal))
     sys.exit(0)
+if "Resolve the conflicts merging" in prompt:
+    Path("task-result").write_text("complete and competing change")
+    output.write_text(json.dumps(dict(approved=True, reason="Combined both changes.")))
+    sys.exit(0)
 def event(kind, **data):
     print(json.dumps(dict(type=kind, **data)), flush=True)
 if "auth task" in prompt and not authorized:
@@ -66,6 +80,9 @@ elif "wait for user" in prompt and "test answer" not in prompt:
     report = dict(status="WAITING_FOR_INPUT", reason="Need a decision", question="What next?")
 elif "shutdown hang" in prompt:
     report = dict(status="NEEDS_REVIEW", reason="Rendering is still slow", question="")
+elif "dirty failure" in prompt:
+    Path("partial").write_text("preserve this work")
+    report = dict(status="NEEDS_REVIEW", reason="Implementation failed", question="")
 elif "sleep task" in prompt and "resume" not in args:
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
     Path("child.pid").write_text(str(child.pid))
@@ -81,7 +98,7 @@ else:
         Path(__file__).with_name("pause-ready").touch()
         while not Path(__file__).with_name("pause-release").exists():
             time.sleep(0.1)
-    Path("task-result").write_text("complete")
+    Path("task-result").write_text("repaired" if "configured verification failed" in prompt else "complete")
     subprocess.run(["git", "add", "task-result"], check=True)
     subprocess.run(["git", "commit", "-qm", "Complete task"], check=True)
     report = dict(status="COMPLETED", reason="Finished", question="")
@@ -114,6 +131,92 @@ class QueueTest(unittest.TestCase):
 
     def git(self, *args, cwd=None):
         return subprocess.check_output(["git", *args], cwd=cwd or self.repo, text=True).strip()
+
+    def queue_standalone_task(self):
+        if not self.sql("SELECT id FROM projects"):
+            self.cq("project", "add")
+        self.sql("INSERT INTO tasks(project_id, name, priority) VALUES (1, 'Deliver change', 5)")
+
+    def run_queue(self):
+        self.sql("INSERT OR REPLACE INTO settings VALUES ('enabled', '1')")
+        self.assertEqual(0, self.worker().wait(timeout=25))
+
+    def test_automatic_repair_planner_review_and_merge(self):
+        suite = [sys.executable, "-c",
+                 "from pathlib import Path; assert Path('task-result').read_text() == 'repaired'"]
+        self.cq("config", "--completion-approval", "planner", "--merge-mode", "auto")
+        self.cq("project", "add", "--test-commands", json.dumps([suite]))
+        self.queue_standalone_task()
+        self.run_queue()
+        self.wait(["DONE"])
+        self.assertEqual([("OK", 1, "MERGED")],
+                         self.sql("SELECT test_result, test_repairs, merge_status FROM attempts"))
+        self.assertEqual("repaired", self.git("show", "main:task-result"))
+        self.assertEqual(3, len(self.git("rev-list", "--parents", "-1", "main").split()))
+
+    def test_manual_merge_and_project_override(self):
+        self.cq("config", "--merge-mode", "off", "--completion-approval", "tests",
+                "--test-commands", json.dumps([[sys.executable, "-c", "pass"]]))
+        self.cq("project", "add", "--merge-mode", "approval")
+        initial = self.git("rev-parse", "main")
+        self.queue_standalone_task()
+        self.run_queue()
+        self.wait(["DONE"])
+        self.assertEqual(initial, self.git("rev-parse", "main"))
+        self.assertIn("PENDING", self.cq("logs", "1"))
+        self.cq("stop")
+        self.cq("merge", "1")
+        self.assertEqual("complete", self.git("show", "main:task-result"))
+
+    def test_blocked_test_never_publishes(self):
+        self.cq("config", "--completion-approval", "tests", "--merge-mode", "auto", "--test-retries", "0",
+                "--test-commands", json.dumps([["missing-cq-test-executable"]]))
+        initial = self.git("rev-parse", "main")
+        self.queue_standalone_task()
+        self.run_queue()
+        self.wait(["NEEDS_REVIEW"])
+        self.assertEqual([("BLOCKED", None)], self.sql("SELECT test_result, merge_status FROM attempts"))
+        self.assertEqual(initial, self.git("rev-parse", "main"))
+
+    def test_next_idea_continues_after_dirty_failure(self):
+        self.cq("config", "--on-abort", "next-idea")
+        self.cq("project", "add", "--planner-model", "project-planner", "--allowed-models", "small,large")
+        for idea in ("First", "Second"):
+            self.cq("idea", "add", idea)
+            self.cq("idea", "plan", str(1 if idea == "First" else 2))
+        self.sql("UPDATE tasks SET prompt='dirty failure' WHERE id=1")
+        self.run_queue()
+        self.wait(["NEEDS_REVIEW", "QUEUED", "DONE", "ABORTED"])
+        self.assertEqual("main", self.git("branch", "--show-current"))
+        self.assertIn("Codex Queue task 1", self.git("stash", "list"))
+
+    def test_clarification_resumes_original_planning_session(self):
+        self.cq("project", "add", "--planner-model", "project-planner", "--allowed-models", "small,large")
+        self.cq("idea", "add", "Improve access")
+        self.cq("idea", "plan", "1")
+        self.sql("UPDATE tasks SET prompt=prompt || ' wait for user, ask planner' WHERE id=1")
+        self.run_queue()
+        self.wait(["DONE", "ABORTED"])
+        self.assertEqual([("plan-session",)], self.sql("SELECT planner_session FROM ideas"))
+        self.assertIn("test answer", self.sql("SELECT answer FROM attempts WHERE task_id=1")[0][0])
+
+    def test_merge_conflict_is_held_then_resolved_and_reviewed(self):
+        self.cq("config", "--merge-mode", "approval", "--completion-approval", "tests",
+                "--test-commands", json.dumps([[sys.executable, "-c", "pass"]]))
+        self.queue_standalone_task()
+        self.run_queue()
+        (self.repo / "task-result").write_text("competing change")
+        self.git("add", "task-result")
+        self.git("commit", "-qm", "Competing change")
+        base = self.git("rev-parse", "main")
+        self.cq("merge", "1", code=1)
+        self.assertEqual([("CONFLICT",)], self.sql("SELECT merge_status FROM attempts"))
+        self.assertEqual(base, self.git("rev-parse", "main"))
+        self.assertEqual("", self.git("status", "--porcelain"))
+        self.cq("config", "--on-conflict", "resolve")
+        self.cq("merge", "1")
+        self.assertEqual("complete and competing change", self.git("show", "main:task-result"))
+        self.assertEqual([("MERGED",)], self.sql("SELECT merge_status FROM attempts"))
 
     def test_idea_planning_and_execution(self):
         self.cq("config", "--planner-model", "global-planner", "--allowed-models", "global-model")

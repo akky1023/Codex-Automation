@@ -10,6 +10,7 @@ import sys
 import time
 
 from .nextcloud import settle_move, sync
+from .autonomy import consult_planner, merge_task, parse_test_commands, verification_folder, verify_completion, workflow
 from .planner import plan_next_idea
 from .processes import process_lock, spawn, stop_tree, wait_for_previous_job
 from .runtime import NO_WINDOW, codex_command, codex_env
@@ -47,7 +48,7 @@ def git(path, *args):
         creationflags=NO_WINDOW,
     )
     if result.returncode:
-        raise RuntimeError(result.stderr.strip() or f"git {args[0]} failed")
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"git {args[0]} failed")
     return result.stdout.rstrip("\r\n")
 
 
@@ -75,6 +76,23 @@ def row_attempt(db, attempt_id):
 
 
 def record(db, attempt, status, reason=None, **values):
+    if status in ("ABORTED", "NEEDS_REVIEW") and get_setting(db, "on_abort") == "next-idea":
+        latest = row_attempt(db, attempt["id"])
+        path, target, original = latest["path"], latest["branch"], latest["original_branch"]
+        if target and target != original and latest["phase"] in ("EXECUTING", "REPORTED", "RESTORE"):
+            try:
+                if branch(path) == target:
+                    if not clean(path):
+                        git(path, "stash", "push", "--include-untracked", "-m",
+                            f"Codex Queue task {latest['task_id']} attempt {latest['number']}")
+                        stash = git(path, "rev-parse", "refs/stash")
+                        with write(db):
+                            update(db, "attempts", latest["id"], {"parked_stash": stash})
+                        reason = f"{reason or ''} Saved work in stash {stash}.".strip()
+                    git(path, "switch", original)
+                    values["parked"] = 1
+            except (OSError, RuntimeError) as error:
+                reason = f"{reason or ''} Could not restore the starting branch: {error}".strip()
     with write(db):
         if status == "DONE" and move_requested(db, attempt):
             status = "INTERRUPTED"
@@ -113,7 +131,8 @@ def prompt_for(task):
         "Keep your assigned branch checked out. Commit task changes in reviewable commits, "
         "without merging or pushing. Leave the worktree clean on completion. "
         "Report COMPLETED only when the task is complete. Include the reason and verification. "
-        "If user input is required, report WAITING_FOR_INPUT and put a concrete question in "
+        "Use the plan and repository to resolve reversible implementation details. "
+        "If clarification is still required, report WAITING_FOR_INPUT and put a concrete question in "
         "question. Otherwise leave question empty. Report ABORTED and explain the reason "
         "when implementation is refused, for example for security reasons. "
         "Report unresolved execution failures as NEEDS_REVIEW."
@@ -127,7 +146,7 @@ def claim(db, scheduled, attempted, authenticated, remote_ready):
         config = settings(db)
         rows = db.execute(
             """SELECT t.*, p.path, p.prompt AS project_prompt, p.base, p.branch,
-                      p.implementation_model AS project_model,
+                      p.implementation_model AS project_model, p.merge_mode AS project_merge,
                       i.title AS idea_title, i.detail AS idea_detail, i.branch_mode AS idea_branch_mode
                FROM tasks t JOIN projects p ON p.id = t.project_id
                LEFT JOIN ideas i ON i.id = t.idea_id
@@ -137,18 +156,29 @@ def claim(db, scheduled, attempted, authenticated, remote_ready):
         running = {row["path"] for row in rows if row["status"] == "RUNNING"}
         if len(running) >= int(config["parallel"]):
             return None
-        if any(row["status"] in HOLD[:2] for row in rows):
+        next_idea = config["on_abort"] == "next-idea"
+        failed_ideas = {
+            row["idea_id"] for row in db.execute(
+                "SELECT DISTINCT idea_id FROM tasks WHERE status IN ('ABORTED', 'NEEDS_REVIEW')"
+            ) if row["idea_id"] is not None
+        } if next_idea else set()
+        if any(row["status"] == "WAITING_FOR_INPUT" or
+               (row["status"] == "NEEDS_REVIEW" and not next_idea) for row in rows):
             return None
         if any(row["id"] in attempted and row["status"] in ("RATE_LIMITED", "AUTH_REQUIRED") for row in rows):
             return None
-        held = any(row["status"] in HOLD for row in rows)
-        for row in sorted(rows, key=lambda item: item["status"] not in RETRY):
+        held = any(row["status"] in (HOLD[2:] if next_idea else HOLD) for row in rows)
+        for row in sorted(rows, key=lambda item: (
+            item["status"] not in RETRY, bool(failed_ideas) and item["idea_id"] is None,
+        )):
             status = row["status"]
             if row["id"] in attempted or row["path"] in running:
                 continue
             if held and status not in HOLD:
                 continue
             if status not in RETRY and status != "QUEUED":
+                continue
+            if row["idea_id"] in failed_ideas:
                 continue
             configured = row["branch"] or config["branch"]
             mode = row["idea_branch_mode"] or ("current" if configured == "current" else "per-task")
@@ -172,6 +202,8 @@ def claim(db, scheduled, attempted, authenticated, remote_ready):
                 if status == "RATE_LIMITED" and attempt["retry_at"] is None and running:
                     continue
             if status == "QUEUED" or attempt is None:
+                if mode == "current" and (next_idea or (row["project_merge"] or config["merge_mode"]) != "off"):
+                    mode = "per-task"
                 number = 1 if attempt is None else attempt["number"] + 1
                 base = config["base"] if row["base"] is None else row["base"]
                 model = row["implementation_model"]
@@ -242,6 +274,18 @@ def prepare(db, attempt):
     if not Path(path).samefile(git(path, "rev-parse", "--show-toplevel")):
         raise RuntimeError("The recorded path is no longer the root of the Git repository.")
     current = branch(path)
+    if attempt["parked"]:
+        if current == attempt["original_branch"] and clean(path):
+            git(path, "switch", attempt["branch"])
+            current = attempt["branch"]
+        if current != attempt["branch"] or not clean(path):
+            raise RuntimeError("Check out the clean task branch before resuming parked work.")
+        git(path, "merge-base", "--is-ancestor", attempt["start_commit"], "HEAD")
+        stash = attempt["parked_stash"]
+        with write(db):
+            update(db, "attempts", attempt["id"], {"parked": 0, "parked_stash": None})
+        if stash:
+            git(path, "stash", "apply", "--index", stash)
     if attempt["phase"] == "PREPARING":
         if not clean(path):
             raise RuntimeError("The worktree has uncommitted or untracked changes.")
@@ -319,8 +363,60 @@ def finalize(db, attempt):
         git(path, "merge-base", "--is-ancestor", attempt["start_commit"], end)
         with write(db):
             update(db, "attempts", attempt["id"], {"end_commit": end, "phase": "RESTORE"})
+        attempt = row_attempt(db, attempt["id"])
+    if move_requested(db, attempt) or get_setting(db, "stop") == "1":
+        record(db, attempt, "INTERRUPTED", "Stopped or moved before completion.")
+        return
+    project, config = workflow(db, attempt)
+    approval = config["completion_approval"]
+    merge_mode = config["merge_mode"]
+    folder = None
+    problem = None
+    has_tests = bool(parse_test_commands(config["test_commands"] or "[]"))
+    if not aborted and (has_tests or approval in ("tests", "planner") or merge_mode != "off"):
+        folder = verification_folder(attempt)
+        test_result, detail, reviewed = verify_completion(db, attempt, config, folder)
+        if test_result != "OK":
+            problem = f"{test_result}: {detail}"
+            if (has_tests and attempt["session"] and current == attempt["branch"]
+                    and attempt["test_repairs"] < int(config["test_retries"])):
+                record(db, attempt, "RESUME_QUEUED", problem, phase="EXECUTING",
+                       test_repairs=attempt["test_repairs"] + 1,
+                       answer="The configured verification failed. Investigate and fix the implementation, "
+                              f"tests or environment where authorized. Preserve the test coverage. {problem}")
+                return
+        elif not reviewed:
+            problem = f"Planner review: {detail}"
+    if not aborted and approval == "manual" and not attempt["completion_approved"] and not problem:
+        problem = "Completion awaits manual approval. Run cq done to approve."
     if attempt["mode"] in ("per-task", "per-idea") and current != attempt["original_branch"]:
         git(path, "switch", attempt["original_branch"])
+    if problem and not attempt["completion_approved"]:
+        record(db, attempt, "NEEDS_REVIEW", problem, phase="RESTORE")
+        return
+    if not aborted and merge_mode != "off" and attempt["branch"] != attempt["original_branch"]:
+        remaining = attempt["mode"] == "per-idea" and db.execute(
+            """SELECT 1 FROM tasks WHERE idea_id=? AND id != ?
+               AND status NOT IN ('DONE', 'REMOVED', 'SUPERSEDED') LIMIT 1""",
+            (project["idea_id"], attempt["task_id"]),
+        ).fetchone()
+        if not remaining:
+            if problem:
+                merge_status, merge_details = "BLOCKED", problem
+            elif merge_mode == "approval":
+                merge_status, merge_details = "PENDING", "Run cq merge to approve."
+            else:
+                try:
+                    merge_status, merge_details = merge_task(db, attempt, config, folder)
+                except (RuntimeError, OSError, ValueError) as error:
+                    merge_status, merge_details = "BLOCKED", str(error)
+            with write(db):
+                update(db, "attempts", attempt["id"], {
+                    "merge_status": merge_status, "merge_details": merge_details,
+                })
+    if move_requested(db, attempt) or get_setting(db, "stop") == "1":
+        record(db, attempt, "INTERRUPTED", "Stopped or moved before completion.")
+        return
     record(db, attempt, "ABORTED" if aborted else "DONE",
            report["reason"] if aborted else None, phase="FINISHED")
 
@@ -398,7 +494,8 @@ def run_attempt(attempt_id):
             attempt = prepare(db, attempt)
             execute(db, attempt)
         except (RuntimeError, OSError, ValueError, subprocess.SubprocessError) as error:
-            record(db, attempt, "NEEDS_REVIEW", str(error))
+            status = "INTERRUPTED" if move_requested(db, attempt) or get_setting(db, "stop") == "1" else "NEEDS_REVIEW"
+            record(db, attempt, status, str(error))
 
 
 def move_requested(db, attempt):
@@ -454,7 +551,7 @@ def execute(db, attempt):
             + prompt
         )
         if attempt["answer"] is not None:
-            prompt += "\n\n# User answer\n" + attempt["answer"]
+            prompt += "\n\n# Resume information\n" + attempt["answer"]
     (folder / "prompt.txt").write_text(prompt, encoding="utf-8")
     env = codex_env(db)
     process = close_job = None
@@ -575,6 +672,17 @@ def process_result(db, attempt, folder, code, events, completed, failed, started
             status == "WAITING_FOR_INPUT" and report["question"].strip()
             and row_attempt(db, attempt["id"])["session"]
         )
+        if waiting:
+            latest = row_attempt(db, attempt["id"])
+            answer = consult_planner(db, latest, report["question"].strip())
+            if move_requested(db, attempt) or get_setting(db, "stop") == "1":
+                record(db, attempt, "INTERRUPTED", "Stopped or moved during planner consultation.")
+                return
+            if answer:
+                record(db, attempt, "RESUME_QUEUED", "Clarification from the planning model.",
+                       answer="Planning model clarification (no new user authorization): " + answer,
+                       report=report_json)
+                return
         record(db, attempt, "WAITING_FOR_INPUT" if waiting else "NEEDS_REVIEW",
                report["question"] if waiting else report["reason"], report=report_json)
 
@@ -664,7 +772,7 @@ def run_worker(scheduled):
                         future.result()
                         del running[task_id]
                         task = db.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()
-                        if task["status"] == "QUEUED":
+                        if task["status"] in ("QUEUED", "RESUME_QUEUED"):
                             attempted.discard(task_id)
                             next_sync = 0
                 auto_sync = get_setting(db, "sync", "auto") == "auto" and get_setting(db, "nextcloud_credential")

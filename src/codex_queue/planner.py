@@ -52,7 +52,7 @@ def planning_prompt(idea, models, default_model):
     )
 
 
-def generate_plan(db, path, prompt, config, models, *, review_branch=False):
+def generate_plan(db, path, prompt, config, models, *, review_branch=False, sessions=None):
     options = models or [config["implementation_model"]]
     fields = {key: {"type": "string"} for key in ("title", "abstract", "plan")}
     fields["model"] = {"type": "string", "enum": options}
@@ -85,6 +85,8 @@ def generate_plan(db, path, prompt, config, models, *, review_branch=False):
     command = [*codex_command(db), "-a", "never", "exec", "-s", "read-only"]
     if config["planner_model"]:
         command += ["-m", config["planner_model"]]
+    if sessions is not None:
+        command.append("--json")
     with TemporaryDirectory(prefix="plan-", dir=queue_folder()) as directory:
         schema_path = Path(directory) / "schema.json"
         output = Path(directory) / "plan.json"
@@ -92,10 +94,20 @@ def generate_plan(db, path, prompt, config, models, *, review_branch=False):
         result = subprocess.run(
             [*command, "--output-schema", str(schema_path), "-o", str(output), "-"],
             input=prompt, cwd=path, env=codex_env(db), encoding="utf-8", errors="replace",
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, creationflags=NO_WINDOW,
+            stdout=subprocess.PIPE if sessions is not None else subprocess.DEVNULL,
+            stderr=subprocess.PIPE, creationflags=NO_WINDOW,
         )
         if result.returncode:
             raise RuntimeError(result.stderr.strip() or f"Planner exited with code {result.returncode}.")
+        if sessions is not None:
+            for line in result.stdout.splitlines():
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(event, dict) and event.get("type") == "thread.started" and event.get("thread_id"):
+                    sessions.append(event["thread_id"])
+                    break
         try:
             report = json.loads(output.read_text(encoding="utf-8"))
             question, todos = report["question"].strip(), report["todos"]
@@ -125,7 +137,8 @@ def plan_idea(db, idea_id, branch_choice=None):
 
 def plan_context(db, idea):
     return {
-        "idea": {key: idea[key] for key in idea.keys() if key not in ("draft_plan", "planning_error")},
+        "idea": {key: idea[key] for key in idea.keys()
+                 if key not in ("draft_plan", "planning_error", "planner_session")},
         "config": planning_config(db, idea),
         "mode": idea["project_branch"] or settings(db)["branch"],
     }
@@ -150,14 +163,17 @@ def save_plan(db, idea_id, branch_choice=None):
             return []
         mode = draft["branch_mode"] if branch_choice == "recommended" else branch_choice
         todos = draft["todos"]
+        planner_session = draft.get("planner_session")
     else:
         prompt = planning_prompt(idea, models, config["implementation_model"])
+        sessions = []
         if mode == "auto":
             question, todos, recommendation, reason = generate_plan(
-                db, idea["path"], prompt, config, models, review_branch=True,
+                db, idea["path"], prompt, config, models, review_branch=True, sessions=sessions,
             )
         else:
-            question, todos = generate_plan(db, idea["path"], prompt, config, models)
+            question, todos = generate_plan(db, idea["path"], prompt, config, models, sessions=sessions)
+        planner_session = next(iter(sessions), None)
         if question:
             raise RuntimeError(f"{question}\nUse cq idea edit {idea_id} to clarify the idea, then plan again.")
     with write(db):
@@ -165,7 +181,8 @@ def save_plan(db, idea_id, branch_choice=None):
         if current != idea or plan_context(db, current) != context:
             raise RuntimeError(f"Idea {idea_id} or its project settings changed during planning.")
         if mode == "auto":
-            draft = {"context": context, "todos": todos, "branch_mode": recommendation, "reason": reason}
+            draft = {"context": context, "todos": todos, "branch_mode": recommendation, "reason": reason,
+                     "planner_session": planner_session}
             db.execute("UPDATE ideas SET draft_plan = ?, planning_error = NULL WHERE id = ?",
                        (json.dumps(draft, ensure_ascii=False), idea_id))
             return []
@@ -181,8 +198,8 @@ def save_plan(db, idea_id, branch_choice=None):
             task_ids.append(cursor.lastrowid)
         db.execute(
             """UPDATE ideas SET planned_at = CURRENT_TIMESTAMP, planning_error = NULL,
-               branch_mode = ?, draft_plan = NULL WHERE id = ?""",
-            (mode, idea_id),
+               branch_mode = ?, draft_plan = NULL, planner_session = ? WHERE id = ?""",
+            (mode, planner_session, idea_id),
         )
     return task_ids
 
