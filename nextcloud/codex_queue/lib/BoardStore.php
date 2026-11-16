@@ -20,7 +20,7 @@ final class BoardStore {
 
     public function requests(string $owner, bool $pending): array {
         $query = $this->db->getQueryBuilder();
-        $query->select('id', 'kind', 'target_id', 'title', 'body', 'outcome')->from('cq_requests')
+        $query->select('id', 'kind', 'target_id', 'title', 'body', 'session_id', 'round_no', 'branch_mode', 'outcome')->from('cq_requests')
             ->where($query->expr()->eq('owner', $query->createNamedParameter($owner)));
         if ($pending) {
             $query->andWhere($query->expr()->isNull('outcome'))->orderBy('id', 'ASC')->setMaxResults(20);
@@ -30,7 +30,8 @@ final class BoardStore {
         return $query->executeQuery()->fetchAllAssociative();
     }
 
-    public function submit(string $owner, string $kind, int $target, string $title, string $body): void {
+    public function submit(string $owner, string $kind, int $target, string $title, string $body,
+        ?string $sessionId = null, ?int $round = null, ?string $branchMode = null): void {
         $query = $this->db->getQueryBuilder();
         $query->insert('cq_requests')->values([
             'owner' => $query->createNamedParameter($owner),
@@ -38,6 +39,9 @@ final class BoardStore {
             'target_id' => $query->createNamedParameter($target, IQueryBuilder::PARAM_INT),
             'title' => $query->createNamedParameter($title),
             'body' => $query->createNamedParameter($body),
+            'session_id' => $query->createNamedParameter($sessionId),
+            'round_no' => $query->createNamedParameter($round, $round === null ? IQueryBuilder::PARAM_NULL : IQueryBuilder::PARAM_INT),
+            'branch_mode' => $query->createNamedParameter($branchMode),
         ])->executeStatement();
     }
 

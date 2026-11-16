@@ -61,6 +61,29 @@ CREATE TABLE IF NOT EXISTS ideas (
     branch_mode TEXT,
     draft_plan TEXT
 );
+CREATE TABLE IF NOT EXISTS grilling_sessions (
+    session_id TEXT PRIMARY KEY,
+    idea_id INTEGER NOT NULL REFERENCES ideas(id) ON DELETE CASCADE,
+    board_key TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL CHECK (status IN ('ACTIVE', 'GENERATING', 'CONFIRM', 'PLAN_GENERATING', 'CONFIRMED', 'CANCELLED')),
+    idea_title TEXT NOT NULL,
+    idea_detail TEXT NOT NULL,
+    project_id INTEGER NOT NULL,
+    project_path TEXT NOT NULL,
+    project_prompt TEXT NOT NULL,
+    project_base TEXT NOT NULL,
+    project_retired INTEGER NOT NULL,
+    nextcloud_sync TEXT NOT NULL,
+    config_json TEXT NOT NULL,
+    settings_json TEXT NOT NULL,
+    branch_mode TEXT NOT NULL,
+    round_no INTEGER NOT NULL DEFAULT 0,
+    questions_json TEXT NOT NULL DEFAULT '[]',
+    answers_json TEXT NOT NULL DEFAULT '[]',
+    summary TEXT NOT NULL DEFAULT '',
+    approved INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 CREATE INDEX IF NOT EXISTS tasks_queue ON tasks(status, priority, id);
 CREATE TABLE IF NOT EXISTS attempts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -163,6 +186,7 @@ def open_queue():
                     if definition.split()[0] not in existing:
                         db.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
             migrate_project_branch_modes(db)
+            migrate_grilling_sessions(db)
         db.execute("PRAGMA foreign_keys = ON")
         yield db
     finally:
@@ -183,6 +207,45 @@ def migrate_project_branch_modes(db):
                   WHERE name = 'projects_new'""")
     db.execute("DROP TABLE projects")
     db.execute("ALTER TABLE projects_new RENAME TO projects")
+
+
+def migrate_grilling_sessions(db):
+    indexes = db.execute("PRAGMA index_list(grilling_sessions)").fetchall()
+    unique_idea = any(index["unique"] and [column["name"] for column in db.execute(
+        f"PRAGMA index_info('{index['name']}')")] == ["idea_id"] for index in indexes)
+    existing = {row["name"] for row in db.execute("PRAGMA table_info(grilling_sessions)")}
+    schema_row = db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='grilling_sessions'").fetchone()
+    required = {"board_key", "project_base", "project_retired", "nextcloud_sync", "settings_json"}
+    if not unique_idea and required <= existing and "'GENERATING'" in schema_row["sql"]:
+        return
+    definition = SCHEMA.split("CREATE TABLE IF NOT EXISTS grilling_sessions ", 1)[1].split(";", 1)[0]
+    db.execute("CREATE TABLE grilling_sessions_new " + definition)
+    columns = list(db.execute("PRAGMA table_info(grilling_sessions_new)"))
+    defaults = {
+        "board_key": "''", "project_base": "''", "project_retired": "0",
+        "nextcloud_sync": "'on'", "settings_json": "'{}'",
+    }
+    target_columns, expressions = [], []
+    incomplete_snapshot = not required <= existing
+    for column in columns:
+        name = column["name"]
+        target_columns.append(name)
+        if incomplete_snapshot and name == "status":
+            expressions.append("CASE WHEN status IN ('ACTIVE','GENERATING','CONFIRM','PLAN_GENERATING') "
+                               "THEN 'CANCELLED' ELSE status END")
+        elif name in existing:
+            expressions.append(name)
+        elif name in defaults:
+            expressions.append(defaults[name])
+        elif column["dflt_value"] is not None:
+            expressions.append(column["dflt_value"])
+        else:
+            raise sqlite3.DatabaseError(f"Cannot migrate grilling_sessions column {name}.")
+    targets = ", ".join(target_columns)
+    sources = ", ".join(expressions)
+    db.execute(f"INSERT INTO grilling_sessions_new ({targets}) SELECT {sources} FROM grilling_sessions")
+    db.execute("DROP TABLE grilling_sessions")
+    db.execute("ALTER TABLE grilling_sessions_new RENAME TO grilling_sessions")
 
 
 @contextmanager

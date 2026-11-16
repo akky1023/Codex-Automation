@@ -3,15 +3,21 @@ from getpass import getpass
 import json
 import sqlite3
 from subprocess import SubprocessError
+from threading import Lock, Thread
 import time
 from urllib.request import ProxyHandler, build_opener
 
 from .actions import task_action, wake
 from .nextcloud import Client, RejectRedirects, connection
 from .planner import plan_idea, revise_task
+from .grilling import answer_grilling, cancel_grilling, confirm_grilling, start_grilling
 from .processes import process_lock
 from .store import write
 from .worker import latest_attempt
+
+_grilling_lock = Lock()
+_grilling_running = set()
+_ASYNC_PENDING = "__GRILLING_PENDING__"
 
 
 class LocalBoardClient(Client):
@@ -55,12 +61,22 @@ def ocs(client, method, data=None):
         raise RuntimeError("Unexpected response from the Nextcloud board.") from error
 
 
-def board_snapshot(db, projects):
+def board_snapshot(db, projects, board_key=""):
     marks = ", ".join("?" for _ in projects)
     ideas = [dict(row) for row in db.execute(
-        f"""SELECT id, project_id, title, detail, planned_at, planning_error FROM ideas
+        f"""SELECT id, project_id, title, detail, planned_at, planning_error, draft_plan FROM ideas
             WHERE project_id IN ({marks}) ORDER BY id DESC""", tuple(projects),
     )]
+    for idea in ideas:
+        session = db.execute(
+            "SELECT session_id, status, round_no, questions_json, summary FROM grilling_sessions "
+            "WHERE idea_id = ? AND board_key = ? AND status != 'CANCELLED' ORDER BY rowid DESC LIMIT 1",
+            (idea["id"], board_key),
+        ).fetchone()
+        idea["grilling"] = None if session is None or session["status"] == "CANCELLED" else {
+            "session_id": session["session_id"], "status": session["status"], "round": session["round_no"],
+            "questions": json.loads(session["questions_json"]), "summary": session["summary"],
+        }
     tasks = []
     for row in db.execute(
         f"""SELECT id, project_id, idea_id, name, abstract, prompt, status, completed_at FROM tasks
@@ -81,6 +97,34 @@ def request_action(db, request, projects, key):
     title, body = request["title"], request["body"]
     if kind == "sync":
         return "同期しました。"
+    if kind == "grilling_start":
+        idea = db.execute("SELECT project_id FROM ideas WHERE id = ? AND planned_at IS NULL", (target,)).fetchone()
+        if idea is None or idea["project_id"] not in projects:
+            raise RuntimeError("同期対象のプロジェクトを選んでください。")
+        result = start_grilling(db, target, key[0])
+        return f"Grilling {result['status']} / round {result['round']}"
+    if kind in ("grilling_answer", "grilling_confirm", "grilling_cancel", "approve_branch"):
+        session_id = request.get("session_id")
+        session = db.execute("SELECT idea_id, board_key, status FROM grilling_sessions WHERE session_id = ?",
+                             (session_id,)).fetchone()
+        if session is None or session["idea_id"] != target or session["board_key"] != key[0]:
+            raise RuntimeError("Grilling session and Idea do not match this board.")
+        if kind == "grilling_answer":
+            result = answer_grilling(db, session_id, int(request.get("round_no") or 0), body, key[0])
+            return f"Grilling {result['status']} / round {result['round']}"
+        if kind == "grilling_cancel":
+            cancel_grilling(db, session_id, key[0])
+            return "Grilling を中止しました。"
+        if kind == "grilling_confirm":
+            result = confirm_grilling(db, session_id, int(request.get("round_no") or 0), board_key=key[0])
+            if result["status"] == "AWAITING_BRANCH":
+                return "ブランチ方式の承認待ちです。"
+            return "ToDo " + ", ".join(map(str, result["task_ids"])) + " を作成しました。"
+        if kind == "approve_branch":
+            if session["status"] != "CONFIRMED":
+                raise RuntimeError("仕様確認済みの Grilling session が見つかりません。")
+            ids = plan_idea(db, target, request.get("branch_mode"))
+            return "ToDo " + ", ".join(map(str, ids)) + " を作成しました。"
     if kind == "add":
         if target not in projects:
             raise RuntimeError("同期対象のプロジェクトを選んでください。")
@@ -94,11 +138,15 @@ def request_action(db, request, projects, key):
             if idea is None or idea["project_id"] not in projects or idea["planned_at"]:
                 raise RuntimeError("未計画の Idea が見つかりません。")
             if kind == "edit":
+                db.execute("UPDATE grilling_sessions SET status = 'CANCELLED' WHERE idea_id = ? AND status != 'CANCELLED'",
+                           (target,))
                 db.execute("UPDATE ideas SET title = ?, detail = ?, planning_error = NULL, draft_plan = NULL WHERE id = ?",
                            (title, body, target))
                 save_outcome(db, key, "Idea を更新しました。")
                 return "Idea を更新しました。"
             if kind == "remove":
+                db.execute("UPDATE grilling_sessions SET status = 'CANCELLED' WHERE idea_id = ? AND status != 'CANCELLED'",
+                           (target,))
                 db.execute("DELETE FROM ideas WHERE id = ?", (target,))
                 save_outcome(db, key, "Idea を削除しました。")
                 return "Idea を削除しました。"
@@ -125,7 +173,21 @@ def save_outcome(db, key, outcome):
     db.execute("UPDATE board_receipts SET outcome = ? WHERE board = ? AND request_id = ?", (outcome, *key))
 
 
-def exchange(db, client, projects):
+def _run_grilling_request(board, request, projects, key):
+    try:
+        with open_queue() as worker_db:
+            outcome = request_action(worker_db, request, projects, key)
+    except (OSError, RuntimeError, sqlite3.Error, SubprocessError) as error:
+        outcome = f"処理できませんでした: {error}"
+    try:
+        with open_queue() as worker_db, write(worker_db):
+            save_outcome(worker_db, key, outcome[:1800])
+    finally:
+        with _grilling_lock:
+            _grilling_running.discard(key)
+
+
+def exchange(db, client, projects, *, async_grilling=False):
     incoming = ocs(client, "GET")
     board = json.dumps([incoming["instance"], incoming["owner"]], ensure_ascii=False)
     results = []
@@ -137,7 +199,20 @@ def exchange(db, client, projects):
                 "INSERT OR IGNORE INTO board_receipts VALUES (?, ?, ?)",
                 (*key, "処理が中断されました。ボードの状態を確認してから、必要なら再度依頼してください。"),
             ).rowcount
-        if reserved:
+        async_kind = request["kind"].startswith("grilling_") or request["kind"] == "approve_branch"
+        if async_grilling and async_kind:
+            if reserved:
+                with write(db):
+                    save_outcome(db, key, _ASYNC_PENDING)
+            outcome = db.execute("SELECT outcome FROM board_receipts WHERE board = ? AND request_id = ?", key).fetchone()[0]
+            if outcome == _ASYNC_PENDING:
+                with _grilling_lock:
+                    should_start = key not in _grilling_running
+                    if should_start:
+                        _grilling_running.add(key)
+                if should_start:
+                    Thread(target=_run_grilling_request, args=(board, request, projects, key), daemon=True).start()
+        elif reserved:
             try:
                 outcome = request_action(db, request, projects, key)
             except (OSError, RuntimeError, sqlite3.Error, SubprocessError) as error:
@@ -145,9 +220,10 @@ def exchange(db, client, projects):
             with write(db):
                 save_outcome(db, key, outcome[:1800])
         outcome = db.execute("SELECT outcome FROM board_receipts WHERE board = ? AND request_id = ?", key).fetchone()[0]
-        results.append({"id": request_id, "outcome": outcome})
-    ocs(client, "POST", {"snapshot": board_snapshot(db, projects), "results": results})
-    if any(request["kind"] in ("add", "plan", "edit", "revise") for request in incoming["requests"]):
+        if outcome != _ASYNC_PENDING:
+            results.append({"id": request_id, "outcome": outcome})
+    ocs(client, "POST", {"snapshot": board_snapshot(db, projects, board), "results": results})
+    if any(request["kind"] in ("add", "plan", "edit", "revise", "grilling_start", "grilling_answer", "grilling_confirm", "approve_branch") for request in incoming["requests"]):
         wake(db)
 
 
@@ -167,7 +243,7 @@ def run_board(db, args):
         while True:
             try:
                 client = local_client if local_client is not None else connection(db)[0]
-                exchange(db, client, available_projects(db, project_ids))
+                exchange(db, client, available_projects(db, project_ids), async_grilling=args.watch)
             except (OSError, RuntimeError) as error:
                 if not args.watch:
                     raise

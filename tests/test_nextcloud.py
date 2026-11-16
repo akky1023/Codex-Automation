@@ -1,4 +1,6 @@
 import sqlite3
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
@@ -16,6 +18,32 @@ BODY = (
 
 
 class BoardProjectTest(unittest.TestCase):
+    def test_grilling_session_is_visible_only_to_its_board_owner(self):
+        from codex_queue.grilling import start_grilling
+
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        db.row_factory = sqlite3.Row
+        db.executescript(SCHEMA)
+        db.execute("INSERT INTO projects(path,path_key,name) VALUES ('one','one','One')")
+        db.execute("INSERT INTO ideas(project_id,title,detail) VALUES (1,'Idea','')")
+        db.commit()
+        projects = available_projects(db)
+        with TemporaryDirectory() as folder, \
+             patch("codex_queue.store.queue_folder", return_value=Path(folder)), \
+             patch("codex_queue.processes.queue_folder", return_value=Path(folder)), \
+             patch("codex_queue.grilling.generate_round", return_value=([{
+                 "title": "Scope", "body": "Which?", "recommendation": "Admins."
+             }], "")):
+            result = start_grilling(db, 1, "board-owner")
+            self.assertEqual("ACTIVE", result["status"])
+            self.assertIsNone(board_snapshot(db, projects, "other-owner")["ideas"][0]["grilling"])
+            self.assertEqual(result["session_id"], board_snapshot(db, projects, "board-owner")["ideas"][0]["grilling"]["session_id"])
+            request = {"kind": "grilling_answer", "target_id": 1, "title": "", "body": "admins",
+                       "session_id": result["session_id"], "round_no": result["round"]}
+            with self.assertRaisesRegex(RuntimeError, "do not match"):
+                request_action(db, request, projects, ("other-owner", 1))
+
     def test_board_can_resolve_reviewed_tasks_and_reject_stale_actions(self):
         db = sqlite3.connect(":memory:")
         self.addCleanup(db.close)

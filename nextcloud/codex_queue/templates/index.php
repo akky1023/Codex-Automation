@@ -76,4 +76,17 @@ script('codex_queue', 'board');
             </div>
         </form>
     </dialog>
+    <dialog id="cq-grilling-dialog" aria-labelledby="cq-grilling-title">
+        <h2 id="cq-grilling-title">Grilling</h2>
+        <div id="cq-grilling-content"></div>
+        <form id="cq-grilling-form">
+            <label id="cq-grilling-answer-label" hidden>回答 <textarea name="answer" maxlength="12000" rows="5"></textarea></label>
+            <p id="cq-grilling-message" role="status"></p>
+            <div class="cq-dialog-actions">
+                <button id="cq-grilling-cancel" type="button">中止</button>
+                <button id="cq-grilling-confirm" type="submit" class="primary" hidden>この仕様で ToDo 化</button>
+                <button id="cq-grilling-send" type="submit" class="primary" hidden>回答を送信</button>
+            </div>
+        </form>
+    </dialog>
 </main>

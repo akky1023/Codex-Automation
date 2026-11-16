@@ -7,6 +7,14 @@ document.addEventListener('DOMContentLoaded', () => {
     const addError = find('#cq-add-error');
     const addSubmit = add.querySelector('[type="submit"]');
     const addCancel = find('#cq-cancel-add');
+    const grillingDialog = find('#cq-grilling-dialog');
+    const grillingContent = find('#cq-grilling-content');
+    const grillingForm = find('#cq-grilling-form');
+    const grillingAnswer = grillingForm.elements.answer;
+    const grillingMessage = find('#cq-grilling-message');
+    const grillingSend = find('#cq-grilling-send');
+    const grillingConfirm = find('#cq-grilling-confirm');
+    const grillingCancel = find('#cq-grilling-cancel');
     const revision = find('#cq-revision');
     const revisionSize = new ResizeObserver(() => {
         board.style.setProperty('--cq-revision-height', revision.offsetHeight + 'px');
@@ -25,6 +33,8 @@ document.addEventListener('DOMContentLoaded', () => {
     const labels = {
         add: 'Idea 追加', edit: 'Idea 編集', remove: 'Idea 削除', plan: '計画',
         revise: '修正依頼', reply: '回答', retry: '再試行', done: '完了', abort: '中止', sync: '同期',
+        grilling_start: 'Grilling', grilling_answer: 'Grilling 回答', grilling_confirm: 'Grilling 仕様確認',
+        grilling_cancel: 'Grilling 中止', approve_branch: 'ブランチ方式承認',
     };
     const states = {
         QUEUED: '待機中', RUNNING: '実行中', DONE: '完了', ABORTED: '中止',
@@ -64,10 +74,10 @@ document.addEventListener('DOMContentLoaded', () => {
         return result.data;
     }
 
-    async function submit(button, kind, target, title = '', body = '', errorTarget = find('#cq-message')) {
+    async function submit(button, kind, target, title = '', body = '', errorTarget = find('#cq-message'), extra = {}) {
         button.disabled = true;
         try {
-            const result = await api('/requests', {kind, target: Number(target), title, body});
+            const result = await api('/requests', {kind, target: Number(target), title, body, ...extra});
             find('#cq-message').textContent = result.message;
             await refresh();
             return true;
@@ -136,6 +146,13 @@ document.addEventListener('DOMContentLoaded', () => {
         trash.setAttribute('aria-hidden', 'true');
         remove.prepend(trash);
         panel.prepend(edit);
+        const grill = node('button', 'Grilling');
+        grill.type = 'button';
+        grill.addEventListener('click', () => {
+            menu.open = false;
+            openGrillingDialog(idea);
+        });
+        panel.append(grill);
         menu.append(toggle, panel);
         actions.append(menu);
         return actions;
@@ -312,6 +329,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 render();
                 if (!revisionPicker.hidden) renderRevisionOptions();
             }
+            if (grillingDialog.open) renderGrillingDialog();
             find('#cq-history').replaceChildren(...(payload.requests || []).map(request => node(
                 'li', (labels[request.kind] || request.kind) + ' — ' + (request.outcome || '実行 PC の応答待ち'),
             )));
@@ -474,6 +492,89 @@ document.addEventListener('DOMContentLoaded', () => {
         add.elements.body.value = idea?.detail || '';
         addDialog.showModal();
     }
+
+    let grillingIdea = null;
+    function openGrillingDialog(idea) {
+        grillingIdea = idea;
+        grillingMessage.textContent = '';
+        grillingAnswer.value = '';
+        grillingDialog.showModal();
+        renderGrillingDialog();
+        if (!idea.grilling) submit(grillingSend, 'grilling_start', idea.id, '', '', grillingMessage);
+    }
+
+    function renderGrillingDialog() {
+        if (!grillingIdea || !grillingDialog.open) return;
+        const idea = (snapshot.ideas || []).find(item => item.id === grillingIdea.id) || grillingIdea;
+        grillingIdea = idea;
+        const session = idea.grilling;
+        grillingContent.replaceChildren();
+        const answerLabel = find('#cq-grilling-answer-label');
+        answerLabel.hidden = true;
+        grillingSend.hidden = true;
+        grillingConfirm.hidden = true;
+        grillingForm.querySelector('.cq-grilling-branch')?.remove();
+        if (!session) {
+            grillingContent.append(node('p', 'Grilling セッションを開始しています。同期を待っています。'));
+            grillingCancel.hidden = true;
+            return;
+        }
+        grillingCancel.hidden = ['CONFIRMED', 'CANCELLED'].includes(session.status);
+        if (session.status === 'ACTIVE') {
+            session.questions.forEach((question, index) => {
+                const section = node('section');
+                section.append(node('h3', `❓ Q${index + 1} - ${question.title}`), node('p', question.body),
+                    node('p', `➡️ ${question.recommendation}`));
+                grillingContent.append(section);
+            });
+            answerLabel.hidden = false;
+            grillingSend.hidden = false;
+        } else if (session.status === 'CONFIRM') {
+            grillingContent.append(node('h3', '合意した仕様'), node('p', session.summary));
+            grillingConfirm.hidden = false;
+        } else if (session.status === 'CONFIRMED' && idea.draft_plan) {
+            const draft = JSON.parse(idea.draft_plan);
+            grillingContent.append(node('p', `ブランチ方式の承認待ちです。推奨: ${draft.branch_mode} — ${draft.reason}`));
+            const choices = node('div');
+            choices.className = 'cq-grilling-branch';
+            for (const [value, label] of [['recommended', '推奨を承認'], ['per-idea', 'Idea ごと'], ['per-task', 'ToDo ごと']]) {
+                const button = node('button', label);
+                button.type = 'button';
+                button.addEventListener('click', () => submit(button, 'approve_branch', idea.id, '', '', grillingMessage,
+                    {sessionId: session.session_id, branchMode: value}));
+                choices.append(button);
+            }
+            grillingForm.append(choices);
+        } else if (session.status === 'CONFIRMED') {
+            grillingContent.append(node('p', 'ToDo を作成しました。'));
+        } else if (session.status === 'CANCELLED') {
+            grillingContent.append(node('p', 'Grilling は中止されました。'));
+        } else {
+            grillingContent.append(node('p', 'Codex が処理中です。通常のボード同期は継続します。'));
+        }
+    }
+
+    grillingForm.addEventListener('submit', async event => {
+        event.preventDefault();
+        const idea = grillingIdea && (snapshot.ideas || []).find(item => item.id === grillingIdea.id);
+        const session = idea?.grilling;
+        if (!idea || !session) return;
+        const kind = session.status === 'CONFIRM' ? 'grilling_confirm' : 'grilling_answer';
+        const extra = {sessionId: session.session_id, round: session.round};
+        const sent = await submit(kind === 'grilling_confirm' ? grillingConfirm : grillingSend,
+            kind, idea.id, '', kind === 'grilling_confirm' ? '' : grillingAnswer.value, grillingMessage, extra);
+        if (sent && kind === 'grilling_answer') {
+            grillingAnswer.value = '';
+            grillingMessage.textContent = '回答を受け付けました。次の質問を待っています。';
+        }
+    });
+    grillingCancel.addEventListener('click', async () => {
+        const idea = grillingIdea && (snapshot.ideas || []).find(item => item.id === grillingIdea.id);
+        if (idea?.grilling) await submit(grillingCancel, 'grilling_cancel', idea.id, '', '', grillingMessage,
+            {sessionId: idea.grilling.session_id});
+        grillingDialog.close();
+    });
+    grillingDialog.addEventListener('close', () => { grillingIdea = null; });
 
     find('#cq-open-add').addEventListener('click', () => openIdeaDialog());
     addCancel.addEventListener('click', () => addDialog.close());

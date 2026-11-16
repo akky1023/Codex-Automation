@@ -23,6 +23,10 @@ class SuggestionTest(unittest.TestCase):
     def setUp(self):
         self.parser = make_parser()
 
+    def test_idea_plan_accepts_grilling_mode(self):
+        args = self.parser.parse_args(["idea", "plan", "12", "--grilling"])
+        self.assertEqual(("plan", 12, True), (args.idea_action, args.id, args.grilling))
+
     def test_project_list_aligns_paths_and_shows_sync_columns_when_connected(self):
         output = io.StringIO()
         args = self.parser.parse_args(["project", "ls"])

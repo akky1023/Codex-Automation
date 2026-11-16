@@ -98,7 +98,8 @@ class QueueTest(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         source = Path(__file__).resolve().parents[1] / "src"
-        self.env = dict(os.environ, LOCALAPPDATA=str(self.root), PYTHONPATH=str(source))
+        self.env = dict(os.environ, LOCALAPPDATA=str(self.root), CQ_WORKER_DATA_DIR=str(self.root / "CodexQueue"),
+                        PYTHONPATH=str(source))
         self.database = self.root / "CodexQueue" / "queue.sqlite3"
         self.repo = self.root / "repo"
         self.repo.mkdir()
@@ -156,6 +157,153 @@ class QueueTest(unittest.TestCase):
         self.cq("idea", "plan", "1", "--approve", "per-task")
         self.assertEqual([("per-task", None)], self.sql("SELECT branch_mode, draft_plan FROM ideas"))
         self.assertEqual([(1,), (2,)], self.sql("SELECT idea_order FROM tasks ORDER BY id"))
+
+    def test_grilling_rounds_require_confirmation_and_create_tasks_once(self):
+        from codex_queue.grilling import answer_grilling, confirm_grilling, start_grilling
+        from codex_queue.store import open_queue
+
+        self.cq("project", "add")
+        self.cq("idea", "add", "Improve access")
+        questions = [
+            [{"title": "Audience", "body": "Who uses it?", "recommendation": "Yes, admins only."}],
+            [{"title": "Location", "body": "Where should it appear?", "recommendation": "Yes, in settings."}],
+            [],
+        ]
+        summary = "Admins can manage access from settings."
+        todos = [{"title": "Add access controls", "abstract": "Restrict access", "plan": "Implement and verify access controls", "model": ""}]
+        folder = self.root / "CodexQueue"
+        with patch("codex_queue.store.queue_folder", return_value=folder), \
+             patch("codex_queue.processes.queue_folder", return_value=folder), \
+             patch("codex_queue.grilling.generate_round", side_effect=[(questions[0], ""), (questions[1], ""), ([], summary)]) as rounds, \
+             patch("codex_queue.grilling.generate_plan", return_value=("", todos)) as planner, \
+             open_queue() as db:
+            first = start_grilling(db, 1)
+            self.assertEqual(("ACTIVE", 1), (first["status"], first["round"]))
+            resumed = start_grilling(db, 1)
+            self.assertEqual((first["session_id"], first["round"]), (resumed["session_id"], resumed["round"]))
+            self.assertEqual([], db.execute("SELECT id FROM tasks").fetchall())
+            self.assertEqual(1, rounds.call_count)
+            with self.assertRaisesRegex(RuntimeError, "active Grilling"):
+                from codex_queue.planner import plan_idea
+                plan_idea(db, 1)
+            second = answer_grilling(db, first["session_id"], first["round"], "Q1: admins only")
+            self.assertEqual(2, second["round"])
+            final = answer_grilling(db, second["session_id"], second["round"], "Q1: settings")
+            self.assertEqual("CONFIRM", final["status"])
+            self.assertIn("Admins can manage access", final["summary"])
+            replay = answer_grilling(db, first["session_id"], first["round"], "Q1: admins only")
+            self.assertEqual("CONFIRM", replay["status"])
+            with self.assertRaisesRegex(RuntimeError, "stale"):
+                answer_grilling(db, first["session_id"], first["round"], "different answer")
+            self.assertEqual([], db.execute("SELECT id FROM tasks").fetchall())
+            created = confirm_grilling(db, final["session_id"], final["round"])
+            self.assertEqual("PLANNED", created["status"])
+            self.assertEqual([1], created["task_ids"])
+            self.assertIn("Admins can manage access", planner.call_args.args[2])
+            with self.assertRaisesRegex(RuntimeError, "already created"):
+                confirm_grilling(db, final["session_id"], final["round"])
+            self.assertEqual(1, db.execute("SELECT count(*) FROM tasks").fetchone()[0])
+
+    def test_grilling_session_is_cancelled_when_idea_is_edited(self):
+        from codex_queue.grilling import start_grilling
+        from codex_queue.store import open_queue
+
+        self.cq("project", "add")
+        self.cq("idea", "add", "Improve access")
+        folder = self.root / "CodexQueue"
+        with patch("codex_queue.store.queue_folder", return_value=folder), \
+             patch("codex_queue.processes.queue_folder", return_value=folder), \
+             patch("codex_queue.grilling.generate_round", return_value=([{"title": "Scope", "body": "Which?", "recommendation": "Admins."}], "")), \
+             open_queue() as db:
+            session = start_grilling(db, 1)
+        self.cq("idea", "edit", "1", "--detail", "Updated scope")
+        self.assertEqual("CANCELLED", self.sql("SELECT status FROM grilling_sessions WHERE session_id=?", (session["session_id"],))[0][0])
+
+    def test_cancelled_grilling_session_can_be_restarted(self):
+        from codex_queue.grilling import cancel_grilling, start_grilling
+        from codex_queue.store import open_queue
+
+        self.cq("project", "add")
+        self.cq("idea", "add", "Improve access")
+        question = [{"title": "Scope", "body": "Who?", "recommendation": "Admins."}]
+        folder = self.root / "CodexQueue"
+        with patch("codex_queue.store.queue_folder", return_value=folder), \
+             patch("codex_queue.processes.queue_folder", return_value=folder), \
+             patch("codex_queue.grilling.generate_round", return_value=(question, "")), \
+             open_queue() as db:
+            first = start_grilling(db, 1)
+            cancel_grilling(db, first["session_id"])
+            second = start_grilling(db, 1)
+            self.assertNotEqual(first["session_id"], second["session_id"])
+            self.assertEqual(2, db.execute("SELECT count(*) FROM grilling_sessions WHERE idea_id = 1").fetchone()[0])
+
+    def test_grilling_rechecks_settings_and_reuses_branch_approval(self):
+        from codex_queue.grilling import answer_grilling, confirm_grilling, start_grilling
+        from codex_queue.planner import plan_idea
+        from codex_queue.store import open_queue
+
+        self.cq("project", "add", "--branch", "auto")
+        self.cq("idea", "add", "Improve access")
+        question = [{"title": "Scope", "body": "Who?", "recommendation": "Admins."}]
+        todos = [{"title": "Add access controls", "abstract": "Restrict access", "plan": "Implement controls", "model": ""}]
+        folder = self.root / "CodexQueue"
+        with patch("codex_queue.store.queue_folder", return_value=folder), \
+             patch("codex_queue.processes.queue_folder", return_value=folder), \
+             patch("codex_queue.grilling.generate_round", return_value=(question, "")), \
+             open_queue() as db:
+            session = start_grilling(db, 1)
+            db.execute("INSERT INTO settings(key,value) VALUES ('priority','6') ON CONFLICT(key) DO UPDATE SET value='6'")
+            db.commit()
+            with self.assertRaisesRegex(RuntimeError, "settings changed"):
+                answer_grilling(db, session["session_id"], session["round"], "Admins")
+            db.execute("UPDATE settings SET value = '5' WHERE key = 'priority'")
+            db.commit()
+            # Start again after the stale session is cancelled, as a user would after resolving the change.
+            db.execute("UPDATE grilling_sessions SET status = 'CANCELLED' WHERE session_id = ?", (session["session_id"],))
+            db.commit()
+            with patch("codex_queue.grilling.generate_round", return_value=([], "Admins can manage access.")):
+                session = start_grilling(db, 1)
+            with patch("codex_queue.grilling.generate_plan", return_value=("", todos, "per-task", "Tasks are independent.")) as planner:
+                result = confirm_grilling(db, session["session_id"], session["round"])
+            self.assertEqual("AWAITING_BRANCH", result["status"])
+            self.assertIn("Admins can manage access", planner.call_args.args[2])
+            self.assertEqual([], db.execute("SELECT id FROM tasks").fetchall())
+            ids = plan_idea(db, 1, "recommended")
+            self.assertEqual(1, len(ids))
+            self.assertEqual("per-task", db.execute("SELECT branch_mode FROM ideas WHERE id=1").fetchone()[0])
+
+    def test_legacy_unique_grilling_session_schema_migrates_without_losing_rows(self):
+        directory = self.root / "legacy-grilling"
+        directory.mkdir()
+        old_schema = SCHEMA.replace("idea_id INTEGER NOT NULL REFERENCES ideas(id) ON DELETE CASCADE",
+                                    "idea_id INTEGER NOT NULL UNIQUE REFERENCES ideas(id) ON DELETE CASCADE")
+        old_schema = old_schema.replace(
+            "status TEXT NOT NULL CHECK (status IN ('ACTIVE', 'GENERATING', 'CONFIRM', 'PLAN_GENERATING', 'CONFIRMED', 'CANCELLED'))",
+            "status TEXT NOT NULL CHECK (status IN ('ACTIVE', 'CONFIRM', 'CONFIRMED', 'CANCELLED'))",
+        )
+        old_schema = old_schema.replace("    board_key TEXT NOT NULL DEFAULT '',\n", "")
+        old_schema = old_schema.replace("    project_base TEXT NOT NULL,\n", "")
+        old_schema = old_schema.replace("    project_retired INTEGER NOT NULL,\n", "")
+        old_schema = old_schema.replace("    nextcloud_sync TEXT NOT NULL,\n", "")
+        old_schema = old_schema.replace("    settings_json TEXT NOT NULL,\n", "")
+        with sqlite3.connect(directory / "queue.sqlite3") as db:
+            db.executescript(old_schema)
+            db.execute("INSERT INTO projects(path,path_key,name) VALUES ('repo','repo','Repo')")
+            db.execute("INSERT INTO ideas(project_id,title) VALUES (1,'Idea')")
+            db.execute("""INSERT INTO grilling_sessions(session_id, idea_id, status, idea_title, idea_detail,
+                project_id, project_path, project_prompt, config_json, branch_mode)
+                VALUES ('old', 1, 'ACTIVE', 'Idea', '', 1, 'repo', '', '{}', 'per-idea')""")
+        db.close()
+        with patch("codex_queue.store.queue_folder", return_value=directory), open_queue() as db:
+            db.execute("""INSERT INTO grilling_sessions(session_id, idea_id, status, idea_title, idea_detail,
+                project_id, project_path, project_prompt, project_base, project_retired, nextcloud_sync,
+                config_json, settings_json, branch_mode) VALUES ('new', 1, 'ACTIVE', 'Idea', '', 1,
+                'repo', '', '', 0, 'on', '{}', '{}', 'per-idea')""")
+            self.assertEqual(["new", "old"], [row[0] for row in db.execute(
+                "SELECT session_id FROM grilling_sessions ORDER BY session_id")])
+            self.assertEqual("CANCELLED", db.execute(
+                "SELECT status FROM grilling_sessions WHERE session_id='old'").fetchone()[0])
+            self.assertEqual([], db.execute("PRAGMA foreign_key_check").fetchall())
 
     def test_legacy_project_branch_constraint_migrates_with_existing_tasks(self):
         directory = self.root / "legacy"

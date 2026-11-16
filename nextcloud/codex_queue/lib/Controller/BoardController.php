@@ -26,7 +26,8 @@ final class BoardController extends OCSController {
     }
 
     #[NoAdminRequired]
-    public function request(string $kind, int $target = 0, string $title = '', string $body = ''): DataResponse {
+    public function request(string $kind, int $target = 0, string $title = '', string $body = '',
+        string $sessionId = '', int $round = 0, string $branchMode = ''): DataResponse {
         $title = trim($title);
         $body = trim($body);
         $valid = match ($kind) {
@@ -34,6 +35,12 @@ final class BoardController extends OCSController {
             'edit' => $target > 0 && $title !== '' && !preg_match('/\R/u', $title),
             'remove', 'plan' => $target > 0,
             'revise', 'reply' => $target > 0 && $body !== '',
+            'grilling_start' => $target > 0,
+            'grilling_cancel' => $target > 0 && $sessionId !== '',
+            'grilling_answer' => $target > 0 && $sessionId !== '' && $round > 0 && $body !== '',
+            'grilling_confirm' => $target > 0 && $sessionId !== '' && $round > 0,
+            'approve_branch' => $target > 0 && $sessionId !== ''
+                && in_array($branchMode, ['recommended', 'per-idea', 'per-task'], true),
             'retry', 'done', 'abort' => $target > 0,
             'sync' => $target === 0,
             default => false,
@@ -41,7 +48,12 @@ final class BoardController extends OCSController {
         if (!$valid || mb_strlen($title) > 200 || mb_strlen($body) > 12000) {
             return new DataResponse(['message' => '入力内容を確認してください。'], 400);
         }
-        $this->board->submit($this->session->getUser()->getUID(), $kind, $target, $title, $body);
+        if (($sessionId !== '' && !preg_match('/^[0-9a-f-]{36}$/i', $sessionId))
+            || $round < 0 || mb_strlen($branchMode) > 16) {
+            return new DataResponse(['message' => '入力内容を確認してください。'], 400);
+        }
+        $this->board->submit($this->session->getUser()->getUID(), $kind, $target, $title, $body,
+            $sessionId ?: null, $round ?: null, $branchMode ?: null);
         return new DataResponse(['message' => '依頼を受け付けました。'], 202);
     }
 }

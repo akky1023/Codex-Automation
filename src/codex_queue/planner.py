@@ -19,6 +19,7 @@ def planning_config(db, project):
 def idea_record(db, idea_id):
     row = db.execute(
         """SELECT i.*, p.path, p.name AS project, p.prompt AS project_prompt, p.branch AS project_branch,
+                  p.base AS project_base, p.retired AS project_retired, p.nextcloud_sync,
                   p.planner_model, p.implementation_model, p.allowed_models
            FROM ideas i JOIN projects p ON p.id = i.project_id
            WHERE i.id = ? AND p.retired = 0""",
@@ -134,6 +135,9 @@ def save_plan(db, idea_id, branch_choice=None):
     idea = idea_record(db, idea_id)
     if idea["planned_at"]:
         raise RuntimeError(f"Idea {idea_id} already has a plan.")
+    grill = db.execute("SELECT status FROM grilling_sessions WHERE idea_id = ?", (idea_id,)).fetchone()
+    if grill and grill["status"] not in ("CANCELLED", "CONFIRMED"):
+        raise RuntimeError(f"Idea {idea_id} has an active Grilling session.")
     context = plan_context(db, idea)
     config, mode = context["config"], context["mode"]
     models = config["allowed_models"].split(",") if config["allowed_models"] else []

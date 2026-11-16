@@ -273,6 +273,9 @@ def show_branch_proposal(row):
 def manage_idea(db, args):
     action = args.idea_action
     if action == "plan":
+        if getattr(args, "grilling", False):
+            grilling_idea(db, args.id)
+            return
         ids = plan_idea(db, args.id, args.approve)
         if not ids:
             show_branch_proposal(by_id(db, "ideas", args.id))
@@ -323,12 +326,52 @@ def manage_idea(db, args):
             if by_id(db, "ideas", idea_id)["planned_at"]:
                 raise QueueError(tr("This idea already has ToDos.", "この Idea にはすでに ToDo があります。"))
             if action == "edit":
+                db.execute("UPDATE grilling_sessions SET status = 'CANCELLED' WHERE idea_id = ? AND status != 'CANCELLED'",
+                           (idea_id,))
                 update(db, "ideas", idea_id, {**values, "planning_error": None, "draft_plan": None})
             else:
                 db.execute("DELETE FROM ideas WHERE id = ?", (idea_id,))
     print(f"Idea {idea_id}")
     if action in ("add", "edit") and settings(db)["idea_planning"] == "auto":
         wake(db)
+
+
+def grilling_idea(db, idea_id):
+    from .grilling import answer_grilling, cancel_grilling, confirm_grilling, start_grilling
+    from .terminal import edit_field
+    result = start_grilling(db, idea_id)
+    while result["status"] in ("ACTIVE", "GENERATING"):
+        if result["status"] != "ACTIVE":
+            raise RuntimeError("A Grilling round is already being generated. Resume the command shortly.")
+        prompt = "\n\n---\n\n".join(
+            f"❓ **Q{index}** - **{item['title']}**: {item['body']}\n\n➡️ {item['recommendation']}"
+            for index, item in enumerate(result["questions"], 1)
+        )
+        answer = edit_field("answer", prompt, "")
+        if answer is None:
+            cancel_grilling(db, result["session_id"])
+            print(tr("Grilling cancelled.", "Grilling を中止しました。"))
+            return
+        result = answer_grilling(db, result["session_id"], result["round"], answer)
+    if result["status"] != "CONFIRM":
+        raise RuntimeError(f"Grilling session is {result['status']}.")
+    print(result["summary"])
+    decision = edit_field("answer", tr("Create ToDos from this specification? Enter yes to confirm.",
+                                       "この仕様で ToDo を作成しますか？確認する場合は yes と入力してください。"), "")
+    if decision is None or decision.strip().lower() not in ("yes", "y", "はい"):
+        cancel_grilling(db, result["session_id"])
+        print(tr("Grilling cancelled; no ToDos were created.", "Grilling を中止しました。ToDo は作成していません。"))
+        return
+    outcome = confirm_grilling(db, result["session_id"], result["round"])
+    if outcome["status"] == "AWAITING_BRANCH":
+        print(outcome["reason"])
+        choice = edit_field("answer", tr("Approve branch mode (recommended/per-idea/per-task)",
+                                          "ブランチ方式を承認してください（recommended / per-idea / per-task）"), "")
+        if choice not in ("recommended", "per-idea", "per-task"):
+            raise RuntimeError("Enter recommended, per-idea, or per-task to approve the branch proposal.")
+        outcome = {"task_ids": plan_idea(db, idea_id, choice)}
+    print(tr("Added ToDo {ids}.", "ToDo {ids} を追加しました。", ids=", ".join(map(str, outcome["task_ids"]))))
+    wake(db)
 
 
 def configure(db, args):
@@ -438,6 +481,8 @@ def make_parser():
         item = idea_actions.add_parser(action, help=description)
         item.add_argument("id", type=positive)
         if action == "plan":
+            item.add_argument("--grilling", action="store_true",
+                              help=tr("Clarify the Idea in rounds before planning", "仕様をラウンドごとに確認してから計画"))
             item.add_argument("--approve", choices=("recommended", "per-idea", "per-task"),
                               help=tr("Approve a branch proposal before queuing ToDos", "ブランチ運用を承認して ToDo をキューに登録"))
     project = commands.add_parser("project", help=tr("Manage projects", "プロジェクトを管理"))
