@@ -369,6 +369,37 @@ class SuggestionTest(unittest.TestCase):
             self.assertEqual(("", "", None, ""), tuple(db.execute("SELECT name, prompt, branch, base FROM projects").fetchone()))
             self.assertEqual(("Idea", ""), tuple(db.execute("SELECT title, detail FROM ideas").fetchone()))
 
+    def test_option_menus_show_values_and_defaults(self):
+        locale = language.set("ja")
+        self.addCleanup(language.reset, locale)
+        with contextlib.closing(sqlite3.connect(":memory:")) as db:
+            db.row_factory = sqlite3.Row
+            db.executescript(SCHEMA)
+            db.execute("INSERT INTO settings VALUES ('parallel', '3')")
+            db.execute("INSERT INTO projects(path, path_key, name) VALUES ('repo', 'repo', 'Saved project')")
+            db.execute("INSERT INTO ideas(project_id, title, detail) VALUES (1, 'Saved idea', 'Saved detail')")
+            with patch("codex_queue.terminal.open_queue", return_value=contextlib.nullcontext(db)), patch(
+                "codex_queue.terminal.choose", side_effect=["", "", 1, "", 1, ""],
+            ) as menu, patch("codex_queue.terminal.confirmed", side_effect=lambda command, prompted: command):
+                self.assertEqual(["config"], prepare(["config"]))
+                self.assertEqual(["config", "--parallel=4"], prepare(["config", "--parallel=4"]))
+                self.assertEqual(["project", "edit", "1", "--name=New project"],
+                                 fill_project(db, ["project", "edit", "1", "--name=New project"]))
+                self.assertEqual(["edit", "1", "--detail=New detail"],
+                                 fill_idea(db, ["edit", "1", "--detail=New detail"]))
+
+            config_options = {key: label for label, key in menu.call_args_list[0].args[1]}
+            self.assertEqual("同時に実行するタスク数の上限: 3", config_options["parallel"])
+            self.assertEqual("タスクの既定の優先度: 5 (既定値)", config_options["priority"])
+            self.assertIn(("同時に実行するタスク数の上限: 4", "parallel"), menu.call_args_list[1].args[1])
+            project_options = menu.call_args_list[3].args[1]
+            self.assertIn(("プロジェクト名: New project", "name"), project_options)
+            self.assertIn(("リポジトリのパス: repo", "path"), project_options)
+            self.assertIn(("Nextcloud ボード同期（on/off）: on (既定値)", "nextcloud_sync"), project_options)
+            idea_options = menu.call_args_list[5].args[1]
+            self.assertIn(("Idea の詳細: New detail", "detail"), idea_options)
+            self.assertIn(("Idea のタイトル: Saved idea", "title"), idea_options)
+
     def test_command_forms_supply_missing_arguments_and_keep_explicit_defaults(self):
         with contextlib.closing(sqlite3.connect(":memory:")) as db:
             db.row_factory = sqlite3.Row

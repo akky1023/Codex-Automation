@@ -20,7 +20,7 @@ from .editor import edit_text
 from .language import language, status_label, tr
 from .runtime import codex_models
 from .status import queue_status
-from .store import get_setting, open_queue, saved_language, settings
+from .store import DEFAULTS, get_setting, open_queue, saved_language, settings
 from .text_layout import fit, print_wrapped, terminal_width, wrap_rows
 from .windows_console import ConsoleInput
 from .worker import latest_attempt
@@ -438,24 +438,35 @@ def choose_value(title, options, supplied=None, default=0):
     return choose(title, options, default)
 
 
-def edit_options(fields, values, edit):
+def option_preview(key, value):
+    if value is None:
+        return tr("default", "既定値")
+    if key == "branch" and value in BRANCH_MODES:
+        return branch_label(value)
+    if (key in ("base", *MODEL_SETTINGS) and value == "inherit") or (key == "branch" and value == ""):
+        return inherited_label()
+    if (key == "base" and value in ("unset", "")) or (key in MODEL_SETTINGS and value == ""):
+        return unset_label()
+    return " ".join(str(value).split()) or "—"
+
+
+def edit_options(fields, values, edit, *, defaults=None, current=None):
     """Keep supplied values and leave untouched options to the command defaults."""
     if not fields:
         return values
+    defaults = defaults or {}
+    current = defaults if current is None else current
     while True:
         options = [(tr("Continue", "次へ"), "")]
         for key, label in fields:
             value = values.get(key)
-            preview = " ".join(str(value).split()) if value is not None else tr("default", "既定値")
-            if key == "branch" and value in BRANCH_MODES:
-                preview = branch_label(value)
-            elif key in ("base", *MODEL_SETTINGS) and value == "inherit":
-                preview = inherited_label()
-            elif (key == "base" and value in ("unset", "")) or (key in MODEL_SETTINGS and value == ""):
-                preview = unset_label()
-            elif key == "branch" and value == "":
-                preview = inherited_label()
-            options.append((f"{label}: {preview or '—'}", key))
+            default = defaults.get(key)
+            if value is None:
+                value = current.get(key)
+            preview = option_preview(key, value)
+            if default is not None and str(value) == str(default):
+                preview += f" ({tr('default', '既定値')})"
+            options.append((f"{label}: {preview}", key))
         key = choose(tr("Choose an option to edit", "変更するオプションを選択"), options)
         if key is None:
             return None
@@ -563,6 +574,7 @@ def fill_add(db, argv):
     values = edit_options(
         [("detail", tr("Idea details", "Idea の詳細"))], {"detail": args.detail},
         lambda key, label, value: edit_field(key, label, value or ""),
+        defaults={"detail": ""},
     )
     if values is None:
         return None
@@ -610,7 +622,7 @@ def fill_idea(db, argv):
             ))
         return edit_field(key, label, value)
 
-    values = edit_options(fields, values, edit)
+    values = edit_options(fields, values, edit, defaults={"detail": ""})
     if values is None:
         return None
     for key, value in values.items():
@@ -674,14 +686,16 @@ def fill_project(db, argv):
         row = db.execute("SELECT * FROM projects WHERE id=? AND retired=0", (target,)).fetchone()
         if row is None:
             return command
-    defaults = dict(row) if row else {"path": ".", "name": "", "prompt": "", "branch": ""}
-    defaults["branch"] = defaults["branch"] or ""
-    defaults.setdefault("nextcloud_sync", "on")
-    for key in ("base", "planner_model", "implementation_model", "allowed_models"):
-        if defaults.get(key) is None:
-            defaults[key] = "inherit"
-    if defaults["base"] == "":
-        defaults["base"] = "unset"
+    defaults = {"prompt": "", "branch": "", "base": "inherit", "nextcloud_sync": "on",
+                **dict.fromkeys(MODEL_SETTINGS, "inherit")}
+    current = dict(row) if row else {"path": ".", "name": "", **defaults}
+    current["branch"] = current["branch"] or ""
+    current.setdefault("nextcloud_sync", defaults["nextcloud_sync"])
+    for key in ("base", *MODEL_SETTINGS):
+        if current.get(key) is None:
+            current[key] = "inherit"
+    if current["base"] == "":
+        current["base"] = "unset"
     labels = dict(fields)
     if action == "add":
         path = validated_input(
@@ -700,7 +714,7 @@ def fill_project(db, argv):
             return None
         command = option(option(command, "--path", path), "--name", name)
         fields = [(key, label) for key, label in fields if key not in ("path", "name")]
-    values = {key: getattr(args, key) if getattr(args, key) is not None else defaults[key] for key, _ in fields}
+    values = {key: getattr(args, key) if getattr(args, key) is not None else current[key] for key, _ in fields}
     models = cache(lambda: codex_models(db))
 
     def edit(key, label, value):
@@ -717,13 +731,13 @@ def fill_project(db, argv):
                                    lambda text: str(repository_path(text)))
         return edit_field(key, label, value or "")
 
-    values = edit_options(fields, values, edit)
+    values = edit_options(fields, values, edit, defaults=defaults)
     if values is None:
         return None
     for key, value in values.items():
         if key == "branch" and value == "" and action != "edit":
             continue
-        if value != defaults[key] or (action != "edit" and getattr(args, key) is not None):
+        if value != current[key] or (action != "edit" and getattr(args, key) is not None):
             command = option(command, f"--{key.replace('_', '-')}", value)
     if action == "edit" and len(command) == 3:
         return None
@@ -887,7 +901,7 @@ def fill_arguments(db, parser, command, argv):
             )
         return prompt_argument(db, command, argument, value, current.get(key))
 
-    values = edit_options(fields, values, edit)
+    values = edit_options(fields, values, edit, defaults=DEFAULTS if current else None, current=current)
     if values is None:
         return None
     for key, value in values.items():
