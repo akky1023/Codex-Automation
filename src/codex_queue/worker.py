@@ -12,7 +12,7 @@ import time
 from .nextcloud import settle_move, sync
 from .planner import plan_next_idea
 from .processes import process_lock, spawn, stop_tree, wait_for_previous_job
-from .runtime import codex_command, codex_env
+from .runtime import NO_WINDOW, codex_command, codex_env
 from .store import get_setting, open_queue, queue_folder, set_setting, settings, update, write
 
 
@@ -43,6 +43,7 @@ MONTHS = (
 def git(path, *args):
     result = subprocess.run(
         ["git", *args], cwd=path, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        creationflags=NO_WINDOW,
     )
     if result.returncode:
         raise RuntimeError(result.stderr.strip() or f"git {args[0]} failed")
@@ -590,7 +591,7 @@ def run_worker(scheduled):
                 try:
                     authenticated = subprocess.run(
                         [*codex_command(db), "login", "status"], env=codex_env(db),
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, creationflags=NO_WINDOW,
                     ).returncode == 0
                 except (OSError, RuntimeError, subprocess.SubprocessError):
                     pass

@@ -13,6 +13,9 @@ from .language import tr
 from .store import get_setting, queue_folder, set_setting, write
 
 
+NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+
 def codex_command(db, use_saved=True):
     saved = get_setting(db, "codex_command") if use_saved else None
     if saved:
@@ -88,7 +91,7 @@ def codex_models(db):
             path = Path(folder) / "stdout"
             with path.open("wb") as stdout, path.open("rb") as output, subprocess.Popen(
                 command, env=codex_env(db), stdin=subprocess.PIPE, stdout=stdout, stderr=subprocess.DEVNULL,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                creationflags=NO_WINDOW,
             ) as process:
                 try:
                     return list_app_server_models(process, output)
@@ -115,7 +118,7 @@ def request_worker(db):
         [*queue_command(), "_worker"], stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         cwd=queue_folder(),
-        creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS if os.name == "nt" else 0,
+        creationflags=NO_WINDOW,
         start_new_session=os.name != "nt",
     )
     return True
@@ -125,7 +128,7 @@ def scheduler(action, name, extra=(), check=True):
     system = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
     result = subprocess.run(
         [str(system / "schtasks.exe"), f"/{action}", "/TN", name, *extra],
-        capture_output=True, text=True, errors="replace",
+        capture_output=True, text=True, errors="replace", creationflags=NO_WINDOW,
     )
     if check and result.returncode:
         raise RuntimeError((result.stderr or result.stdout).strip())
@@ -139,8 +142,11 @@ def task_name(db):
 def register_schedule(db, minutes):
     if os.name != "nt":
         raise RuntimeError(tr("The scheduled worker requires Windows Task Scheduler.", "定期実行には Windows タスク スケジューラが必要です。"))
+    executable = Path(sys.executable).with_name("pythonw.exe")
+    if not executable.is_file():
+        raise RuntimeError(tr("Scheduled execution requires pythonw.exe beside python.exe.", "定期実行には python.exe と同じフォルダーに pythonw.exe が必要です。"))
     system = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
-    user = subprocess.check_output([str(system / "whoami.exe")], text=True).strip()
+    user = subprocess.check_output([str(system / "whoami.exe")], text=True, creationflags=NO_WINDOW).strip()
     task = ET.Element("Task", version="1.3", xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task")
 
     def child(parent, tag, value=None, **attrs):
@@ -164,7 +170,7 @@ def register_schedule(db, minutes):
     child(config, "StartWhenAvailable", "true")
     child(config, "ExecutionTimeLimit", "PT0S")
     action = child(child(task, "Actions", Context="Owner"), "Exec")
-    child(action, "Command", sys.executable)
+    child(action, "Command", str(executable))
     child(action, "Arguments", subprocess.list2cmdline([
         *queue_command()[1:], "_worker", "--scheduled", "--data-dir", str(queue_folder()),
     ]))

@@ -4,7 +4,7 @@ import subprocess
 from tempfile import TemporaryDirectory
 
 from .processes import process_lock
-from .runtime import codex_command, codex_env
+from .runtime import NO_WINDOW, codex_command, codex_env
 from .store import queue_folder, settings, write
 
 
@@ -91,7 +91,7 @@ def generate_plan(db, path, prompt, config, models, *, review_branch=False):
         result = subprocess.run(
             [*command, "--output-schema", str(schema_path), "-o", str(output), "-"],
             input=prompt, cwd=path, env=codex_env(db), encoding="utf-8", errors="replace",
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, creationflags=NO_WINDOW,
         )
         if result.returncode:
             raise RuntimeError(result.stderr.strip() or f"Planner exited with code {result.returncode}.")
