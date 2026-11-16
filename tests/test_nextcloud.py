@@ -1,8 +1,9 @@
 import sqlite3
 import unittest
+from unittest.mock import patch
 
 from codex_queue.nextcloud import Client, apply_snapshot, completed_body, todo_fields, writeback
-from codex_queue.nextcloud_board import available_projects, board_snapshot
+from codex_queue.nextcloud_board import available_projects, board_snapshot, request_action
 from codex_queue.store import SCHEMA
 
 
@@ -15,6 +16,31 @@ BODY = (
 
 
 class BoardProjectTest(unittest.TestCase):
+    def test_board_can_resolve_reviewed_tasks_and_reject_stale_actions(self):
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        db.row_factory = sqlite3.Row
+        db.executescript(SCHEMA)
+        with db:
+            db.execute("INSERT INTO projects(path,path_key,name) VALUES ('one','one','One')")
+            db.execute("INSERT INTO settings VALUES ('enabled','1')")
+            db.execute("""INSERT INTO tasks(project_id,name,priority,status) VALUES
+                       (1,'Resolved',1,'NEEDS_REVIEW'), (1,'Discarded',1,'NEEDS_REVIEW')""")
+            db.execute("""INSERT INTO attempts(task_id,number,path,mode,prompt) VALUES
+                       (1,1,'one','current',''), (2,1,'one','current','')""")
+        projects = available_projects(db)
+        done = {"kind": "done", "target_id": 1, "title": "", "body": ""}
+        abort = {"kind": "abort", "target_id": 2, "title": "", "body": ""}
+        with patch("codex_queue.actions.wake"):
+            self.assertIn("完了", request_action(db, done, projects, ("board", 1)))
+            self.assertIn("中止", request_action(db, abort, projects, ("board", 2)))
+            with self.assertRaisesRegex(RuntimeError, "status changed|状態が変わりました"):
+                request_action(db, {**done, "target_id": 2}, projects, ("board", 3))
+        self.assertEqual(["DONE", "ABORTED"], [
+            row["status"] for row in db.execute("SELECT status FROM tasks ORDER BY id")
+        ])
+        self.assertEqual("0", db.execute("SELECT value FROM settings WHERE key='enabled'").fetchone()[0])
+
     def test_project_sync_defaults_on_and_updates_the_published_snapshot(self):
         db = sqlite3.connect(":memory:")
         self.addCleanup(db.close)

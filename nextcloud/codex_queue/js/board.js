@@ -24,7 +24,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const collator = new Intl.Collator('ja', {numeric: true, sensitivity: 'base'});
     const labels = {
         add: 'Idea 追加', edit: 'Idea 編集', remove: 'Idea 削除', plan: '計画',
-        revise: '修正依頼', reply: '回答', retry: '再試行', sync: '同期',
+        revise: '修正依頼', reply: '回答', retry: '再試行', done: '完了', abort: '中止', sync: '同期',
     };
     const states = {
         QUEUED: '待機中', RUNNING: '実行中', DONE: '完了', ABORTED: '中止',
@@ -93,6 +93,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function action(card, kind, id, label = labels[kind]) {
         const button = node('button', label);
+        button.type = 'button';
         button.addEventListener('click', () => {
             if (kind !== 'remove' || window.confirm('この Idea を削除しますか？')) submit(button, kind, id);
         });
@@ -190,6 +191,15 @@ document.addEventListener('DOMContentLoaded', () => {
         return wrapper;
     }
 
+    function cardSection(card, label, text, key) {
+        if (!text) return;
+        const section = node('details');
+        section.className = 'cq-card-section';
+        section.dataset.key = key;
+        section.append(node('summary', label), node('p', text));
+        card.append(section);
+    }
+
     function render() {
         const ideas = find('#cq-ideas');
         const todos = find('#cq-todos');
@@ -205,9 +215,10 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         for (const task of (snapshot.tasks || []).filter(visible)) {
             const {item, content} = card(task, task.name, states[task.status] || task.status, 'task-');
-            for (const text of [task.abstract, task.prompt, task.reason, task.completed_at]) {
-                if (text) content.append(node('p', text));
-            }
+            if (task.abstract) content.append(node('p', task.abstract));
+            cardSection(content, '詳細', task.prompt, item.dataset.key + '-detail');
+            cardSection(content, '停止理由', task.reason, item.dataset.key + '-reason');
+            if (task.completed_at) content.append(node('p', task.completed_at));
             if (task.report) {
                 try {
                     const report = JSON.parse(task.report);
@@ -216,11 +227,10 @@ document.addEventListener('DOMContentLoaded', () => {
                     content.append(node('p', task.report));
                 }
             }
-            let taskCard = item;
+            const actions = node('div');
+            actions.className = 'cq-card-actions cq-task-actions';
             if (canRevise(task)) {
-                const actions = node('div');
-                actions.className = 'cq-card-actions';
-                const revise = node('button', '修正依頼');
+                const revise = node('button', labels.revise);
                 revise.type = 'button';
                 revise.addEventListener('click', () => {
                     if (revisionClear.disabled) return;
@@ -230,12 +240,16 @@ document.addEventListener('DOMContentLoaded', () => {
                     showRevisionPicker(false);
                 });
                 actions.append(revise);
-                taskCard = cardWithActions(item, actions);
             }
             if (task.status === 'WAITING_FOR_INPUT') requestForm(content, 'reply', task.id);
             if (['NEEDS_REVIEW', 'INTERRUPTED', 'AUTH_REQUIRED', 'RETRY_WAIT', 'ABORTED'].includes(task.status)) {
-                action(content, 'retry', task.id);
+                action(actions, 'retry', task.id);
             }
+            if (task.status === 'NEEDS_REVIEW') {
+                action(actions, 'done', task.id);
+                action(actions, 'abort', task.id);
+            }
+            const taskCard = actions.childElementCount ? cardWithActions(item, actions) : item;
             (taskColumn(task) === 'Done' ? done : todos).append(taskCard);
         }
         for (const item of board.querySelectorAll('details[data-key]')) item.open = expanded.has(item.dataset.key);
@@ -282,7 +296,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     filter.addEventListener('change', render);
     find('.cq-board').addEventListener('click', event => {
-        if (event.defaultPrevented || event.target.closest('summary, button, a, form, input, select, textarea, label')) return;
+        if (event.defaultPrevented || event.target.closest('.cq-card-section, summary, button, a, form, input, select, textarea, label')) return;
         if (window.getSelection()?.type === 'Range') return;
         const surface = event.target.closest('.cq-card-with-actions, .cq-card');
         if (!surface) return;

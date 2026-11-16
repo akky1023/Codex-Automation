@@ -30,6 +30,7 @@ REPORT_SCHEMA = {
     "additionalProperties": False,
 }
 RECONNECTING = "Reconnecting... waiting for network (Connection failed:"
+SHUTDOWN_GRACE_SECONDS = 30
 RESET_TIME = re.compile(
     r"try again at ([A-Za-z]+) (\d{1,2})(?:st|nd|rd|th)?, (\d{4}) "
     r"(\d{1,2}):(\d{2}) (AM|PM)", re.IGNORECASE,
@@ -400,6 +401,24 @@ def move_requested(db, attempt):
     ).fetchone() is not None
 
 
+def read_report(path):
+    report = json.loads(path.read_text(encoding="utf-8"))
+    if (
+        not isinstance(report, dict)
+        or report.keys() != set(REPORT_SCHEMA["required"])
+        or any(not isinstance(value, str) for value in report.values())
+        or report["status"] not in REPORT_SCHEMA["properties"]["status"]["enum"]
+    ):
+        raise ValueError("Invalid Codex final report.")
+    return report
+
+
+def write_run_json(path, value):
+    marker = path.with_suffix(".tmp")
+    marker.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
+    marker.replace(path)
+
+
 def execute(db, attempt):
     folder = attempt_folder(attempt)
     folder.mkdir(parents=True, exist_ok=True)
@@ -434,6 +453,8 @@ def execute(db, attempt):
     interruption = None
     events = []
     completed = failed = started = False
+    report = shutdown_deadline = None
+    shutdown_timeout = False
     reconnects = 0
     with (folder / "prompt.txt").open("rb") as source, stdout.open("wb") as out, stderr.open("wb") as err:
         try:
@@ -487,6 +508,19 @@ def execute(db, attempt):
                         break
                     if reconnects >= 3:
                         break
+                    if completed and not failed:
+                        if report is None:
+                            try:
+                                report = read_report(output)
+                            except (FileNotFoundError, ValueError):
+                                pass  # The CLI may still be writing the report.
+                            else:
+                                write_run_json(folder / "report-ready.json", report)
+                                shutdown_deadline = time.monotonic() + SHUTDOWN_GRACE_SECONDS
+                        if shutdown_deadline is not None and time.monotonic() >= shutdown_deadline:
+                            shutdown_timeout = process.poll() is None
+                            if shutdown_timeout:
+                                break
                     time.sleep(0.15)
         finally:
             if process is not None:
@@ -496,14 +530,13 @@ def execute(db, attempt):
     if interruption or move_requested(db, attempt):
         record(db, attempt, "INTERRUPTED", interruption or "Nextcloud task moved or was removed.")
         return
-    marker = folder / "exit.tmp"
-    marker.write_text(json.dumps({"code": process.returncode}), encoding="utf-8")
-    marker.replace(folder / "exit.json")
-    process_result(db, attempt, folder, process.returncode, events, completed, failed, started)
+    write_run_json(folder / "exit.json", {"code": process.returncode, "shutdown_timeout": shutdown_timeout})
+    process_result(db, attempt, folder, process.returncode, events, completed, failed, started,
+                   report=report if shutdown_timeout else None)
 
 
-def process_result(db, attempt, folder, code, events, completed, failed, started):
-    if code or not completed or failed:
+def process_result(db, attempt, folder, code, events, completed, failed, started, *, report=None):
+    if (code and report is None) or not completed or failed:
         status, retry_at = classify(events, (folder / "stderr.log").read_text(encoding="utf-8", errors="replace"))
         failures = attempt["failures"] + 1
         if status == "RETRY_WAIT":
@@ -521,9 +554,8 @@ def process_result(db, attempt, folder, code, events, completed, failed, started
         record(db, attempt, status, f"Codex exit {code}; see logs.", phase=phase,
                retry_at=retry_at, failures=failures if status == "RETRY_WAIT" else 0)
         return
-    report = json.loads((folder / "final.json").read_text(encoding="utf-8"))
-    if not isinstance(report, dict) or any(not isinstance(report.get(key), str) for key in REPORT_SCHEMA["required"]):
-        raise RuntimeError("Invalid Codex final report.")
+    if report is None:
+        report = read_report(folder / "final.json")
     status = report["status"]
     report_json = json.dumps(report, ensure_ascii=False)
     if status in ("COMPLETED", "ABORTED"):
@@ -549,9 +581,25 @@ def recover(db):
             if runs:
                 run = max(runs, key=lambda path: int(path.name))
                 try:
-                    code = json.loads((run / "exit.json").read_text(encoding="utf-8"))["code"]
+                    try:
+                        exit_result = json.loads((run / "exit.json").read_text(encoding="utf-8"))
+                    except FileNotFoundError:
+                        if os.name != "nt":
+                            raise  # Without a Windows job, the previous process may still be running.
+                        exit_result = None
+                    report = None
+                    if exit_result is None or exit_result.get("shutdown_timeout"):
+                        report = read_report(run / "report-ready.json")
                     events = [json.loads(line) for line in (run / "events.jsonl").read_bytes().splitlines()]
                     types = {event["type"] for event in events if isinstance(event, dict)}
+                    if exit_result is None:
+                        moved = move_requested(db, attempt)
+                        if moved or get_setting(db, "stop") == "1":
+                            reason = "Nextcloud task moved or was removed." if moved else "Stopped by the user."
+                            record(db, attempt, "INTERRUPTED", reason)
+                            continue
+                        if "turn.completed" not in types or "turn.failed" in types:
+                            raise ValueError("The saved report has no successful turn.")
                     for event in reversed(events):
                         if isinstance(event, dict) and event.get("type") == "thread.started" and event.get("thread_id"):
                             with write(db):
@@ -559,8 +607,9 @@ def recover(db):
                             break
                     started = "turn.started" in types or any(kind.startswith("item.") for kind in types)
                     process_result(
-                        db, attempt, run, code, events,
+                        db, attempt, run, exit_result["code"] if exit_result else None, events,
                         "turn.completed" in types, "turn.failed" in types, started,
+                        report=report,
                     )
                     continue
                 except (OSError, ValueError, KeyError, RuntimeError):

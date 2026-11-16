@@ -51,7 +51,7 @@ def queue_control(db, command):
     print(tr("Queue stopped.", "キューを停止しました。") if command == "stop" else tr("Queue paused.", "キューを一時停止しました。"))
 
 
-def task_action(db, args):
+def task_action(db, args, *, expected_status=None):
     action = args.command
     if action == "logs":
         show_logs(db, args.id)
@@ -61,6 +61,9 @@ def task_action(db, args):
         if task is None:
             raise RuntimeError(tr("Unknown task ID {id}", "タスク ID {id} が見つかりません", id=args.id))
         status = task["status"]
+        if expected_status is not None and status != expected_status:
+            raise RuntimeError(tr("The task status changed. Refresh the board.",
+                                  "To Do の状態が変わりました。ボードを更新してください。"))
         attempt = latest_attempt(db, args.id)
         if status in ("RUNNING", "DONE", "REMOVED", "SUPERSEDED") or attempt is None:
             raise RuntimeError(tr("Cannot {action} task {id} in state {status}.",

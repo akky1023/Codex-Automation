@@ -34,7 +34,7 @@ final class BoardController extends OCSController {
             'edit' => $target > 0 && $title !== '' && !preg_match('/\R/u', $title),
             'remove', 'plan' => $target > 0,
             'revise', 'reply' => $target > 0 && $body !== '',
-            'retry' => $target > 0,
+            'retry', 'done', 'abort' => $target > 0,
             'sync' => $target === 0,
             default => false,
         };

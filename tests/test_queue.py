@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 from codex_queue.nextcloud import apply_snapshot
 from codex_queue.store import SCHEMA, open_queue
-from codex_queue.worker import classify
+from codex_queue.worker import classify, run_worker
 
 
 FAKE_CODEX = """
@@ -64,6 +64,8 @@ if "Decline unsafe change" in prompt:
     report = dict(status="ABORTED", reason="Refused by policy", question="")
 elif "wait for user" in prompt and "test answer" not in prompt:
     report = dict(status="WAITING_FOR_INPUT", reason="Need a decision", question="What next?")
+elif "shutdown hang" in prompt:
+    report = dict(status="NEEDS_REVIEW", reason="Rendering is still slow", question="")
 elif "sleep task" in prompt and "resume" not in args:
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
     Path("child.pid").write_text(str(child.pid))
@@ -85,6 +87,8 @@ else:
     report = dict(status="COMPLETED", reason="Finished", question="")
 output.write_text(json.dumps(dict(report, verification="fake verification")))
 event("turn.completed")
+if "shutdown hang" in prompt:
+    time.sleep(60)
 """
 
 
@@ -382,6 +386,30 @@ class QueueTest(unittest.TestCase):
         self.assertEqual(0, pause.wait(8))
         self.assertEqual(0, worker.wait(8))
         self.wait(["DONE", "QUEUED"])
+
+    def test_worker_preserves_report_when_codex_hangs_after_completion(self):
+        self.add_task("shutdown hang")
+        self.enable()
+        with patch.dict(os.environ, {"CQ_WORKER_DATA_DIR": str(self.database.parent)}), \
+                patch("codex_queue.worker.SHUTDOWN_GRACE_SECONDS", 0.2):
+            run_worker(False)
+        self.wait(["NEEDS_REVIEW"])
+        reason, report = self.sql("SELECT reason, report FROM attempts")[0]
+        self.assertEqual("Rendering is still slow", reason)
+        self.assertEqual("fake verification", json.loads(report)["verification"])
+        run = self.database.parent / "logs" / "1" / "1" / "1"
+        exit_result = json.loads((run / "exit.json").read_text())
+        self.assertTrue(exit_result["shutdown_timeout"])
+        self.assertNotEqual(0, exit_result["code"])
+
+        # Simulate a worker exit after saving the report but before recording the result.
+        if os.name == "nt":
+            (run / "exit.json").unlink()
+            self.sql("UPDATE tasks SET status='RUNNING'")
+            self.sql("UPDATE attempts SET reason=NULL, report=NULL")
+            self.cq("_worker")
+            self.wait(["NEEDS_REVIEW"])
+            self.assertEqual([(reason, report)], self.sql("SELECT reason, report FROM attempts"))
 
     def test_stop_preserves_branch_and_prevents_new_launch(self):
         self.add_task("sleep task")

@@ -115,6 +115,9 @@ def request_action(db, request, projects, key):
     if kind in ("reply", "retry"):
         task_action(db, Namespace(command=kind, id=target, answer=body, fresh=False))
         return "依頼を処理しました。"
+    if kind in ("done", "abort"):
+        task_action(db, Namespace(command=kind, id=target, note=body or None), expected_status="NEEDS_REVIEW")
+        return f"To Do {target} を{'完了' if kind == 'done' else '中止'}にしました。"
     raise RuntimeError("この操作には対応していません。")
 
 
