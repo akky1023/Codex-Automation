@@ -12,14 +12,17 @@ from .nextcloud import Client, RejectRedirects, connection
 from .planner import plan_idea, revise_task
 from .grilling import answer_grilling, cancel_grilling, confirm_grilling, start_grilling
 from .processes import process_lock
-from .store import write
+from .store import open_queue, write
 from .worker import latest_attempt
 
-_grilling_lock = Lock()
-_grilling_running = set()
 _ASYNC_PENDING = "__GRILLING_PENDING__"
 BOARD_POLL_SECONDS = 5
 GRILLING_POLL_SECONDS = 1
+
+
+PENDING_OUTCOME = "処理中です。"
+_running_lock = Lock()
+_running_requests = set()
 
 
 class LocalBoardClient(Client):
@@ -175,21 +178,36 @@ def save_outcome(db, key, outcome):
     db.execute("UPDATE board_receipts SET outcome = ? WHERE board = ? AND request_id = ?", (outcome, *key))
 
 
-def _run_grilling_request(board, request, projects, key):
+def _run_request(key, request, project_ids):
     try:
         with open_queue() as worker_db:
-            outcome = request_action(worker_db, request, projects, key)
-    except (OSError, RuntimeError, sqlite3.Error, SubprocessError) as error:
-        outcome = f"処理できませんでした: {error}"
-    try:
-        with open_queue() as worker_db, write(worker_db):
-            save_outcome(worker_db, key, outcome[:1800])
+            projects = available_projects(worker_db, project_ids)
+            try:
+                outcome = request_action(worker_db, request, projects, key)
+            except (OSError, RuntimeError, sqlite3.Error, SubprocessError) as error:
+                outcome = f"処理できませんでした。{error}"
+            with write(worker_db):
+                save_outcome(worker_db, key, outcome[:1800])
     finally:
-        with _grilling_lock:
-            _grilling_running.discard(key)
+        with _running_lock:
+            _running_requests.discard(key)
 
 
-def exchange(db, client, projects, *, async_grilling=False):
+def _start_request(key, request, project_ids):
+    with _running_lock:
+        if key in _running_requests:
+            return False
+        _running_requests.add(key)
+    try:
+        Thread(target=_run_request, args=(key, request, project_ids), daemon=True).start()
+    except BaseException:
+        with _running_lock:
+            _running_requests.discard(key)
+        raise
+    return True
+
+
+def exchange(db, client, projects, watch=False):
     incoming = ocs(client, "GET")
     board = json.dumps([incoming["instance"], incoming["owner"]], ensure_ascii=False)
     results = []
@@ -199,21 +217,19 @@ def exchange(db, client, projects, *, async_grilling=False):
         with write(db):
             reserved = db.execute(
                 "INSERT OR IGNORE INTO board_receipts VALUES (?, ?, ?)",
-                (*key, "処理が中断されました。ボードの状態を確認してから、必要なら再度依頼してください。"),
+                (*key, PENDING_OUTCOME),
             ).rowcount
-        async_kind = request["kind"].startswith("grilling_") or request["kind"] == "approve_branch"
-        if async_grilling and async_kind:
+        kind = request["kind"]
+        grilling = kind.startswith("grilling_") or kind == "approve_branch"
+        if watch and grilling:
             if reserved:
                 with write(db):
                     save_outcome(db, key, _ASYNC_PENDING)
             outcome = db.execute("SELECT outcome FROM board_receipts WHERE board = ? AND request_id = ?", key).fetchone()[0]
             if outcome == _ASYNC_PENDING:
-                with _grilling_lock:
-                    should_start = key not in _grilling_running
-                    if should_start:
-                        _grilling_running.add(key)
-                if should_start:
-                    Thread(target=_run_grilling_request, args=(board, request, projects, key), daemon=True).start()
+                _start_request(key, request, set(projects))
+        elif reserved and watch and kind in ("plan", "revise"):
+            _start_request(key, request, set(projects))
         elif reserved:
             try:
                 outcome = request_action(db, request, projects, key)
@@ -221,8 +237,14 @@ def exchange(db, client, projects, *, async_grilling=False):
                 outcome = f"処理できませんでした。{error}"
             with write(db):
                 save_outcome(db, key, outcome[:1800])
-        outcome = db.execute("SELECT outcome FROM board_receipts WHERE board = ? AND request_id = ?", key).fetchone()[0]
-        if outcome != _ASYNC_PENDING:
+        with _running_lock:
+            running = key in _running_requests
+            outcome = db.execute("SELECT outcome FROM board_receipts WHERE board = ? AND request_id = ?", key).fetchone()[0]
+        if outcome == PENDING_OUTCOME and not running:
+            outcome = "処理が中断されました。ボードの状態を確認してから、必要なら再度依頼してください。"
+            with write(db):
+                save_outcome(db, key, outcome)
+        if outcome not in (PENDING_OUTCOME, _ASYNC_PENDING):
             results.append({"id": request_id, "outcome": outcome})
     ocs(client, "POST", {"snapshot": board_snapshot(db, projects, board), "results": results})
     if any(request["kind"] in ("add", "plan", "edit", "revise", "grilling_start", "grilling_answer", "grilling_confirm", "approve_branch") for request in incoming["requests"]):
@@ -245,7 +267,7 @@ def run_board(db, args):
         while True:
             try:
                 client = local_client if local_client is not None else connection(db)[0]
-                exchange(db, client, available_projects(db, project_ids), async_grilling=args.watch)
+                exchange(db, client, available_projects(db, project_ids), watch=args.watch)
             except (OSError, RuntimeError) as error:
                 if not args.watch:
                     raise
