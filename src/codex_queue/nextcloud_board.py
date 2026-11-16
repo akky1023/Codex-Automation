@@ -129,26 +129,41 @@ def exchange(db, client, projects):
     incoming = ocs(client, "GET")
     board = json.dumps([incoming["instance"], incoming["owner"]], ensure_ascii=False)
     results = []
+    deferred = None
+    interrupted = "処理が中断されました。ボードの状態を確認してから、必要なら再度依頼してください。"
     for request in incoming["requests"]:
         request_id = int(request["id"])
         key = (board, request_id)
-        with write(db):
-            reserved = db.execute(
-                "INSERT OR IGNORE INTO board_receipts VALUES (?, ?, ?)",
-                (*key, "処理が中断されました。ボードの状態を確認してから、必要なら再度依頼してください。"),
-            ).rowcount
-        if reserved:
-            try:
-                outcome = request_action(db, request, projects, key)
-            except (OSError, RuntimeError, sqlite3.Error, SubprocessError) as error:
-                outcome = f"処理できませんでした。{error}"
+        atomic = request["kind"] in ("add", "edit", "remove")
+        try:
             with write(db):
-                save_outcome(db, key, outcome[:1800])
-        outcome = db.execute("SELECT outcome FROM board_receipts WHERE board = ? AND request_id = ?", key).fetchone()[0]
-        results.append({"id": request_id, "outcome": outcome})
+                reserved = db.execute(
+                    "INSERT OR IGNORE INTO board_receipts VALUES (?, ?, ?)", (*key, interrupted),
+                ).rowcount
+                outcome = db.execute(
+                    "SELECT outcome FROM board_receipts WHERE board = ? AND request_id = ?", key,
+                ).fetchone()[0]
+            # These Idea changes commit their receipt with the mutation, so a
+            # reservation left by an interrupted attempt can safely be replayed.
+            if reserved or (atomic and outcome == interrupted):
+                try:
+                    outcome = request_action(db, request, projects, key)
+                except (OSError, RuntimeError, sqlite3.Error, SubprocessError) as error:
+                    if atomic and isinstance(error, sqlite3.OperationalError):
+                        raise
+                    outcome = f"処理できませんでした。{error}"
+                with write(db):
+                    save_outcome(db, key, outcome[:1800])
+            results.append({"id": request_id, "outcome": outcome[:1800]})
+        except sqlite3.OperationalError as error:
+            # Publish completed requests before retrying this request in order.
+            deferred = error
+            break
     ocs(client, "POST", {"snapshot": board_snapshot(db, projects), "results": results})
     if any(request["kind"] in ("add", "plan", "edit", "revise") for request in incoming["requests"]):
         wake(db)
+    if deferred is not None:
+        raise RuntimeError(f"ボードの同期を再試行します。{deferred}") from deferred
 
 
 def run_board(db, args):

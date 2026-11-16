@@ -4,7 +4,7 @@
     <name>Codex Queue</name>
     <summary>Codex Queue workspace</summary>
     <description>Workspace for managing ideas and viewing Codex tasks.</description>
-    <version>0.2.32</version>
+    <version>0.2.34</version>
     <licence>agpl</licence>
     <author>Codex Queue contributors</author>
     <namespace>CodexQueue</namespace>

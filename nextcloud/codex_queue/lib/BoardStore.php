@@ -8,6 +8,8 @@ use OCP\DB\QueryBuilder\IQueryBuilder;
 use OCP\IDBConnection;
 
 final class BoardStore {
+    private const CLAIMED = '@claimed';
+
     public function __construct(private IDBConnection $db) {}
 
     public function snapshot(string $owner): array {
@@ -18,16 +20,55 @@ final class BoardStore {
         return $value === false ? [] : json_decode($value, true, flags: JSON_THROW_ON_ERROR);
     }
 
-    public function requests(string $owner, bool $pending): array {
+    public function pending(string $owner, bool $claim = false): array {
         $query = $this->db->getQueryBuilder();
         $query->select('id', 'kind', 'target_id', 'title', 'body', 'outcome')->from('cq_requests')
-            ->where($query->expr()->eq('owner', $query->createNamedParameter($owner)));
-        if ($pending) {
-            $query->andWhere($query->expr()->isNull('outcome'))->orderBy('id', 'ASC')->setMaxResults(20);
-        } else {
-            $query->orderBy('id', 'DESC')->setMaxResults(20);
+            ->where($query->expr()->eq('owner', $query->createNamedParameter($owner)))
+            ->andWhere($query->expr()->orX(
+                $query->expr()->isNull('outcome'),
+                $query->expr()->eq('outcome', $query->createNamedParameter(self::CLAIMED)),
+            ))->orderBy('id', 'ASC');
+        if ($claim) {
+            $query->setMaxResults(20);
         }
+
+        $requests = [];
+        foreach ($query->executeQuery()->fetchAllAssociative() as $request) {
+            $claimed = $request['outcome'] === self::CLAIMED;
+            if ($claim && !$claimed && !$this->resolve($owner, (int) $request['id'], self::CLAIMED)) {
+                continue;
+            }
+            unset($request['outcome']);
+            $request['claimed'] = $claim || $claimed;
+            $requests[] = $request;
+        }
+        return $requests;
+    }
+
+    public function history(string $owner): array {
+        $query = $this->db->getQueryBuilder();
+        $query->select('id', 'kind', 'outcome')->from('cq_requests')
+            ->where($query->expr()->eq('owner', $query->createNamedParameter($owner)))
+            ->andWhere($query->expr()->neq('outcome', $query->createNamedParameter(self::CLAIMED)))
+            ->orderBy('id', 'DESC')->setMaxResults(20);
         return $query->executeQuery()->fetchAllAssociative();
+    }
+
+    public function cancel(string $owner, int $id, string $kind, int $target): bool {
+        return $this->resolve($owner, $id, '予約を取り消しました。', $kind, $target);
+    }
+
+    private function resolve(string $owner, int $id, string $outcome, ?string $kind = null, int $target = 0): bool {
+        $query = $this->db->getQueryBuilder();
+        $query->update('cq_requests')->set('outcome', $query->createNamedParameter($outcome))
+            ->where($query->expr()->eq('owner', $query->createNamedParameter($owner)))
+            ->andWhere($query->expr()->eq('id', $query->createNamedParameter($id, IQueryBuilder::PARAM_INT)))
+            ->andWhere($query->expr()->isNull('outcome'));
+        if ($kind !== null) {
+            $query->andWhere($query->expr()->eq('kind', $query->createNamedParameter($kind)))
+                ->andWhere($query->expr()->eq('target_id', $query->createNamedParameter($target, IQueryBuilder::PARAM_INT)));
+        }
+        return $query->executeStatement() === 1;
     }
 
     public function submit(string $owner, string $kind, int $target, string $title, string $body): void {
@@ -56,7 +97,8 @@ final class BoardStore {
                     ->set('outcome', $query->createNamedParameter($result['outcome']))
                     ->where($query->expr()->eq('owner', $query->createNamedParameter($owner)))
                     ->andWhere($query->expr()->eq('id', $query->createNamedParameter($result['id'], IQueryBuilder::PARAM_INT)))
-                    ->andWhere($query->expr()->isNull('outcome'))->executeStatement();
+                    ->andWhere($query->expr()->eq('outcome', $query->createNamedParameter(self::CLAIMED)))
+                    ->executeStatement();
             }
             $this->db->commit();
         } catch (\Throwable $error) {

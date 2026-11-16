@@ -35,6 +35,9 @@ document.addEventListener('DOMContentLoaded', () => {
     let snapshot = {};
     let fingerprint;
     let loading = false;
+    let boardVersion = 0;
+    let pending = [];
+    const scheduled = '次回同期時に実行';
     let editingIdea = null;
     let revisionTask = null;
     const recentDoneLimit = 15;
@@ -64,18 +67,29 @@ document.addEventListener('DOMContentLoaded', () => {
         return result.data;
     }
 
-    async function submit(button, kind, target, title = '', body = '', errorTarget = find('#cq-message')) {
+    function reservation(kind, target) {
+        return pending.find(request => request.kind === kind && Number(request.target_id) === Number(target));
+    }
+
+    function showReservation(button, request, label) {
+        button.textContent = request ? scheduled : label;
+        button.disabled = Boolean(request?.claimed);
+        button.title = request ? label + (request.claimed ? '（同期処理中）' : '（押すと予約を取り消す）') : '';
+    }
+
+    async function submit(button, kind, target, title = '', body = '', errorTarget = find('#cq-message'), cancelId = 0) {
         button.disabled = true;
         try {
-            const result = await api('/requests', {kind, target: Number(target), title, body});
+            const result = await api('/requests', {kind, target: Number(target), title, body, cancelId: Number(cancelId)});
+            boardVersion++;
+            updateBoard(result, true);
             find('#cq-message').textContent = result.message;
-            await refresh();
             return true;
         } catch (error) {
             errorTarget.textContent = error.message;
             return false;
         } finally {
-            button.disabled = false;
+            if (button !== find('#cq-sync') || !reservation('sync', 0)?.claimed) button.disabled = false;
         }
     }
 
@@ -95,8 +109,12 @@ document.addEventListener('DOMContentLoaded', () => {
     function action(card, kind, id, label = labels[kind]) {
         const button = node('button', label);
         button.type = 'button';
+        const request = reservation(kind, id);
+        showReservation(button, request, label);
         button.addEventListener('click', () => {
-            if (kind !== 'remove' || window.confirm('この Idea を削除しますか？')) submit(button, kind, id);
+            if (request || kind !== 'remove' || window.confirm('この Idea を削除しますか？')) {
+                submit(button, kind, id, '', '', find('#cq-message'), request?.id);
+            }
         });
         card.append(button);
         return button;
@@ -142,6 +160,10 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function requestForm(card, kind, id) {
+        if (reservation(kind, id)) {
+            action(card, kind, id);
+            return;
+        }
         const details = node('details');
         details.className = 'cq-card-request';
         const form = node('form');
@@ -171,7 +193,8 @@ document.addEventListener('DOMContentLoaded', () => {
         const summary = node('summary');
         const heading = node('span', title);
         heading.className = 'cq-card-title';
-        const meta = node('span', '#' + row.id + ' · ' + snapshot.projects[row.project_id]);
+        const project = snapshot.projects[row.project_id];
+        const meta = node('span', row.provisional ? project : '#' + row.id + ' · ' + project);
         meta.className = 'cq-meta';
         const badge = node('span', status);
         badge.className = 'cq-card-status';
@@ -226,13 +249,29 @@ document.addEventListener('DOMContentLoaded', () => {
             completedIdeas.set(task.idea_id, completedIdeas.get(task.idea_id) !== false && task.status === 'DONE');
         }
         const implementedIdeas = [];
-        for (const idea of (snapshot.ideas || []).filter(visible)) {
+        const editedIdeas = new Map();
+        const addedIdeas = [];
+        for (const request of pending) {
+            const target = Number(request.target_id);
+            if (request.kind === 'edit') editedIdeas.set(target, request);
+            if (request.kind === 'add') addedIdeas.unshift({
+                id: 'pending-' + request.id, project_id: target, title: request.title, detail: request.body,
+                provisional: true,
+            });
+        }
+        const currentIdeas = (snapshot.ideas || []).map(idea => {
+            const edit = editedIdeas.get(idea.id);
+            return edit ? {...idea, title: edit.title, detail: edit.body, edited: true} : idea;
+        });
+        for (const idea of [...addedIdeas, ...currentIdeas].filter(visible)) {
             const implemented = Boolean(idea.planned_at && completedIdeas.get(idea.id));
-            const status = implemented ? '実装済み' : (idea.planned_at ? '計画済み' : '未計画');
+            const status = idea.provisional || idea.edited ? '未同期'
+                : implemented ? '実装済み' : (idea.planned_at ? '計画済み' : '未計画');
             const {item, content} = card(idea, idea.title, status, 'idea-');
             if (idea.detail) content.append(node('p', idea.detail));
             if (idea.planning_error) content.append(node('p', idea.planning_error));
-            if (implemented) implementedIdeas.push(item);
+            if (idea.provisional) ideas.append(item);
+            else if (implemented) implementedIdeas.push(item);
             else ideas.append(cardWithActions(item, ideaActions(idea)));
         }
         appendArchive(ideas, '実装済みのIdea', 'implemented-ideas', implementedIdeas);
@@ -253,7 +292,9 @@ document.addEventListener('DOMContentLoaded', () => {
             }
             const actions = node('div');
             actions.className = 'cq-card-actions cq-task-actions';
-            if (canRevise(task)) {
+            if (reservation('revise', task.id)) {
+                action(actions, 'revise', task.id);
+            } else if (canRevise(task)) {
                 const revise = node('button', labels.revise);
                 revise.type = 'button';
                 revise.addEventListener('click', () => {
@@ -293,28 +334,42 @@ document.addEventListener('DOMContentLoaded', () => {
         if ([...select.options].some(option => option.value === selected)) select.value = selected;
     }
 
+    function updateBoard(payload, force = false) {
+        const {synced_at: time, ...cards} = payload.snapshot || {};
+        find('#cq-synced').textContent = time
+            ? '最終同期 ' + new Date(time).toLocaleString()
+            : '実行 PC との同期を待っています';
+        const nextPending = payload.pending || [];
+        const next = JSON.stringify([cards, nextPending]);
+        const editing = addDialog.open || find('.cq-card-request[open], .cq-idea-menu[open]');
+        if (next !== fingerprint && (force || !editing)) {
+            const projects = cards.projects || {};
+            cards.projects = projects;
+            projectOptions(filter, projects, 'すべて');
+            projectOptions(add.elements.target, projects, '選択してください');
+            snapshot = cards;
+            pending = nextPending;
+            fingerprint = next;
+            render();
+            showReservation(find('#cq-sync'), reservation('sync', 0), '今すぐ同期');
+            if (!revisionPicker.hidden) renderRevisionOptions();
+        }
+        const history = [...nextPending.map(request => ({...request, outcome: request.claimed
+            ? '同期処理中' : ['add', 'edit'].includes(request.kind) ? '未同期' : scheduled})),
+        ...(payload.requests || [])];
+        history.sort((left, right) => Number(right.id) - Number(left.id));
+        find('#cq-history').replaceChildren(...history.map(request => node(
+            'li', (labels[request.kind] || request.kind) + ' — ' + request.outcome,
+        )));
+    }
+
     async function refresh() {
         if (loading) return;
         loading = true;
+        const version = boardVersion;
         try {
             const payload = await api('/board');
-            const {synced_at: time, ...cards} = payload.snapshot || {};
-            find('#cq-synced').textContent = time
-                ? '最終同期 ' + new Date(time).toLocaleString()
-                : '実行 PC との同期を待っています';
-            const next = JSON.stringify(cards);
-            if (next !== fingerprint && !addDialog.open && !find('.cq-card-request[open], .cq-idea-menu[open]')) {
-                const projects = cards.projects || {};
-                projectOptions(filter, projects, 'すべて');
-                projectOptions(add.elements.target, projects, '選択してください');
-                snapshot = cards;
-                fingerprint = next;
-                render();
-                if (!revisionPicker.hidden) renderRevisionOptions();
-            }
-            find('#cq-history').replaceChildren(...(payload.requests || []).map(request => node(
-                'li', (labels[request.kind] || request.kind) + ' — ' + (request.outcome || '実行 PC の応答待ち'),
-            )));
+            if (version === boardVersion) updateBoard(payload);
         } catch (error) {
             find('#cq-message').textContent = error.message;
         } finally {
@@ -343,7 +398,7 @@ document.addEventListener('DOMContentLoaded', () => {
     function renderRevisionOptions() {
         const options = find('#cq-revision-options');
         const projects = snapshot.projects || {};
-        const tasks = (snapshot.tasks || []).filter(canRevise);
+        const tasks = (snapshot.tasks || []).filter(task => canRevise(task) && !reservation('revise', task.id));
         const direction = revisionAscending ? 1 : -1;
         const order = revisionSort.value;
         tasks.sort((left, right) => {
@@ -460,7 +515,9 @@ document.addEventListener('DOMContentLoaded', () => {
             menu.querySelector('summary').focus();
         }
     });
-    find('#cq-sync').addEventListener('click', event => submit(event.currentTarget, 'sync', 0));
+    find('#cq-sync').addEventListener('click', event => {
+        submit(event.currentTarget, 'sync', 0, '', '', find('#cq-message'), reservation('sync', 0)?.id);
+    });
     function openIdeaDialog(idea = null) {
         editingIdea = idea;
         add.reset();
