@@ -597,6 +597,11 @@ document.addEventListener('DOMContentLoaded', () => {
             addCancel.disabled = false;
         }
     });
-    refresh();
-    window.setInterval(refresh, 5000);
+    const scheduleRefresh = async () => {
+        await refresh();
+        const grillingActive = grillingDialog.open || (snapshot.ideas || []).some(idea =>
+            idea.grilling && ['ACTIVE', 'GENERATING', 'CONFIRM', 'PLAN_GENERATING'].includes(idea.grilling.status));
+        window.setTimeout(scheduleRefresh, grillingActive ? 1000 : 5000);
+    };
+    scheduleRefresh();
 });

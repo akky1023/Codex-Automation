@@ -18,6 +18,8 @@ from .worker import latest_attempt
 _grilling_lock = Lock()
 _grilling_running = set()
 _ASYNC_PENDING = "__GRILLING_PENDING__"
+BOARD_POLL_SECONDS = 5
+GRILLING_POLL_SECONDS = 1
 
 
 class LocalBoardClient(Client):
@@ -251,7 +253,7 @@ def run_board(db, args):
             if not args.watch:
                 return
             try:
-                time.sleep(5)
+                time.sleep(GRILLING_POLL_SECONDS if grilling_active(db, project_ids) else BOARD_POLL_SECONDS)
             except KeyboardInterrupt:
                 return
 
@@ -263,3 +265,18 @@ def available_projects(db, project_ids=None):
         )
         if project_ids is None or row["id"] in project_ids
     }
+
+
+def grilling_active(db, project_ids=None):
+    """Return whether a watched project has a session that needs interaction."""
+    projects = available_projects(db, project_ids)
+    if not projects:
+        return False
+    marks = ", ".join("?" for _ in projects)
+    row = db.execute(
+        f"""SELECT 1 FROM grilling_sessions g JOIN ideas i ON i.id = g.idea_id
+            WHERE i.project_id IN ({marks}) AND g.status IN ('ACTIVE', 'GENERATING', 'CONFIRM', 'PLAN_GENERATING')
+            LIMIT 1""",
+        tuple(projects),
+    ).fetchone()
+    return row is not None

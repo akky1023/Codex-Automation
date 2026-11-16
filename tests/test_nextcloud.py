@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from codex_queue.nextcloud import Client, apply_snapshot, completed_body, todo_fields, writeback
-from codex_queue.nextcloud_board import available_projects, board_snapshot, request_action
+from codex_queue.nextcloud_board import available_projects, board_snapshot, grilling_active, request_action
 from codex_queue.store import SCHEMA
 
 
@@ -18,6 +18,22 @@ BODY = (
 
 
 class BoardProjectTest(unittest.TestCase):
+    def test_grilling_short_poll_is_limited_to_active_sessions(self):
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        db.row_factory = sqlite3.Row
+        db.executescript(SCHEMA)
+        db.execute("INSERT INTO projects(path,path_key,name) VALUES ('one','one','One')")
+        db.execute("INSERT INTO ideas(project_id,title,detail) VALUES (1,'Idea','')")
+        self.assertFalse(grilling_active(db))
+        db.execute("""INSERT INTO grilling_sessions(session_id,idea_id,board_key,status,idea_title,idea_detail,
+                   project_id,project_path,project_prompt,project_base,project_retired,nextcloud_sync,
+                   config_json,settings_json,branch_mode) VALUES
+                   ('session',1,'owner','ACTIVE','Idea','','1','one','','main',0,'on','{}','{}','per-task')""")
+        self.assertTrue(grilling_active(db))
+        db.execute("UPDATE grilling_sessions SET status='CANCELLED'")
+        self.assertFalse(grilling_active(db))
+
     def test_grilling_session_is_visible_only_to_its_board_owner(self):
         from codex_queue.grilling import start_grilling
 
