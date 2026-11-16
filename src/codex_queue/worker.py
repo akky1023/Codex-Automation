@@ -126,7 +126,7 @@ def claim(db, scheduled, attempted, authenticated, remote_ready):
         rows = db.execute(
             """SELECT t.*, p.path, p.prompt AS project_prompt, p.base, p.branch,
                       p.implementation_model AS project_model,
-                      i.title AS idea_title, i.detail AS idea_detail
+                      i.title AS idea_title, i.detail AS idea_detail, i.branch_mode AS idea_branch_mode
                FROM tasks t JOIN projects p ON p.id = t.project_id
                LEFT JOIN ideas i ON i.id = t.idea_id
                WHERE t.status NOT IN ('DONE', 'ABORTED', 'REMOVED', 'SUPERSEDED')
@@ -147,6 +147,15 @@ def claim(db, scheduled, attempted, authenticated, remote_ready):
             if held and status not in HOLD:
                 continue
             if status not in RETRY and status != "QUEUED":
+                continue
+            configured = row["branch"] or config["branch"]
+            mode = row["idea_branch_mode"] or ("current" if configured == "current" else "per-task")
+            if mode == "per-idea" and db.execute(
+                """SELECT 1 FROM tasks WHERE idea_id = ? AND id != ?
+                   AND (coalesce(idea_order, id), id) < (?, ?)
+                   AND status NOT IN ('DONE', 'REMOVED', 'SUPERSEDED') LIMIT 1""",
+                (row["idea_id"], row["id"], row["idea_order"] or row["id"], row["id"]),
+            ).fetchone():
                 continue
             remote = db.execute("SELECT * FROM remote_tasks WHERE task_id=?", (row["id"],)).fetchone()
             if remote and (not remote_ready or remote["blocked"] or not get_setting(db, "nextcloud_credential")
@@ -169,12 +178,61 @@ def claim(db, scheduled, attempted, authenticated, remote_ready):
                 cursor = db.execute(
                     """INSERT INTO attempts(task_id, number, path, mode, base, prompt, implementation_model)
                        VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    (row["id"], number, row["path"], row["branch"] or config["branch"], base, prompt_for(row), model),
+                    (row["id"], number, row["path"], mode, base, prompt_for(row), model),
                 )
                 attempt = row_attempt(db, cursor.lastrowid)
             update(db, "tasks", row["id"], {"status": "RUNNING"})
             return attempt
     return None
+
+
+def idea_checkout(db, attempt, idea_id, current):
+    path = attempt["path"]
+    target = f"codex/queue-idea-{idea_id}"
+    ref = f"refs/heads/{target}"
+    previous = db.execute(
+        """SELECT a.original_branch, a.start_commit, a.end_commit, t.status
+           FROM attempts a JOIN tasks t ON t.id = a.task_id
+           WHERE t.idea_id = ? AND a.path = ? AND a.branch = ? AND a.mode = 'per-idea'
+             AND a.id != ? ORDER BY a.id DESC LIMIT 1""",
+        (idea_id, path, target, attempt["id"]),
+    ).fetchone()
+    try:
+        tip = git(path, "rev-parse", "--verify", f"{ref}^{{commit}}")
+    except RuntimeError:
+        tip = None
+    if tip and previous is None:
+        raise RuntimeError(f"The Idea branch {target} already exists outside the queue.")
+    if previous and not tip:
+        raise RuntimeError(f"The recorded Idea branch {target} is missing.")
+    if current.startswith("codex/queue-") and current != target:
+        raise RuntimeError("Switch away from the previous queue branch first.")
+    original = previous["original_branch"] if current == target else current
+    if tip:
+        checkpoint = (previous["end_commit"] if previous["status"] == "DONE" else None) or previous["start_commit"]
+        git(path, "merge-base", "--is-ancestor", checkpoint, tip)
+        return original, target, target, tip
+    base = attempt["base"] or current
+    commit = git(path, "rev-parse", "--verify", f"refs/heads/{base}^{{commit}}")
+    return original, target, base, commit
+
+
+def switch_idea_branch(path, current, attempt):
+    target, start = attempt["branch"], attempt["start_commit"]
+    if not clean(path):
+        raise RuntimeError("The worktree has uncommitted or untracked changes.")
+    if current == target:
+        if git(path, "rev-parse", "HEAD") != start:
+            raise RuntimeError("The Idea branch changed before execution.")
+        return
+    if current != attempt["original_branch"]:
+        raise RuntimeError(f"Check out {attempt['original_branch']} to continue preparing the Idea branch.")
+    if attempt["base"] == target:
+        if git(path, "rev-parse", "--verify", f"refs/heads/{target}^{{commit}}") != start:
+            raise RuntimeError("The Idea branch changed before execution.")
+        git(path, "switch", target)
+    else:
+        git(path, "switch", "-c", target, start)
 
 
 def prepare(db, attempt):
@@ -185,26 +243,38 @@ def prepare(db, attempt):
     if attempt["phase"] == "PREPARING":
         if not clean(path):
             raise RuntimeError("The worktree has uncommitted or untracked changes.")
-        task = db.execute("SELECT revision_of FROM tasks WHERE id = ?", (attempt["task_id"],)).fetchone()
-        prior = latest_attempt(db, task["revision_of"]) if task["revision_of"] is not None else None
-        continuing = prior and current == prior["branch"] and attempt["mode"] == "per-task"
-        if current.startswith("codex/queue-") and not continuing:
-            raise RuntimeError("Switch away from the previous queue branch first.")
-        original = prior["original_branch"] if continuing else current
-        base = current if continuing or attempt["mode"] == "current" else attempt["base"] or current
-        if prior and prior["end_commit"] and attempt["mode"] == "per-task":
-            base = prior["branch"]
-        commit = git(path, "rev-parse", "--verify", f"refs/heads/{base}^{{commit}}")
-        target = current
-        if attempt["mode"] == "per-task":
-            target = f"codex/queue-{attempt['task_id']}-{attempt['number']}"
+        task = db.execute("SELECT idea_id, revision_of FROM tasks WHERE id = ?", (attempt["task_id"],)).fetchone()
+        if attempt["mode"] == "per-idea":
+            original, target, base, commit = idea_checkout(db, attempt, task["idea_id"], current)
+            create = False
+        else:
+            prior = latest_attempt(db, task["revision_of"]) if task["revision_of"] is not None else None
+            continuing = prior and current == prior["branch"] and attempt["mode"] == "per-task"
+            if current.startswith("codex/queue-") and not continuing:
+                raise RuntimeError("Switch away from the previous queue branch first.")
+            original = prior["original_branch"] if continuing else current
+            base = current if continuing or attempt["mode"] == "current" else attempt["base"] or current
+            if prior and prior["end_commit"] and attempt["mode"] == "per-task":
+                base = prior["branch"]
+            commit = git(path, "rev-parse", "--verify", f"refs/heads/{base}^{{commit}}")
+            create = attempt["mode"] == "per-task"
+            target = f"codex/queue-{attempt['task_id']}-{attempt['number']}" if create else current
         with write(db):
             update(db, "attempts", attempt["id"], {
                 "original_branch": original, "branch": target, "start_commit": commit,
                 "base": base, "phase": "CHECKOUT",
             })
-        if target != current:
-            git(path, "switch", "-c", target, commit)
+        if attempt["mode"] == "per-idea":
+            switch_idea_branch(path, current, row_attempt(db, attempt["id"]))
+        elif target != current:
+            if create:
+                git(path, "switch", "-c", target, commit)
+            else:
+                git(path, "switch", target)
+        with write(db):
+            update(db, "attempts", attempt["id"], {"phase": "READY"})
+    elif attempt["mode"] == "per-idea" and attempt["phase"] == "CHECKOUT":
+        switch_idea_branch(path, current, attempt)
         with write(db):
             update(db, "attempts", attempt["id"], {"phase": "READY"})
     elif current != attempt["branch"]:
@@ -239,7 +309,7 @@ def finalize(db, attempt):
         git(path, "merge-base", "--is-ancestor", attempt["start_commit"], end)
         with write(db):
             update(db, "attempts", attempt["id"], {"end_commit": end, "phase": "RESTORE"})
-    if attempt["mode"] == "per-task" and current != attempt["original_branch"]:
+    if attempt["mode"] in ("per-task", "per-idea") and current != attempt["original_branch"]:
         git(path, "switch", attempt["original_branch"])
     record(db, attempt, "ABORTED" if aborted else "DONE",
            report["reason"] if aborted else None, phase="FINISHED")

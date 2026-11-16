@@ -315,7 +315,9 @@ INHERIT_MODELS = object()
 
 def branch_label(value):
     return {
+        "per-idea": tr("One branch per Idea", "Idea ごとにまとめる"),
         "per-task": tr("Separate branches per task", "タスクごとに分割"),
+        "auto": tr("Review Codex recommendation", "Codex の提案を確認する"),
         "current": tr("Use current branch", "そのまま使う"),
     }[value]
 
@@ -342,7 +344,7 @@ def branch_mode(label, value, project):
 def branch_names(repository):
     try:
         result = subprocess.run(
-            ["git", "for-each-ref", "--format=%(refname:short)%09%(symref)", "refs/heads", "refs/remotes"],
+            ["git", "for-each-ref", "--format=%(refname:lstrip=2)%09%(symref)", "refs/heads"],
             cwd=repository, capture_output=True, encoding="utf-8", timeout=3,
         )
     except (OSError, ValueError, subprocess.TimeoutExpired):
@@ -778,6 +780,11 @@ def prompt_argument(db, command, argument, supplied, current=None, heading=None)
         return None if value is None else tokens(value)
     if isinstance(argument, argparse._StoreTrueAction):
         return choose_yes_no(label, bool(initial))
+    if command == ["idea", "plan"] and argument.dest == "approve":
+        return choose_value(label, [
+            (tr("Use the recommendation", "提案どおりに進める"), "recommended"),
+            *((branch_label(mode), mode) for mode in ("per-idea", "per-task")),
+        ], initial)
     if argument.choices is not None:
         return choose_value(label, [(str(choice), str(choice)) for choice in argument.choices], initial)
     if argument.dest in MULTILINE_FIELDS or argument.dest == "context_file" or initial is not None:

@@ -9,8 +9,10 @@ import sys
 from tempfile import TemporaryDirectory
 import time
 import unittest
+from unittest.mock import patch
 
 from codex_queue.nextcloud import apply_snapshot
+from codex_queue.store import SCHEMA, open_queue
 from codex_queue.worker import classify
 
 
@@ -43,10 +45,13 @@ if "read-only" in args:
     elif "clarify first" in prompt:
         output.write_text(json.dumps(dict(question="Which screen?", todos=[])))
     else:
-        output.write_text(json.dumps(dict(question="", todos=[
+        proposal = dict(question="", todos=[
             dict(title="Add access controls", abstract="Restrict access", plan="Implement and test access", model="small"),
             dict(title="Decline unsafe change", abstract="Assess request", plan="Check policy", model="large"),
-        ])))
+        ])
+        if "Recommend per-idea" in prompt:
+            proposal.update(branch_mode="per-idea", branch_reason="Review the changes together.")
+        output.write_text(json.dumps(proposal))
     sys.exit(0)
 def event(kind, **data):
     print(json.dumps(dict(type=kind, **data)), flush=True)
@@ -119,14 +124,53 @@ class QueueTest(unittest.TestCase):
         ))
         self.assertIn("Improve access", self.cq("todo", "show", "1"))
         self.assertIn("Implement and test access", self.cq("todo", "show", "1"))
+        self.sql("UPDATE tasks SET priority=1 WHERE id=2")
         self.cq("start")
         self.wait(["DONE", "ABORTED"])
+        attempts = self.sql("SELECT task_id, branch, start_commit, end_commit FROM attempts ORDER BY id")
+        self.assertEqual([(1, "codex/queue-idea-1"), (2, "codex/queue-idea-1")],
+                         [attempt[:2] for attempt in attempts])
+        self.assertEqual(attempts[0][3], attempts[1][2])
+        self.assertNotEqual(attempts[0][2], attempts[0][3])
         self.assertEqual("main", self.git("branch", "--show-current"))
         view = self.cq("status")
         self.assertLess(view.index("\nIdea\n"), view.index("\nToDo\n"))
         self.assertLess(view.index("\nAbort (1)\n"), view.index("\nIdea\n"))
         self.assertLess(view.index("\nToDo\n"), view.index("\nDone\n"))
         self.assertIn("Refused by policy", view)
+
+    def test_auto_branch_plan_waits_for_approval_and_supports_override(self):
+        self.cq("project", "add", "--branch", "auto", "--planner-model", "project-planner",
+                "--allowed-models", "small,large")
+        self.cq("idea", "add", "Improve access")
+        proposal = self.cq("idea", "plan", "1")
+        self.assertIn("Suggested branch mode: per-idea", proposal)
+        self.assertIn("Review the changes together.", proposal)
+        self.assertIn("Add access controls", self.cq("idea", "show", "1"))
+        self.assertEqual([], self.sql("SELECT id FROM tasks"))
+        (self.root / "fake.py").write_text("raise RuntimeError('Approval must reuse the saved plan')")
+        self.cq("idea", "plan", "1", "--approve", "per-task")
+        self.assertEqual([("per-task", None)], self.sql("SELECT branch_mode, draft_plan FROM ideas"))
+        self.assertEqual([(1,), (2,)], self.sql("SELECT idea_order FROM tasks ORDER BY id"))
+
+    def test_legacy_project_branch_constraint_migrates_with_existing_tasks(self):
+        directory = self.root / "legacy"
+        directory.mkdir()
+        with sqlite3.connect(directory / "queue.sqlite3") as db:
+            db.executescript(SCHEMA.replace("'per-task', 'per-idea', 'auto', 'current'", "'per-task', 'current'"))
+            db.execute("INSERT INTO projects(id, path, path_key, name, branch) VALUES (7, 'repo', 'repo', 'Repo', 'per-task')")
+            db.execute("INSERT INTO tasks(project_id, name, priority) VALUES (7, 'Existing', 5)")
+            db.execute("UPDATE sqlite_sequence SET seq = 15 WHERE name = 'projects'")
+        db.close()
+        with patch("codex_queue.store.queue_folder", return_value=directory), open_queue() as db:
+            self.assertEqual(("per-task", 7), tuple(db.execute(
+                "SELECT p.branch, t.project_id FROM tasks t JOIN projects p ON p.id=t.project_id",
+            ).fetchone()))
+            self.assertEqual([], db.execute("PRAGMA foreign_key_check").fetchall())
+            with db:
+                db.execute("UPDATE projects SET branch='auto' WHERE id=7")
+                db.execute("INSERT INTO projects(path, path_key, name, branch) VALUES ('next', 'next', 'Next', 'per-idea')")
+            self.assertEqual(16, db.execute("SELECT max(id) FROM projects").fetchone()[0])
 
     def test_automatic_planning_updates_idea_state(self):
         self.cq("project", "add", "--planner-model", "project-planner", "--allowed-models", "small,large")

@@ -94,7 +94,7 @@ def request_action(db, request, projects, key):
             if idea is None or idea["project_id"] not in projects or idea["planned_at"]:
                 raise RuntimeError("未計画の Idea が見つかりません。")
             if kind == "edit":
-                db.execute("UPDATE ideas SET title = ?, detail = ?, planning_error = NULL WHERE id = ?",
+                db.execute("UPDATE ideas SET title = ?, detail = ?, planning_error = NULL, draft_plan = NULL WHERE id = ?",
                            (title, body, target))
                 save_outcome(db, key, "Idea を更新しました。")
                 return "Idea を更新しました。"
@@ -103,6 +103,8 @@ def request_action(db, request, projects, key):
                 save_outcome(db, key, "Idea を削除しました。")
                 return "Idea を削除しました。"
         ids = plan_idea(db, target)
+        if not ids:
+            return f"ブランチ運用の承認待ちです。cq idea show {target} で提案を確認できます。"
         return "To Do " + ", ".join(map(str, ids)) + " を作成しました。"
     task = db.execute("SELECT project_id FROM tasks WHERE id = ?", (target,)).fetchone()
     if task is None or task["project_id"] not in projects:

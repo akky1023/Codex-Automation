@@ -1,4 +1,5 @@
 import argparse
+import json
 from datetime import datetime
 import os
 from pathlib import Path
@@ -16,7 +17,7 @@ from .text_layout import print_wrapped, text_width
 from .worker import latest_attempt, run_worker
 
 
-BRANCH_MODES = ("per-task", "current")
+BRANCH_MODES = ("per-idea", "per-task", "auto", "current")
 MODEL_SETTINGS = ("planner_model", "implementation_model", "allowed_models")
 
 
@@ -257,10 +258,25 @@ def manage_task(db, args):
                 print("  " + tr("Waiting for Nextcloud to confirm the task location.", "Nextcloud でタスクの所在を確認中です。"))
         return
 
+def show_branch_proposal(row):
+    draft = json.loads(row["draft_plan"])
+    print(tr("Suggested branch mode: {mode}", "ブランチ運用の提案：{mode}", mode=draft["branch_mode"]))
+    print(draft["reason"])
+    for todo in draft["todos"]:
+        print(f"  {todo['title']}")
+        print(f"    {todo['abstract']}")
+    command = f"cq idea plan {row['id']} --approve recommended"
+    print(tr("Approve with {command}, or specify per-idea or per-task.",
+             "{command} で承認できます。per-idea または per-task を指定して変更することもできます。", command=command))
+
+
 def manage_idea(db, args):
     action = args.idea_action
     if action == "plan":
-        ids = plan_idea(db, args.id)
+        ids = plan_idea(db, args.id, args.approve)
+        if not ids:
+            show_branch_proposal(by_id(db, "ideas", args.id))
+            return
         print(tr("Added ToDo {ids}.", "ToDo {ids} を追加しました。", ids=", ".join(map(str, ids))))
         wake(db)
         return
@@ -275,6 +291,8 @@ def manage_idea(db, args):
             (getattr(args, "id", None), planned, getattr(args, "id", None)),
         ):
             state = tr("Planned", "計画済み") if row["planned_at"] else tr("Unplanned", "未計画")
+            if row["draft_plan"]:
+                state = tr("Awaiting plan approval", "計画の承認待ち")
             print(f"{row['id']}\t{row['project']}\t{state}\t{row['title']}")
             if action == "show":
                 print(f"Planned  {'yes' if row['planned_at'] else 'no'}")
@@ -284,6 +302,8 @@ def manage_idea(db, args):
                     print(row["detail"])
                 if row["planning_error"]:
                     print(row["planning_error"])
+                if row["draft_plan"]:
+                    show_branch_proposal(row)
                 for task in db.execute("SELECT id, name FROM tasks WHERE idea_id = ? AND status NOT IN ('REMOVED', 'SUPERSEDED') ORDER BY id", (row["id"],)):
                     print(f"ToDo {task['id']}  {task['name']}")
         return
@@ -303,7 +323,7 @@ def manage_idea(db, args):
             if by_id(db, "ideas", idea_id)["planned_at"]:
                 raise QueueError(tr("This idea already has ToDos.", "この Idea にはすでに ToDo があります。"))
             if action == "edit":
-                update(db, "ideas", idea_id, {**values, "planning_error": None})
+                update(db, "ideas", idea_id, {**values, "planning_error": None, "draft_plan": None})
             else:
                 db.execute("DELETE FROM ideas WHERE id = ?", (idea_id,))
     print(f"Idea {idea_id}")
@@ -417,6 +437,9 @@ def make_parser():
     ):
         item = idea_actions.add_parser(action, help=description)
         item.add_argument("id", type=positive)
+        if action == "plan":
+            item.add_argument("--approve", choices=("recommended", "per-idea", "per-task"),
+                              help=tr("Approve a branch proposal before queuing ToDos", "ブランチ運用を承認して ToDo をキューに登録"))
     project = commands.add_parser("project", help=tr("Manage projects", "プロジェクトを管理"))
     project_arguments(project)
     actions = project.add_subparsers(dest="project_action")

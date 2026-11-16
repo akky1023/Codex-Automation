@@ -116,7 +116,7 @@ class SuggestionTest(unittest.TestCase):
     def test_completes_option_choices_after_a_space_or_equals(self):
         for line, expected in (
             ("config --language j", "ja"),
-            ("project edit 3 --branch=per", "per-task"),
+            ("project edit 3 --branch=per-t", "per-task"),
             ("config --priority 3", "3"),
             ("project --base in", "inherit"),
         ):
@@ -125,6 +125,8 @@ class SuggestionTest(unittest.TestCase):
                 self.assertEqual([Suggestion(expected)], choices)
                 self.assertTrue((line[:start] + choices[0].name).endswith(expected))
         self.assertEqual([Suggestion("auto"), Suggestion("manual")], completion(self.parser, "config --sync ")[1])
+        self.assertEqual([Suggestion("per-idea"), Suggestion("per-task")],
+                         completion(self.parser, "project edit 3 --branch=per")[1])
 
     def test_completes_quoted_paths_and_continues_into_subfolders(self):
         with TemporaryDirectory(dir=Path.cwd()) as folder:

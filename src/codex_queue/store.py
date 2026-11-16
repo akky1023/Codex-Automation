@@ -7,7 +7,7 @@ import sqlite3
 DEFAULTS = {
     "parallel": "1",
     "priority": "5",
-    "branch": "per-task",
+    "branch": "per-idea",
     "base": "",
     "on_abort": "pause",
     "sync": "auto",
@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS projects (
     path_key TEXT NOT NULL UNIQUE,
     name TEXT NOT NULL,
     prompt TEXT NOT NULL DEFAULT '',
-    branch TEXT CHECK (branch IN ('per-task', 'current')),
+    branch TEXT CHECK (branch IN ('per-task', 'per-idea', 'auto', 'current')),
     base TEXT,
     retired INTEGER NOT NULL DEFAULT 0,
     planner_model TEXT,
@@ -48,7 +48,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     idea_id INTEGER REFERENCES ideas(id),
     abstract TEXT NOT NULL DEFAULT '',
     implementation_model TEXT,
-    revision_of INTEGER REFERENCES tasks(id)
+    revision_of INTEGER REFERENCES tasks(id),
+    idea_order INTEGER
 );
 CREATE TABLE IF NOT EXISTS ideas (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -56,7 +57,9 @@ CREATE TABLE IF NOT EXISTS ideas (
     title TEXT NOT NULL,
     detail TEXT NOT NULL DEFAULT '',
     planned_at TEXT,
-    planning_error TEXT
+    planning_error TEXT,
+    branch_mode TEXT,
+    draft_plan TEXT
 );
 CREATE INDEX IF NOT EXISTS tasks_queue ON tasks(status, priority, id);
 CREATE TABLE IF NOT EXISTS attempts (
@@ -114,14 +117,14 @@ CREATE TABLE IF NOT EXISTS remote_tasks (
 """
 
 WORKFLOW_COLUMNS = {
-    "ideas": ("planning_error TEXT",),
+    "ideas": ("planning_error TEXT", "branch_mode TEXT", "draft_plan TEXT"),
     "projects": (
         "planner_model TEXT", "implementation_model TEXT", "allowed_models TEXT",
         "nextcloud_sync TEXT NOT NULL DEFAULT 'on' CHECK (nextcloud_sync IN ('on', 'off'))",
     ),
     "tasks": (
         "idea_id INTEGER REFERENCES ideas(id)", "abstract TEXT NOT NULL DEFAULT ''",
-        "implementation_model TEXT", "revision_of INTEGER REFERENCES tasks(id)",
+        "implementation_model TEXT", "revision_of INTEGER REFERENCES tasks(id)", "idea_order INTEGER",
     ),
     "attempts": ("implementation_model TEXT",),
 }
@@ -151,7 +154,7 @@ def open_queue():
     db = sqlite3.connect(queue_folder() / "queue.sqlite3", timeout=15)
     db.row_factory = sqlite3.Row
     try:
-        db.execute("PRAGMA foreign_keys = ON")
+        db.execute("PRAGMA foreign_keys = OFF")
         db.executescript(SCHEMA)
         with write(db):
             for table, definitions in WORKFLOW_COLUMNS.items():
@@ -159,9 +162,27 @@ def open_queue():
                 for definition in definitions:
                     if definition.split()[0] not in existing:
                         db.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
+            migrate_project_branch_modes(db)
+        db.execute("PRAGMA foreign_keys = ON")
         yield db
     finally:
         db.close()
+
+
+def migrate_project_branch_modes(db):
+    sql = db.execute("SELECT sql FROM sqlite_master WHERE name = 'projects'").fetchone()[0]
+    if "'per-idea'" in sql:
+        return
+    definition = SCHEMA.split("CREATE TABLE IF NOT EXISTS projects ", 1)[1].split(";", 1)[0]
+    db.execute("CREATE TABLE projects_new " + definition)
+    columns = ", ".join(row["name"] for row in db.execute("PRAGMA table_info(projects_new)"))
+    db.execute(f"INSERT INTO projects_new ({columns}) SELECT {columns} FROM projects")
+    # Preserve the sequence even if higher project IDs were deleted.
+    db.execute("""UPDATE sqlite_sequence SET seq = max(seq, coalesce(
+                  (SELECT seq FROM sqlite_sequence WHERE name = 'projects'), 0))
+                  WHERE name = 'projects_new'""")
+    db.execute("DROP TABLE projects")
+    db.execute("ALTER TABLE projects_new RENAME TO projects")
 
 
 @contextmanager

@@ -101,6 +101,8 @@ def queue_status(db):
             ideas.append(label)
             if row["planning_error"]:
                 ideas.append(f"  {row['planning_error']}")
+            elif row["draft_plan"]:
+                ideas.append("  " + tr("Awaiting plan approval", "計画の承認待ち") + f"  cq idea show {row['id']}")
     for status, heading in (("WAITING_FOR_INPUT", "Waiting response"), ("ABORTED", "Abort")):
         if counts[status]:
             lines.extend(["", f"{heading} ({counts[status]})", *results[status]])

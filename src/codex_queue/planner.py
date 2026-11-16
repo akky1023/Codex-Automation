@@ -18,7 +18,7 @@ def planning_config(db, project):
 
 def idea_record(db, idea_id):
     row = db.execute(
-        """SELECT i.*, p.path, p.name AS project, p.prompt AS project_prompt,
+        """SELECT i.*, p.path, p.name AS project, p.prompt AS project_prompt, p.branch AS project_branch,
                   p.planner_model, p.implementation_model, p.allowed_models
            FROM ideas i JOIN projects p ON p.id = i.project_id
            WHERE i.id = ? AND p.retired = 0""",
@@ -51,7 +51,7 @@ def planning_prompt(idea, models, default_model):
     )
 
 
-def generate_plan(db, path, prompt, config, models):
+def generate_plan(db, path, prompt, config, models, *, review_branch=False):
     options = models or [config["implementation_model"]]
     fields = {key: {"type": "string"} for key in ("title", "abstract", "plan")}
     fields["model"] = {"type": "string", "enum": options}
@@ -70,6 +70,17 @@ def generate_plan(db, path, prompt, config, models):
         "required": ["question", "todos"],
         "additionalProperties": False,
     }
+    if review_branch:
+        prompt += (
+            "\n\nRecommend per-idea when the ToDos belong in one review or need each other's changes. "
+            "Recommend per-task when the ToDos can be reviewed and integrated separately. "
+            "Explain the recommendation briefly in the language of the Idea."
+        )
+        schema["properties"].update({
+            "branch_mode": {"type": "string", "enum": ["per-idea", "per-task"]},
+            "branch_reason": {"type": "string"},
+        })
+        schema["required"].extend(("branch_mode", "branch_reason"))
     command = [*codex_command(db), "-a", "never", "exec", "-s", "read-only"]
     if config["planner_model"]:
         command += ["-m", config["planner_model"]]
@@ -94,45 +105,80 @@ def generate_plan(db, path, prompt, config, models):
                     not task[key].strip() for key in ("title", "abstract", "plan")
                 ) or len(task["title"].strip().splitlines()) != 1:
                     raise ValueError
+            if review_branch:
+                mode, reason = report["branch_mode"], report["branch_reason"].strip()
+                if mode not in ("per-idea", "per-task") or (todos and not reason):
+                    raise ValueError
+                return question, todos, mode, reason
         except (AttributeError, KeyError, TypeError, ValueError) as error:
             raise RuntimeError("Invalid planner response.") from error
     return question, todos
 
 
-def plan_idea(db, idea_id):
+def plan_idea(db, idea_id, branch_choice=None):
     with process_lock(f"idea-{idea_id}.lock") as acquired:
         if not acquired:
             raise RuntimeError(f"Idea {idea_id} is already being planned.")
-        return save_plan(db, idea_id)
+        return save_plan(db, idea_id, branch_choice)
 
 
-def save_plan(db, idea_id):
+def plan_context(db, idea):
+    return {
+        "idea": {key: idea[key] for key in idea.keys() if key not in ("draft_plan", "planning_error")},
+        "config": planning_config(db, idea),
+        "mode": idea["project_branch"] or settings(db)["branch"],
+    }
+
+
+def save_plan(db, idea_id, branch_choice=None):
     idea = idea_record(db, idea_id)
     if idea["planned_at"]:
         raise RuntimeError(f"Idea {idea_id} already has a plan.")
-    config = planning_config(db, idea)
+    context = plan_context(db, idea)
+    config, mode = context["config"], context["mode"]
     models = config["allowed_models"].split(",") if config["allowed_models"] else []
-    prompt = planning_prompt(idea, models, config["implementation_model"])
-    question, todos = generate_plan(db, idea["path"], prompt, config, models)
-    if question:
-        raise RuntimeError(f"{question}\nUse cq idea edit {idea_id} to clarify the idea, then plan again.")
+    draft = json.loads(idea["draft_plan"]) if idea["draft_plan"] else None
+    waiting_for_review = mode == "auto" and draft and draft["context"] == context
+    if branch_choice and not waiting_for_review:
+        raise RuntimeError(f"No current proposal to approve. Run cq idea plan {idea_id} first.")
+    if waiting_for_review:
+        if not branch_choice:
+            return []
+        mode = draft["branch_mode"] if branch_choice == "recommended" else branch_choice
+        todos = draft["todos"]
+    else:
+        prompt = planning_prompt(idea, models, config["implementation_model"])
+        if mode == "auto":
+            question, todos, recommendation, reason = generate_plan(
+                db, idea["path"], prompt, config, models, review_branch=True,
+            )
+        else:
+            question, todos = generate_plan(db, idea["path"], prompt, config, models)
+        if question:
+            raise RuntimeError(f"{question}\nUse cq idea edit {idea_id} to clarify the idea, then plan again.")
     with write(db):
         current = idea_record(db, idea_id)
-        if current != idea or planning_config(db, current) != config:
+        if current != idea or plan_context(db, current) != context:
             raise RuntimeError(f"Idea {idea_id} or its project settings changed during planning.")
+        if mode == "auto":
+            draft = {"context": context, "todos": todos, "branch_mode": recommendation, "reason": reason}
+            db.execute("UPDATE ideas SET draft_plan = ?, planning_error = NULL WHERE id = ?",
+                       (json.dumps(draft, ensure_ascii=False), idea_id))
+            return []
         priority = int(settings(db)["priority"])
         task_ids = []
-        for task in todos:
+        for position, task in enumerate(todos, 1):
             cursor = db.execute(
-                """INSERT INTO tasks(project_id, idea_id, name, abstract, prompt, priority, implementation_model)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                """INSERT INTO tasks(project_id, idea_id, name, abstract, prompt, priority, implementation_model, idea_order)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (idea["project_id"], idea_id, task["title"].strip(), task["abstract"].strip(),
-                 task["plan"].strip(), priority, task["model"] if models else None),
+                 task["plan"].strip(), priority, task["model"] if models else None, position),
             )
             task_ids.append(cursor.lastrowid)
         db.execute(
-            "UPDATE ideas SET planned_at = CURRENT_TIMESTAMP, planning_error = NULL WHERE id = ?",
-            (idea_id,),
+            """UPDATE ideas SET planned_at = CURRENT_TIMESTAMP, planning_error = NULL,
+               branch_mode = ?, draft_plan = NULL WHERE id = ?""",
+            (mode, idea_id),
         )
     return task_ids
 
@@ -141,7 +187,7 @@ def revise_task(db, task_id, instruction):
     task = db.execute(
         """SELECT t.*, p.path, p.prompt AS project_prompt, p.planner_model,
                   p.implementation_model AS project_model, p.allowed_models,
-                  i.title AS idea_title, i.detail AS idea_detail
+                  i.title AS idea_title, i.detail AS idea_detail, i.branch_mode AS idea_branch_mode
            FROM tasks t JOIN projects p ON p.id = t.project_id
            LEFT JOIN ideas i ON i.id = t.idea_id
            WHERE t.id = ? AND t.status NOT IN ('REMOVED', 'SUPERSEDED') AND p.retired = 0""",
@@ -195,13 +241,17 @@ def revise_task(db, task_id, instruction):
                  revision["model"] if models else None, task_id),
             )
             return task_id, ""
-        cursor = db.execute(
-            """INSERT INTO tasks(project_id, idea_id, name, abstract, prompt, priority, implementation_model, revision_of)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (task["project_id"], task["idea_id"], revision["title"].strip(), revision["abstract"].strip(),
-             revision["plan"].strip(), task["priority"], revision["model"] if models else None, task_id),
+        replaces_position = task["status"] != "DONE" and (
+            task["status"] != "ABORTED" or task["idea_branch_mode"] == "per-idea"
         )
-        if task["status"] not in ("DONE", "ABORTED"):
+        cursor = db.execute(
+            """INSERT INTO tasks(project_id, idea_id, name, abstract, prompt, priority, implementation_model, revision_of, idea_order)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (task["project_id"], task["idea_id"], revision["title"].strip(), revision["abstract"].strip(),
+             revision["plan"].strip(), task["priority"], revision["model"] if models else None, task_id,
+             (task["idea_order"] or task_id) if replaces_position else None),
+        )
+        if replaces_position:
             db.execute("UPDATE tasks SET status = 'SUPERSEDED' WHERE id = ?", (task_id,))
             db.execute("INSERT INTO task_actions(task_id, action, note) VALUES (?, 'revise', ?)",
                        (task_id, f"Superseded by ToDo {cursor.lastrowid}"))
@@ -213,7 +263,7 @@ def plan_next_idea(db):
         return False
     idea = db.execute(
         """SELECT i.id, i.title, i.detail FROM ideas i JOIN projects p ON p.id = i.project_id
-           WHERE i.planned_at IS NULL AND i.planning_error IS NULL AND p.retired = 0
+           WHERE i.planned_at IS NULL AND i.planning_error IS NULL AND i.draft_plan IS NULL AND p.retired = 0
            ORDER BY i.id LIMIT 1"""
     ).fetchone()
     if idea is None:

@@ -12,7 +12,7 @@ def wake(db):
     if get_setting(db, "enabled") != "1":
         return
     automatic_planning = get_setting(db, "idea_planning") == "auto" and db.execute(
-        "SELECT 1 FROM ideas WHERE planned_at IS NULL AND planning_error IS NULL"
+        "SELECT 1 FROM ideas WHERE planned_at IS NULL AND planning_error IS NULL AND draft_plan IS NULL"
     ).fetchone()
     if not automatic_planning and db.execute("SELECT 1 FROM tasks WHERE status IN (?,?,?,?,?)", HOLD).fetchone():
         print(tr("Queue is waiting. Run cq task ls for details.", "キューは待機中です。詳細は cq task ls で確認できます。"))
