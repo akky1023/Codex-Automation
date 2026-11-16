@@ -144,6 +144,25 @@ class QueueTest(unittest.TestCase):
         self.assertLess(view.index("\nToDo\n"), view.index("\nDone\n"))
         self.assertIn("Refused by policy", view)
 
+    def test_next_idea_leaves_previous_queue_branch_for_configured_base(self):
+        self.cq("project", "add", "--base", "main", "--planner-model", "project-planner",
+                "--allowed-models", "small,large")
+        self.cq("idea", "add", "Improve access")
+        self.cq("idea", "plan", "1")
+        base = self.git("rev-parse", "main")
+        self.git("switch", "-qc", "codex/queue-idea-99")
+        self.git("commit", "--allow-empty", "-qm", "Previous idea")
+        previous = self.git("rev-parse", "HEAD")
+
+        self.cq("start")
+        self.wait(["DONE", "ABORTED"])
+
+        self.assertEqual([(base, "main")], self.sql(
+            "SELECT start_commit, original_branch FROM attempts WHERE task_id = 1",
+        ))
+        self.assertEqual(previous, self.git("rev-parse", "codex/queue-idea-99"))
+        self.assertEqual("main", self.git("branch", "--show-current"))
+
     def test_auto_branch_plan_waits_for_approval_and_supports_override(self):
         self.cq("project", "add", "--branch", "auto", "--planner-model", "project-planner",
                 "--allowed-models", "small,large")

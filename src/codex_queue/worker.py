@@ -246,12 +246,20 @@ def prepare(db, attempt):
         if not clean(path):
             raise RuntimeError("The worktree has uncommitted or untracked changes.")
         task = db.execute("SELECT idea_id, revision_of FROM tasks WHERE id = ?", (attempt["task_id"],)).fetchone()
+        prior = latest_attempt(db, task["revision_of"]) if task["revision_of"] is not None else None
+        continuing = (
+            attempt["mode"] == "per-idea" and current == f"codex/queue-idea-{task['idea_id']}"
+            or attempt["mode"] == "per-task" and prior and current == prior["branch"]
+        )
+        configured_base = attempt["base"]
+        if (attempt["mode"] in ("per-idea", "per-task") and not continuing
+                and configured_base and configured_base != current and not configured_base.startswith("codex/queue-")):
+            git(path, "switch", "--no-guess", "--", configured_base)
+            current = configured_base
         if attempt["mode"] == "per-idea":
             original, target, base, commit = idea_checkout(db, attempt, task["idea_id"], current)
             create = False
         else:
-            prior = latest_attempt(db, task["revision_of"]) if task["revision_of"] is not None else None
-            continuing = prior and current == prior["branch"] and attempt["mode"] == "per-task"
             if current.startswith("codex/queue-") and not continuing:
                 raise RuntimeError("Switch away from the previous queue branch first.")
             original = prior["original_branch"] if continuing else current
