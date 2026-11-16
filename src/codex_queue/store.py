@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS projects (
     retired INTEGER NOT NULL DEFAULT 0,
     planner_model TEXT,
     implementation_model TEXT,
-    allowed_models TEXT
+    allowed_models TEXT,
+    nextcloud_sync TEXT NOT NULL DEFAULT 'on' CHECK (nextcloud_sync IN ('on', 'off'))
 );
 CREATE TABLE IF NOT EXISTS tasks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -91,6 +92,12 @@ CREATE TABLE IF NOT EXISTS remote_links (
     list TEXT PRIMARY KEY,
     project_id INTEGER NOT NULL REFERENCES projects(id)
 );
+CREATE TABLE IF NOT EXISTS board_receipts (
+    board TEXT NOT NULL,
+    request_id INTEGER NOT NULL,
+    outcome TEXT NOT NULL,
+    PRIMARY KEY (board, request_id)
+);
 CREATE TABLE IF NOT EXISTS remote_tasks (
     connection TEXT NOT NULL,
     uid TEXT NOT NULL,
@@ -108,7 +115,10 @@ CREATE TABLE IF NOT EXISTS remote_tasks (
 
 WORKFLOW_COLUMNS = {
     "ideas": ("planning_error TEXT",),
-    "projects": ("planner_model TEXT", "implementation_model TEXT", "allowed_models TEXT"),
+    "projects": (
+        "planner_model TEXT", "implementation_model TEXT", "allowed_models TEXT",
+        "nextcloud_sync TEXT NOT NULL DEFAULT 'on' CHECK (nextcloud_sync IN ('on', 'off'))",
+    ),
     "tasks": (
         "idea_id INTEGER REFERENCES ideas(id)", "abstract TEXT NOT NULL DEFAULT ''",
         "implementation_model TEXT", "revision_of INTEGER REFERENCES tasks(id)",

@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<info>
+    <id>codex_queue</id>
+    <name>Codex Queue</name>
+    <summary>Codex Queue workspace</summary>
+    <description>Workspace for managing ideas and viewing Codex tasks.</description>
+    <version>0.2.30</version>
+    <licence>agpl</licence>
+    <author>Codex Queue contributors</author>
+    <namespace>CodexQueue</namespace>
+    <category>organization</category>
+    <dependencies>
+        <nextcloud min-version="33" max-version="33"/>
+    </dependencies>
+    <navigations>
+        <navigation>
+            <name>Codex Queue</name>
+            <route>codex_queue.page.index</route>
+            <icon>app.svg</icon>
+        </navigation>
+    </navigations>
+</info>

@@ -23,6 +23,31 @@ class SuggestionTest(unittest.TestCase):
     def setUp(self):
         self.parser = make_parser()
 
+    def test_project_list_aligns_paths_and_shows_sync_columns_when_connected(self):
+        output = io.StringIO()
+        args = self.parser.parse_args(["project", "ls"])
+        locale = language.set("en")
+        self.addCleanup(language.reset, locale)
+        with contextlib.closing(sqlite3.connect(":memory:")) as db, contextlib.redirect_stdout(output):
+            db.row_factory = sqlite3.Row
+            db.executescript(SCHEMA)
+            db.execute("INSERT INTO projects(path,path_key,name) VALUES ('/first','first','A')")
+            db.execute("INSERT INTO projects(path,path_key,name,nextcloud_sync) VALUES ('/second','second','日本語','off')")
+            db.execute("INSERT INTO remote_links VALUES ('inbox',1)")
+            manage_project(db, args)
+            self.assertNotIn("Deck", output.getvalue())
+            output.seek(0)
+            output.truncate()
+            db.execute("INSERT INTO settings VALUES ('nextcloud_credential','test')")
+            manage_project(db, args)
+        header, first, second = output.getvalue().splitlines()
+        self.assertIn("Nextcloud App", header)
+        self.assertIn("Deck", header)
+        self.assertRegex(first, r"On\s+Linked")
+        self.assertRegex(second, r"Off\s+Unlinked")
+        self.assertEqual(text_width(header.split("Path")[0]), text_width(first.split("/first")[0]))
+        self.assertEqual(text_width(first.split("/first")[0]), text_width(second.split("/second")[0]))
+
     def test_help_respects_terminal_columns_in_both_languages(self):
         for locale in ("ja", "en"):
             token = language.set(locale)
@@ -85,7 +110,7 @@ class SuggestionTest(unittest.TestCase):
     def test_subcommands_and_options_follow_parser(self):
         self.assertEqual([], completion(self.parser, "task e")[1])
         self.assertEqual([Suggestion("--detail")], completion(self.parser, "idea edit 42 --de")[1])
-        self.assertEqual([Suggestion("resolve", "Resolve a completion conflict")], completion(self.parser, "/nextcloud re")[1])
+        self.assertEqual([Suggestion("resolve", "Resolve a completion conflict")], completion(self.parser, "/deck re")[1])
         self.assertNotIn("_worker", [candidate.name for candidate in completion(self.parser, "/")[1]])
 
     def test_completes_option_choices_after_a_space_or_equals(self):
@@ -235,6 +260,8 @@ class SuggestionTest(unittest.TestCase):
                 command = fill_project(db, ["project", "edit", "1", "--planner-model=custom"])
                 self.assertEqual("custom", self.parser.parse_args(command).planner_model)
                 self.assertIn("custom", [call.args[2] for call in prompt.call_args_list])
+                command = fill_project(db, ["project", "edit", "1", "--nextcloud-sync=off"])
+                self.assertEqual("off", self.parser.parse_args(command).nextcloud_sync)
 
             def clear_field(parser, message, *, show_queue, complete, initial, editor=None):
                 return initial if message.startswith(("Repository path", "Idea title")) else ""
@@ -291,10 +318,10 @@ class SuggestionTest(unittest.TestCase):
                 self.assertEqual("https://cloud.example", parsed(
                     "nextcloud", "connect", "--server=https://cloud.example",
                 ).server)
-                linked = parsed("nextcloud", "link")
+                linked = parsed("deck", "link")
                 self.assertEqual(("15", 1), (linked.list, linked.project_id))
-                self.assertTrue(parsed("nextcloud", "resolve").complete)
-                resolved = parsed("nextcloud", "resolve", "--keep-remote")
+                self.assertTrue(parsed("deck", "resolve").complete)
+                resolved = parsed("deck", "resolve", "--keep-remote")
                 self.assertTrue(resolved.keep_remote)
                 self.assertFalse(resolved.complete)
 
@@ -476,10 +503,11 @@ class QueueViewTest(unittest.TestCase):
             self.assertIn("コマンド一覧", all_commands)
             self.assertIn("add: Idea を登録", all_commands)
             self.assertIn("task list: タスクを一覧表示", all_commands)
-            self.assertIn("nextcloud resolve:", all_commands)
+            self.assertIn("nextcloud sync:", all_commands)
+            self.assertIn("deck resolve:", all_commands)
             self.assertNotIn("_worker", all_commands)
             self.assertIn("--language", cq("help", "settings"))
-            self.assertIn("--keep-remote", cq("help", "nextcloud", "resolve"))
+            self.assertIn("--keep-remote", cq("help", "deck", "resolve"))
             cq("help", "_worker", code=2)
             cq("config", "--language", "de", code=2)
             self.assertIn("language: ja", cq("config"))

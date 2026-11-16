@@ -1,4 +1,7 @@
 /docs/
+/nextcloud/.env
+/nextcloud/.env.*
+/nextcloud/compose.override.yaml
 __pycache__/
 *.egg-info/
 build/

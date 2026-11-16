@@ -12,7 +12,7 @@ from .planner import plan_idea, revise_task
 from .runtime import register_schedule, setup
 from .status import OUTCOMES, queue_status
 from .store import DEFAULTS, get_setting, open_queue, saved_language, settings, update, write
-from .text_layout import print_wrapped
+from .text_layout import print_wrapped, text_width
 from .worker import latest_attempt, run_worker
 
 
@@ -52,6 +52,28 @@ def by_id(db, table, row_id):
 def show_projects(rows):
     for row in rows:
         print(f"{row['id']}\t{row['name']}\t{row['path']}")
+
+
+def show_project_table(db):
+    connected = bool(get_setting(db, "nextcloud_credential"))
+    linked_projects = set()
+    headings = ["ID", tr("Project", "プロジェクト")]
+    if connected:
+        headings.extend([tr("Nextcloud App", "Nextcloud アプリ"), "Deck"])
+        linked_projects = {row[0] for row in db.execute("SELECT DISTINCT project_id FROM remote_links")}
+    headings.append(tr("Path", "パス"))
+    table = [headings]
+    for row in active_projects(db):
+        cells = [str(row["id"]), row["name"]]
+        if connected:
+            cells.append(tr("On", "有効") if row["nextcloud_sync"] == "on" else tr("Off", "無効"))
+            cells.append(tr("Linked", "連携あり") if row["id"] in linked_projects else tr("Unlinked", "未連携"))
+        cells.append(row["path"])
+        table.append([cell.replace("\t", " ").replace("\r", " ").replace("\n", " ") for cell in cells])
+    widths = [max(map(text_width, column)) for column in zip(*table)]
+    for cells in table:
+        padded = [cell + " " * (width - text_width(cell)) for cell, width in zip(cells[:-1], widths)]
+        print("  ".join([*padded, cells[-1]]))
 
 
 def active_projects(db):
@@ -98,7 +120,7 @@ def project_for_idea(db, args):
 
 
 def project_options(args):
-    values = changes(args, "name", "prompt", "branch", "base", *MODEL_SETTINGS)
+    values = changes(args, "name", "prompt", "branch", "base", "nextcloud_sync", *MODEL_SETTINGS)
     for key in MODEL_SETTINGS:
         if values.get(key) == "inherit":
             values[key] = None
@@ -124,12 +146,13 @@ def show_project(db, row):
     for key in MODEL_SETTINGS:
         value = (row[key] or unset) if row[key] is not None else f"{defaults[key] or unset} {inherited}"
         print(f"{key.replace('_', '-')}  {value}")
+    print(tr("Nextcloud board sync: {value}", "Nextcloud ボード同期：{value}", value=row["nextcloud_sync"]))
 
 
 def manage_project(db, args):
     action = args.project_action
     if action in ("ls", "list"):
-        show_projects(active_projects(db))
+        show_project_table(db)
         return
     with write(db):
         if action in ("rm", "remove"):
@@ -227,8 +250,8 @@ def manage_task(db, args):
                 if row["status"] == "AUTH_REQUIRED":
                     print("  " + tr("Run codex login.", "codex login を実行してください。"))
             if row["writeback"] == "conflict":
-                print("  " + tr("Nextcloud completion conflict. Run cq nextcloud resolve {id}.",
-                                "Nextcloud で完了状態が競合しています。cq nextcloud resolve {id} を実行してください。",
+                print("  " + tr("Nextcloud completion conflict. Run cq deck resolve {id}.",
+                                "Nextcloud で完了状態が競合しています。cq deck resolve {id} を実行してください。",
                                 id=row["id"]))
             if row["blocked"] and row["status"] in ("QUEUED", "RESUME_QUEUED"):
                 print("  " + tr("Waiting for Nextcloud to confirm the task location.", "Nextcloud でタスクの所在を確認中です。"))
@@ -373,6 +396,9 @@ def project_arguments(parser, editing=False):
     parser.add_argument("--branch", choices=(*BRANCH_MODES, "") if editing else BRANCH_MODES,
                         help=tr("Branch mode", "ブランチ運用"))
     parser.add_argument("--base", help=tr("Base branch", "開始元ブランチ"))
+    parser.add_argument("--nextcloud-sync", choices=("on", "off"),
+                        help=tr("Sync this project with the Nextcloud board (default: on)",
+                                "このプロジェクトを Nextcloud ボードと同期（既定：on）"))
 
 
 def make_parser():
@@ -448,6 +474,8 @@ def make_parser():
     worker.add_argument("--data-dir", help=argparse.SUPPRESS)
     from .nextcloud import add_commands
     add_commands(commands)
+    from .nextcloud_board import add_board_command
+    add_board_command(commands)
     return parser
 
 
@@ -520,9 +548,12 @@ def run_cli(argv, interactive):
                 register_schedule(db, args.every_minutes)
             elif args.command in ("retry", "reply", "abort", "logs", "done"):
                 task_action(db, args)
-            elif args.command in ("nextcloud", "sync"):
+            elif args.command in ("nextcloud", "deck", "sync"):
                 from .nextcloud import dispatch
                 dispatch(db, args)
+            elif args.command == "nextcloud-board":
+                from .nextcloud_board import run_board
+                run_board(db, args)
             else:
                 manage_task(db, args)
     except sqlite3.IntegrityError as error:

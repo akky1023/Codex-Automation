@@ -2,6 +2,7 @@ import sqlite3
 import unittest
 
 from codex_queue.nextcloud import Client, apply_snapshot, completed_body, todo_fields, writeback
+from codex_queue.nextcloud_board import available_projects, board_snapshot
 from codex_queue.store import SCHEMA
 
 
@@ -11,6 +12,25 @@ BODY = (
     'STATUS:NEEDS-ACTION\r\nBEGIN:VALARM\r\nDESCRIPTION:alarm\r\nEND:VALARM\r\n'
     'END:VTODO\r\nEND:VCALENDAR\r\n'
 )
+
+
+class BoardProjectTest(unittest.TestCase):
+    def test_project_sync_defaults_on_and_updates_the_published_snapshot(self):
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        db.row_factory = sqlite3.Row
+        db.executescript(SCHEMA)
+        db.execute("INSERT INTO projects(path,path_key,name) VALUES ('one','one','One')")
+        db.execute("INSERT INTO ideas(project_id,title,detail) VALUES (1,'Idea','')")
+        self.assertEqual({1: "One"}, available_projects(db))
+        self.assertEqual(1, len(board_snapshot(db, available_projects(db))["ideas"]))
+
+        db.execute("UPDATE projects SET nextcloud_sync = 'off' WHERE id = 1")
+        self.assertEqual({}, available_projects(db, {1}))
+        self.assertEqual({"projects": {}, "ideas": [], "tasks": []}, board_snapshot(db, available_projects(db)))
+
+        db.execute("UPDATE projects SET nextcloud_sync = 'on' WHERE id = 1")
+        self.assertEqual({1: "One"}, available_projects(db))
 
 
 class CalDAVTest(unittest.TestCase):

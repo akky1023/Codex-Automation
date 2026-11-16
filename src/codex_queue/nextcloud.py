@@ -394,16 +394,18 @@ def sync(db):
 
 def add_commands(commands):
     commands.add_parser("sync", help=tr("Synchronize linked Nextcloud Tasks lists", "連携した Nextcloud Tasks のリストを同期"))
-    parser = commands.add_parser("nextcloud", help=tr("Manage Nextcloud Tasks integration", "Nextcloud Tasks 連携を管理"))
+    parser = commands.add_parser("nextcloud", help=tr("Manage the Codex Queue app in Nextcloud", "Nextcloud の Codex Queue アプリを管理"))
     actions = parser.add_subparsers(dest="nc_action", required=True)
-    for name, help_text in (
-        ("connect", tr("Connect to Nextcloud", "Nextcloud に接続")),
-        ("disconnect", tr("Disconnect from Nextcloud", "Nextcloud との接続を解除")),
-        ("lists", tr("Show Nextcloud task lists", "Nextcloud のタスクリストを表示")),
-    ):
-        action = actions.add_parser(name, help=help_text)
-        if name == "connect":
-            action.add_argument("--server", help=tr("Nextcloud HTTPS URL", "Nextcloud の HTTPS URL"))
+    connect_parser = actions.add_parser("connect", help=tr("Connect to Nextcloud", "Nextcloud に接続"))
+    connect_parser.add_argument("--server", help=tr("Nextcloud HTTPS URL", "Nextcloud の HTTPS URL"))
+    actions.add_parser("disconnect", help=tr("Disconnect from Nextcloud", "Nextcloud との接続を解除"))
+    from .nextcloud_board import add_board_options
+    add_board_options(actions.add_parser("sync", help=tr("Synchronize the Codex Queue board", "Codex Queue ボードを同期")))
+
+    deck = commands.add_parser("deck", help=tr("Manage linked Nextcloud Tasks lists (CalDAV)", "連携した Nextcloud Tasks リスト（CalDAV）を管理"))
+    actions = deck.add_subparsers(dest="nc_action", required=True)
+    actions.add_parser("sync", help=tr("Synchronize linked task lists", "連携したタスクリストを同期"))
+    actions.add_parser("lists", help=tr("Show Nextcloud task lists", "Nextcloud のタスクリストを表示"))
     link = actions.add_parser("link", help=tr("Link a task list to a project", "タスクリストをプロジェクトに連携"))
     link.add_argument("--list", required=True, help=tr("Nextcloud list ID", "Nextcloud のリスト ID"))
     link.add_argument("--project-id", type=int, required=True, help=tr("Project ID", "プロジェクト ID"))
@@ -415,7 +417,12 @@ def add_commands(commands):
 
 
 def dispatch(db, args):
-    if args.command == "sync":
+    action = getattr(args, "nc_action", None)
+    if args.command == "nextcloud" and action == "sync":
+        from .nextcloud_board import run_board
+        run_board(db, args)
+        return
+    if args.command == "sync" or action == "sync":
         synced = sync(db)
         if error := get_setting(db, "nextcloud_error"):
             raise RuntimeError(error)
@@ -424,7 +431,6 @@ def dispatch(db, args):
         from .actions import wake
         wake(db)
         return
-    action = args.nc_action
     if action in ("connect", "disconnect", "link", "resolve"):
         with process_lock("sync.lock") as acquired:
             if not acquired:
@@ -453,7 +459,7 @@ def manage_connection(db, args):
     client, identity = connection(db)
     if action == "link":
         if args.list not in dict(client.calendars()):
-            raise RuntimeError(tr("Unknown Nextcloud list. Use cq nextcloud lists.", "Nextcloud のリストが見つかりません。cq nextcloud lists で確認してください。"))
+            raise RuntimeError(tr("Unknown Nextcloud list. Use cq deck lists.", "Nextcloud のリストが見つかりません。cq deck lists で確認してください。"))
         with write(db):
             if not db.execute("SELECT 1 FROM projects WHERE id=? AND retired=0", (args.project_id,)).fetchone():
                 raise RuntimeError(f"Unknown project ID {args.project_id}")

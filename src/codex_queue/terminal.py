@@ -456,6 +456,8 @@ def fill_project(db, argv):
         field_keys = {key for key, _ in fields}
         fields += tuple((argument.dest, argument.help) for argument in options.values()
                         if argument.dest not in field_keys)
+        parser.add_argument("--nextcloud-sync", choices=("on", "off"))
+        fields += (("nextcloud_sync", tr("Nextcloud board sync (on/off)", "Nextcloud ボード同期（on/off）")),)
     args = parser.parse_args(argv[len(command):])
     row = None
     if action in ("edit", "rm", "remove"):
@@ -470,6 +472,7 @@ def fill_project(db, argv):
             return command
     default_path = str(repo_here() or ".") if action == "add" else "."
     defaults = dict(row) if row else {"path": default_path, "name": "", "prompt": "", "branch": ""}
+    defaults.setdefault("nextcloud_sync", "on")
     for key in ("base", "planner_model", "implementation_model", "allowed_models"):
         if defaults.get(key) is None:
             defaults[key] = "inherit"
@@ -478,6 +481,12 @@ def fill_project(db, argv):
         supplied = getattr(args, key)
         initial = current if supplied is None else supplied
         value = edit_field(key, label, initial)
+        if key == "nextcloud_sync":
+            if not value.strip():
+                continue
+            if value not in ("on", "off"):
+                raise ValueError(tr("Enter on or off for Nextcloud board sync.",
+                                    "Nextcloud ボード同期には on または off を入力してください。"))
         if value != current or (action == "add" and (key == "path" or supplied is not None)):
             command = option(command, f"--{key.replace('_', '-')}", value)
     if action == "edit" and len(command) == 3:
@@ -559,7 +568,11 @@ def fill_arguments(db, parser, command, argv):
         if argument in group_members:
             continue
         original = current.get(argument.dest)
-        value = prompt_argument(db, command, argument, getattr(supplied, argument.dest), original)
+        provided = getattr(supplied, argument.dest)
+        if isinstance(argument, argparse._AppendAction) and provided:
+            options.extend(f"{argument.option_strings[0]}={value}" for value in provided)
+            continue
+        value = prompt_argument(db, command, argument, provided, original)
         if value is None:
             return None
         needs_value = argument in required or (command == ["nextcloud", "connect"] and argument.dest == "server")
@@ -675,7 +688,12 @@ def run_screen():
                 if not argv:
                     message = ""
                     continue
-                live = argv[:2] == ["nextcloud", "connect"] or argv[0] in ("setup", "pause", "stop")
+                board = argv[:2] == ["nextcloud", "sync"] or argv[0] == "nextcloud-board"
+                live = (
+                    argv[:2] == ["nextcloud", "connect"]
+                    or argv[0] in ("setup", "pause", "stop")
+                    or (board and ("--watch" in argv or any(arg.startswith("--dev-port=") for arg in argv)))
+                )
                 if live:
                     try:
                         main(argv, interactive=False)

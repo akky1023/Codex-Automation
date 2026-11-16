@@ -1,0 +1,24 @@
+name: codex-queue-nextcloud-dev
+
+services:
+  nextcloud:
+    image: nextcloud:33-apache
+    ports:
+      - "127.0.0.1:${CQ_NEXTCLOUD_PORT:-8087}:80"
+    environment:
+      SQLITE_DATABASE: nextcloud
+      NEXTCLOUD_ADMIN_USER: cqadmin
+      NEXTCLOUD_ADMIN_PASSWORD: ${CQ_NEXTCLOUD_ADMIN_PASSWORD:-codex-queue-local-dev}
+      NEXTCLOUD_TRUSTED_DOMAINS: "127.0.0.1 localhost"
+    volumes:
+      - nextcloud:/var/www/html
+      - ./codex_queue:/var/www/html/custom_apps/codex_queue:ro
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost/status.php"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 60s
+
+volumes:
+  nextcloud:
