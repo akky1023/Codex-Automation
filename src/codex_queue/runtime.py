@@ -4,6 +4,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+from tempfile import TemporaryDirectory
 import time
 from datetime import datetime
 from xml.etree import ElementTree as ET
@@ -35,6 +36,72 @@ def codex_env(db):
     if home:
         env["CODEX_HOME"] = home
     return env
+
+
+def list_app_server_models(process, output):
+    deadline = time.monotonic() + 5
+    pending = b""
+
+    def send(message):
+        process.stdin.write((json.dumps(message) + "\n").encode("utf-8"))
+        process.stdin.flush()
+
+    def request(identifier, method, params):
+        nonlocal pending
+        send({"id": identifier, "method": method, "params": params})
+        while time.monotonic() < deadline:
+            pending += output.read()
+            while b"\n" in pending:
+                line, pending = pending.split(b"\n", 1)
+                message = json.loads(line)
+                if message.get("id") == identifier:
+                    return message.get("result") or {}
+            if process.poll() is not None:
+                return {}
+            time.sleep(0.03)
+        return {}
+
+    initialized = request(0, "initialize", {"clientInfo": {"name": "cq", "version": "0.1.0"}})
+    if not initialized:
+        return []
+    send({"method": "initialized"})
+    models = {}
+    params = {"limit": 100}
+    identifier = 1
+    while True:
+        page = request(identifier, "model/list", params)
+        for item in page.get("data", []):
+            if model := item.get("model"):
+                models[model] = item.get("displayName") or model
+        cursor = page.get("nextCursor")
+        if not cursor:
+            return list(models.items())
+        params["cursor"] = cursor
+        identifier += 1
+
+
+def codex_models(db):
+    try:
+        command = [*codex_command(db), "app-server", "--listen", "stdio://"]
+        # A file lets us enforce the timeout even if a CLI launcher leaves stdout open.
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "stdout"
+            with path.open("wb") as stdout, path.open("rb") as output, subprocess.Popen(
+                command, env=codex_env(db), stdin=subprocess.PIPE, stdout=stdout, stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            ) as process:
+                try:
+                    return list_app_server_models(process, output)
+                finally:
+                    try:
+                        process.stdin.close()
+                    finally:
+                        try:
+                            process.wait(timeout=0.5)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+    except (OSError, RuntimeError, ValueError):
+        return []
 
 
 def queue_command():

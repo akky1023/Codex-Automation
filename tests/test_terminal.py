@@ -11,10 +11,10 @@ import unittest
 from unittest.mock import Mock, patch
 
 from codex_queue.editor import edit_text
-from codex_queue.cli import make_parser, manage_project, manage_idea
+from codex_queue.cli import QueueError, make_parser, manage_project, manage_idea
 from codex_queue.language import language
 from codex_queue.store import SCHEMA
-from codex_queue.terminal import Suggestion, choose_options, command_text, completion, draw_prompt, edit_field, fill_project, fill_idea, prepare, prompt_frame, queue_view, screen, tokens, windows_input
+from codex_queue.terminal import APPLY_SELECTION, Suggestion, choose_options, command_text, completion, draw_prompt, edit_field, fill_project, fill_idea, prepare, prompt_frame, queue_view, screen, tokens, windows_input
 from codex_queue.text_layout import text_width, wrap_rows
 from codex_queue.windows_console import ConsoleInput, InputRecord, KeyEvent
 
@@ -144,31 +144,106 @@ class SuggestionTest(unittest.TestCase):
             self.assertTrue(files[0].insertion.endswith(" "))
 
     @unittest.skipUnless(os.name == "nt", "Windows console input")
-    def test_project_add_form_completes_path_and_branch_fields(self):
+    def test_project_add_form_completes_path_and_selects_branches(self):
         with TemporaryDirectory(dir=Path.cwd()) as folder:
             directory = Path(folder) / "Project folder"
             directory.mkdir()
-            replies = iter([(str(Path(folder) / "Project "), str(directory) + os.sep),
-                            ("per", "per-task"), ("un", "unset")])
-
             def complete_field(parser, message, *, show_queue, complete, initial, editor=None):
                 self.assertEqual((0, []), complete(""))
-                if not message.startswith(("Repository path", "Branch mode", "Base branch")):
+                if not message.startswith("Repository path"):
                     return initial
-                prefix, expected = next(replies)
-                start, choices = complete(prefix)
+                start, choices = complete(str(Path(folder) / "Project "))
                 self.assertEqual(0, start)
-                self.assertEqual([expected], [choice.insertion for choice in choices])
+                self.assertEqual([str(directory) + os.sep], [choice.insertion for choice in choices])
                 self.assertFalse(show_queue)
                 return choices[0].insertion
 
             with patch("codex_queue.terminal.windows_input", side_effect=complete_field), patch(
                 "codex_queue.terminal.repo_here", return_value=None,
+            ), patch("codex_queue.terminal.git_root", return_value=directory), patch(
+                "codex_queue.terminal.branch_names", return_value=["main"],
+            ), patch(
+                "codex_queue.terminal.choose", side_effect=["branch", "per-task", "base", "unset", ""],
             ), patch("codex_queue.terminal.confirmed", side_effect=lambda command, prompted: command):
                 command = fill_project(None, ["project", "add"])
-            self.assertIn(f"--path={directory}{os.sep}", command)
+            self.assertIn(f"--path={directory}", command)
+            self.assertIn("--name=Project folder", command)
             self.assertIn("--branch=per-task", command)
             self.assertIn("--base=unset", command)
+
+    def test_project_add_retries_invalid_required_values_before_showing_options(self):
+        with TemporaryDirectory(dir=Path.cwd()) as folder:
+            plain = Path(folder) / "plain"
+            plain.mkdir()
+            repo = Path(folder) / "repo"
+            repo.mkdir()
+            missing = str(Path(folder) / "missing")
+            calls = []
+
+            def edit(key, heading, initial):
+                calls.append((key, heading, initial))
+                return next(replies)
+
+            def git_root(value):
+                if value == str(plain):
+                    raise QueueError("No Git repository")
+                self.assertEqual(str(repo), value)
+                return repo
+
+            def choose(label, options, default=0):
+                self.assertEqual(["path", "path", "path", "name", "name"], [key for key, _, _ in calls])
+                return options[default][1]
+
+            replies = iter([missing, str(plain), str(repo), "", "New project"])
+            with patch("codex_queue.terminal.git_root", side_effect=git_root), patch(
+                "codex_queue.terminal.edit_field", side_effect=edit,
+            ), patch("codex_queue.terminal.choose", side_effect=choose), patch(
+                "codex_queue.terminal.confirmed", side_effect=lambda command, prompted: command,
+            ):
+                command = fill_project(None, ["project", "add", "--path=."])
+            self.assertEqual(["project", "add", f"--path={repo}", "--name=New project"], command)
+            self.assertEqual([".", missing, str(plain), "repo", ""], [initial for _, _, initial in calls])
+            self.assertIn("does not exist", calls[1][1])
+            self.assertIn("No Git repository", calls[2][1])
+
+    def test_idea_add_retries_title_and_keeps_supplied_detail_without_opening_editor(self):
+        with contextlib.closing(sqlite3.connect(":memory:")) as db:
+            db.row_factory = sqlite3.Row
+            db.executescript(SCHEMA)
+            db.execute("INSERT INTO projects(path, path_key, name) VALUES ('repo', 'repo', 'Notes')")
+            bad_title = "Two\nlines"
+            with patch("codex_queue.terminal.open_queue", return_value=contextlib.nullcontext(db)), patch(
+                "codex_queue.terminal.repo_here", return_value=None,
+            ), patch("codex_queue.terminal.field", side_effect=[bad_title, "Title"]) as field, patch(
+                "codex_queue.terminal.choose", side_effect=lambda label, options, default=0: options[default][1],
+            ), patch("codex_queue.terminal.edit_field") as editor, patch(
+                "codex_queue.terminal.confirmed", side_effect=lambda command, prompted: command,
+            ):
+                command = prepare(["idea", "add", "--detail=Already supplied"])
+            self.assertEqual(["add", "--project-id=1", "--detail=Already supplied", "--", "Title"], command)
+            self.assertIn("single-line", field.call_args.args[0])
+            self.assertEqual(bad_title, field.call_args.args[1])
+            editor.assert_not_called()
+
+    def test_project_edit_validates_path_only_when_selected(self):
+        with contextlib.closing(sqlite3.connect(":memory:")) as db:
+            db.row_factory = sqlite3.Row
+            db.executescript(SCHEMA)
+            db.execute("INSERT INTO projects(path, path_key, name) VALUES ('old', 'old', 'Project')")
+            with TemporaryDirectory(dir=Path.cwd()) as folder:
+                missing = str(Path(folder) / "missing")
+                with patch("codex_queue.terminal.choose", side_effect=[1, "path", ""]), patch(
+                    "codex_queue.terminal.git_root", return_value=Path(folder),
+                ) as git_root, patch(
+                    "codex_queue.terminal.edit_field", side_effect=[missing, folder],
+                ) as editor, patch(
+                    "codex_queue.terminal.confirmed", side_effect=lambda command, prompted: command,
+                ):
+                    command = fill_project(db, ["project", "edit", "1"])
+                self.assertEqual(["project", "edit", "1", f"--path={folder}"], command)
+                self.assertEqual("old", editor.call_args_list[0].args[2])
+                self.assertEqual(missing, editor.call_args.args[2])
+                git_root.assert_called_once_with(folder)
 
     @unittest.skipUnless(os.name == "nt", "Windows console input")
     def test_edit_starts_with_current_value_and_can_clear_it(self):
@@ -214,6 +289,22 @@ class SuggestionTest(unittest.TestCase):
         self.assertIn("\x1b[97;44mcq> First", output.getvalue())
         self.assertIn("\x1b[97;44mcq> Second", output.getvalue())
 
+    def test_ordered_choices_toggle_and_confirm_in_selection_order(self):
+        options = [("First", "first"), ("Second", "second"), ("Confirm", APPLY_SELECTION)]
+        toggle = ["down", "\r", "up", "\r", "down", "\r", "\r"]
+        for finish in (["ctrl+enter"], ["down", "\r"]):
+            with self.subTest(finish=finish), patch(
+                "codex_queue.terminal.ConsoleInput.read", side_effect=toggle + finish,
+            ), patch("codex_queue.terminal.PosixInput.read", side_effect=toggle + finish), patch(
+                "codex_queue.terminal.draw_prompt",
+            ) as render:
+                self.assertEqual(
+                    ["first", "second"], choose_options("Models", options, 0, True, ordered=[]),
+                )
+            final_frame = render.call_args.args[1]
+            self.assertIn("1 First", final_frame)
+            self.assertIn("2 Second", final_frame)
+
     @unittest.skipUnless(os.name == "nt", "Windows console input")
     def test_backspace_removes_japanese_characters_in_edit_field(self):
         for backspace in ("\b", "\x7f"):
@@ -242,34 +333,32 @@ class SuggestionTest(unittest.TestCase):
                     return ""
                 return initial
 
-            with patch("codex_queue.terminal.choose", side_effect=lambda label, options, default: options[default][1]), patch(
+            with patch("codex_queue.terminal.choose", side_effect=[1, "name", "prompt", "", 1, "detail", ""]), patch(
                 "codex_queue.terminal.windows_input", side_effect=complete_field,
             ), patch(
                 "codex_queue.terminal.confirmed", side_effect=lambda command, prompted: command,
             ):
                 self.assertEqual(["project", "edit", "1", "--name=New project name", "--prompt="], fill_project(db, ["project", "edit", "1"]))
                 self.assertEqual(["edit", "1", "--detail="], fill_idea(db, ["edit", "1"]))
-            with patch("codex_queue.terminal.choose", return_value=1), patch(
+            with patch("codex_queue.terminal.choose", side_effect=[1, "", 1, ""]), patch(
                 "codex_queue.terminal.windows_input", side_effect=lambda *args, initial, **kwargs: initial,
             ):
                 self.assertIsNone(fill_project(db, ["project", "edit", "1"]))
                 self.assertIsNone(fill_idea(db, ["edit", "1"]))
-            with patch("codex_queue.terminal.choose", return_value=1), patch(
-                "codex_queue.terminal.edit_field", side_effect=lambda key, label, initial: initial,
-            ) as prompt, patch("codex_queue.terminal.field", return_value="y"):
+            with patch("codex_queue.terminal.choose", side_effect=[1, "planner_model", "custom", "", True, 1, "", True]) as menu, patch(
+                "codex_queue.terminal.codex_models", return_value=[("known", "Known")],
+            ):
                 command = fill_project(db, ["project", "edit", "1", "--planner-model=custom"])
                 self.assertEqual("custom", self.parser.parse_args(command).planner_model)
-                self.assertIn("custom", [call.args[2] for call in prompt.call_args_list])
+                self.assertIn(("custom", "custom"), menu.call_args_list[2].args[1])
                 command = fill_project(db, ["project", "edit", "1", "--nextcloud-sync=off"])
                 self.assertEqual("off", self.parser.parse_args(command).nextcloud_sync)
 
             def clear_field(parser, message, *, show_queue, complete, initial, editor=None):
                 return initial if message.startswith(("Repository path", "Idea title")) else ""
 
-            with patch("codex_queue.terminal.choose", return_value=1), patch(
+            with patch("codex_queue.terminal.choose", side_effect=[1, "name", "prompt", "branch", "", "base", "unset", "", True, 1, "detail", "", True]), patch(
                 "codex_queue.terminal.windows_input", side_effect=clear_field,
-            ), patch(
-                "codex_queue.terminal.field", return_value="y",
             ), patch("codex_queue.cli.wake"), contextlib.redirect_stdout(io.StringIO()):
                 project = fill_project(db, ["project", "edit", "1"])
                 idea = fill_idea(db, ["edit", "1"])
@@ -291,9 +380,11 @@ class SuggestionTest(unittest.TestCase):
                 "VALUES ('server', 'item', 1, 'list', 'url', 'conflict')"
             )
             with patch("codex_queue.terminal.open_queue", side_effect=lambda: contextlib.nullcontext(db)), patch(
-                "codex_queue.terminal.choose", side_effect=lambda label, options, default: options[default][1],
+                "codex_queue.terminal.choose", side_effect=lambda label, options, default=0: (
+                    True if label == "Save changes?" else options[default][1]
+                ),
             ), patch("codex_queue.terminal.field", side_effect=lambda label, default="": (
-                "y" if label.startswith("Save changes") else default or "15"
+                default or "15"
             )), patch("codex_queue.terminal.edit_field", side_effect=lambda key, label, initial: (
                 initial or {"instruction": "revise it", "note": "15"}.get(key, "")
             )):
@@ -309,7 +400,7 @@ class SuggestionTest(unittest.TestCase):
                 self.assertEqual("history.txt", str(parsed(
                     "task", "revise", "1", "adjust plan", "--context-file=history.txt",
                 ).context_file))
-                self.assertEqual("15", parsed("done", "1").note)
+                self.assertIsNone(parsed("done", "1").note)
                 self.assertFalse(parsed("retry").fresh)
                 self.assertTrue(parsed("retry", "--fresh").fresh)
                 self.assertTrue(parsed("idea", "list", "--planned").planned)

@@ -2,20 +2,23 @@ import argparse
 import codecs
 from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from collections import deque
-from functools import partial
+from functools import cache, partial
 from io import StringIO
 import os
+from pathlib import Path
 import re
 import shlex
 import shutil
+import subprocess
 import time
 from typing import NamedTuple
 import unicodedata
 
 from .arguments import ArgumentParser, parser_candidates
-from .cli import BRANCH_MODES, QueueError, git_root, main, make_parser, model_arguments
+from .cli import BRANCH_MODES, MODEL_SETTINGS, QueueError, allowed_models, git_root, main, make_parser, model_arguments
 from .editor import edit_text
 from .language import language, status_label, tr
+from .runtime import codex_models
 from .status import queue_status
 from .store import get_setting, open_queue, saved_language, settings
 from .text_layout import fit, print_wrapped, terminal_width, wrap_rows
@@ -80,28 +83,33 @@ def clear():
         print("\033[2J\033[H", end="")
 
 
-def choose(title, options, default=0):
+def choose(title, options, default=0, *, ordered=None):
     if not options:
         print(tr("No available choices.", "選択できる項目がありません。"))
         return None
     output = virtual_terminal() if os.name == "nt" else nullcontext(True)
     with output as vt:
-        return choose_options(title, options, default, vt)
+        return choose_options(title, options, default, vt, ordered=ordered)
 
 
-def choose_options(title, options, default, vt):
+def choose_options(title, options, default, vt, *, ordered=None):
     index = default
     console = ConsoleInput() if os.name == "nt" else PosixInput()
     hint = tr("Up/Down select  Enter accept  Esc cancel", "上下キーで選択  Enter で確定  Esc で戻る")
+    if ordered is not None:
+        hint = tr("Up/Down move  Enter toggle  Ctrl+Enter confirm  Esc cancel",
+                  "上下キーで移動  Enter で選択・解除  Ctrl+Enter で決定  Esc で戻る")
     while True:
         size = shutil.get_terminal_size()
         title_rows = len(list(wrap_rows(title, max(1, size.columns - 1))))
         capacity = max(1, size.lines - title_rows - 4)
         first = min(max(0, index - capacity // 2), max(0, len(options) - capacity))
-        visible = [
-            fit(("> " if i == index else "  ") + label, max(1, size.columns - 1))
-            for i, (label, _) in enumerate(options[first:first + capacity], first)
-        ]
+        priorities = {value: i for i, value in enumerate(ordered or (), 1)}
+        visible = []
+        for i, (label, value) in enumerate(options[first:first + capacity], first):
+            if priorities and value in priorities:
+                label = f"{priorities[value]} {label}"
+            visible.append(fit(("> " if i == index else "  ") + label, max(1, size.columns - 1)))
         draw_prompt(title, "\n".join(visible), options[index][0], [], 0, size, 0, vt, hint=hint)
         while (key := console.read()) is None:
             time.sleep(0.03)
@@ -111,8 +119,22 @@ def choose_options(title, options, default, vt):
             index = (index - 1) % len(options)
         elif key == "down":
             index = (index + 1) % len(options)
+        elif key == "ctrl+enter" and ordered is not None:
+            return ordered
         elif key in ("\n", "\r"):
-            return options[index][1]
+            value = options[index][1]
+            if ordered is None or value is FREE_ENTRY:
+                return value
+            if value is APPLY_SELECTION:
+                return ordered
+            if value in ordered:
+                ordered.remove(value)
+            elif value is INHERIT_MODELS:
+                ordered[:] = [value]
+            else:
+                if INHERIT_MODELS in ordered:
+                    ordered.remove(INHERIT_MODELS)
+                ordered.append(value)
         elif key in ("\x1b", "\x04"):
             return None
         elif key == "\x03":
@@ -282,8 +304,111 @@ def edit_field(key, label, current):
     return prompt_input(None, heading, **kwargs)
 
 
+def choose_yes_no(label, default=False):
+    return choose(label, [(tr("No", "いいえ"), False), (tr("Yes", "はい"), True)], int(default))
+
+
+FREE_ENTRY = object()
+APPLY_SELECTION = object()
+INHERIT_MODELS = object()
+
+
+def branch_label(value):
+    return {
+        "per-task": tr("Separate branches per task", "タスクごとに分割"),
+        "current": tr("Use current branch", "そのまま使う"),
+    }[value]
+
+
+def inherited_label():
+    return tr("Inherit global setting", "全体設定を継承")
+
+
+def unset_label():
+    return tr("Unset", "未設定")
+
+
+def free_entry_label():
+    return tr("Enter manually", "自由記述")
+
+
+def branch_mode(label, value, project):
+    options = [(branch_label(mode), mode) for mode in BRANCH_MODES]
+    if project:
+        options.insert(0, (inherited_label(), ""))
+    return choose_value(label, options, value)
+
+
+def branch_names(repository):
+    try:
+        result = subprocess.run(
+            ["git", "for-each-ref", "--format=%(refname:short)%09%(symref)", "refs/heads", "refs/remotes"],
+            cwd=repository, capture_output=True, encoding="utf-8", timeout=3,
+        )
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return []
+    if result.returncode:
+        return []
+    return [name for line in result.stdout.splitlines() if "\t" in line
+            for name, target in [line.split("\t", 1)] if name and not target]
+
+
+def base_branch(label, value, repository, project):
+    unset = "unset" if project else ""
+    value = unset if project and value == "" else value
+    options = [(unset_label(), unset)]
+    if project:
+        options.insert(0, (inherited_label(), "inherit"))
+    known = dict.fromkeys([*branch_names(repository), value])
+    reserved = {None, "", "unset", "inherit"} if project else {None, ""}
+    options.extend((name, name) for name in known if name not in reserved)
+    options.append((free_entry_label(), FREE_ENTRY))
+    selection = choose_value(label, options, value)
+    if selection is FREE_ENTRY:
+        return edit_field("base", label, value if value not in reserved else "")
+    return selection
+
+
+def model_setting(key, label, value, available, project):
+    models = dict(available)
+    if key != "allowed_models":
+        options = [(unset_label(), "")]
+        if project:
+            options.insert(0, (inherited_label(), "inherit"))
+        if value and (value != "inherit" or not project) and value not in models:
+            models[value] = value
+        options.extend((name if model == name else f"{name} ({model})", model) for model, name in models.items())
+        options.append((free_entry_label(), FREE_ENTRY))
+        selection = choose_value(label, options, value)
+        if selection is FREE_ENTRY:
+            return edit_field(key, label, "" if value in (None, "inherit") else value)
+        return selection
+
+    order = value.split(",") if value else []
+    if project and value == "inherit":
+        order = [INHERIT_MODELS]
+    while True:
+        for model in order:
+            if model is not INHERIT_MODELS:
+                models.setdefault(model, model)
+        options = [(inherited_label(), INHERIT_MODELS)] if project else []
+        options.extend((name if name == model else f"{name} ({model})", model) for model, name in models.items())
+        options.extend([(tr("Confirm", "決定"), APPLY_SELECTION), (free_entry_label(), FREE_ENTRY)])
+        selection = choose(label, options, ordered=order)
+        if selection is None:
+            return None
+        if selection is not FREE_ENTRY:
+            return "inherit" if selection == [INHERIT_MODELS] else ",".join(selection)
+        added = validated_input(label, "", lambda title, initial: edit_field(key, title, initial), allowed_models)
+        if added:
+            if added == "inherit" and project:
+                order[:] = [INHERIT_MODELS]
+            else:
+                order[:] = list(dict.fromkeys([*(model for model in order if model is not INHERIT_MODELS), *added.split(",")]))
+
+
 def confirmed(argv, prompted):
-    if prompted and field(tr("Save changes? [y/N]", "変更を保存しますか？ [y/N]")).strip().lower() not in ("y", "yes"):
+    if prompted and not choose_yes_no(tr("Save changes?", "変更を保存しますか？")):
         return None
     return argv
 
@@ -309,6 +434,61 @@ def choose_value(title, options, supplied=None, default=0):
         options = [(str(supplied), supplied), *options]
         default = 0
     return choose(title, options, default)
+
+
+def edit_options(fields, values, edit):
+    """Keep supplied values and leave untouched options to the command defaults."""
+    if not fields:
+        return values
+    while True:
+        options = [(tr("Continue", "次へ"), "")]
+        for key, label in fields:
+            value = values.get(key)
+            preview = " ".join(str(value).split()) if value is not None else tr("default", "既定値")
+            if key == "branch" and value in BRANCH_MODES:
+                preview = branch_label(value)
+            elif key in ("base", *MODEL_SETTINGS) and value == "inherit":
+                preview = inherited_label()
+            elif (key == "base" and value in ("unset", "")) or (key in MODEL_SETTINGS and value == ""):
+                preview = unset_label()
+            elif key == "branch" and value == "":
+                preview = inherited_label()
+            options.append((f"{label}: {preview or '—'}", key))
+        key = choose(tr("Choose an option to edit", "変更するオプションを選択"), options)
+        if key is None:
+            return None
+        if key == "":
+            return values
+        value = edit(key, dict(fields)[key], values.get(key))
+        if value is not None:
+            values[key] = value
+
+
+def validated_input(label, initial, read, validate):
+    heading = label
+    while True:
+        value = read(heading, initial)
+        if value is None:
+            return None
+        try:
+            return validate(value)
+        except (QueueError, OSError, ValueError, argparse.ArgumentTypeError) as error:
+            initial = value
+            heading = f"{label}\n{error}"
+
+
+def single_line(value, message):
+    if not value.strip() or len(value.strip().splitlines()) != 1:
+        raise ValueError(message)
+    return value.strip()
+
+
+def repository_path(value):
+    if not value.strip():
+        raise ValueError(tr("Repository path is required.", "リポジトリのパスは必須です。"))
+    if not Path(value).is_dir():
+        raise ValueError(tr("Directory does not exist: {path}", "フォルダーが存在しません：{path}", path=value))
+    return git_root(value)
 
 
 def task_options(db, statuses=None, excluded=("RUNNING", "REMOVED", "SUPERSEDED")):
@@ -343,6 +523,12 @@ def fill_add(db, argv):
     target.add_argument("--project-id", type=int)
     parser.add_argument("--detail")
     args = parser.parse_args(argv[1:])
+    title = validated_input(
+        tr("Idea title", "Idea のタイトル"), args.title or "", field,
+        lambda value: single_line(value, tr("Enter a single-line title.", "タイトルを1行で入力してください。")),
+    )
+    if title is None:
+        return None
     command = ["add"]
     options = project_options(db)
     root = repo_here()
@@ -356,27 +542,31 @@ def fill_add(db, argv):
         else:
             options.insert(0, (f"{root.name}  {root} " + tr("(register)", "（新規登録）"), "current"))
     supplied = args.project_id
+    label = tr("Project", "プロジェクト")
     if args.project is not None:
         matches = [row["id"] for row in db.execute(
             "SELECT id FROM projects WHERE retired=0 AND name=?", (args.project,),
         )]
-        supplied = matches[0] if len(matches) == 1 else ("--project", args.project)
-        if isinstance(supplied, tuple):
-            options.insert(0, (args.project, supplied))
-    selected = choose_value(tr("Project", "プロジェクト"), options, supplied, default)
+        supplied = matches[0] if len(matches) == 1 else None
+        if supplied is None:
+            label += "\n" + tr("Choose a registered project for {name}.", "{name} に対応する登録済みプロジェクトを選んでください。", name=args.project)
+    if supplied is not None and not any(key == supplied for _, key in options):
+        label += "\n" + tr("Unknown project ID {id}.", "プロジェクト ID {id} が見つかりません。", id=supplied)
+        supplied = None
+    selected = choose_value(label, options, supplied, default)
     if selected is None:
         return None
-    if isinstance(selected, tuple):
-        command = option(command, *selected)
-    elif selected != "current":
+    if selected != "current":
         command = option(command, "--project-id", selected)
-    title = field(tr("Idea title", "Idea のタイトル"), args.title or "")
-    if not title.strip():
-        print_wrapped(tr("Enter a single-line title.", "タイトルを1行で入力してください。"))
+    values = edit_options(
+        [("detail", tr("Idea details", "Idea の詳細"))], {"detail": args.detail},
+        lambda key, label, value: edit_field(key, label, value or ""),
+    )
+    if values is None:
         return None
-    label = tr("Idea details (optional)", "Idea の詳細（任意）")
-    detail = edit_field("detail", label, args.detail or "")
-    return confirmed(option(command, "--detail", detail) + ["--", title], True)
+    if values["detail"] is not None:
+        command = option(command, "--detail", values["detail"])
+    return confirmed(command + ["--", title], True)
 
 
 def idea_options(db, include_planned=False):
@@ -408,10 +598,20 @@ def fill_idea(db, argv):
     idea = db.execute("SELECT * FROM ideas WHERE id = ?", (target,)).fetchone()
     if idea is None or idea["planned_at"]:
         return command
-    for key, label in (("title", tr("Idea title", "Idea のタイトル")),
-                       ("detail", tr("Idea details", "Idea の詳細"))):
-        value = getattr(args, key)
-        value = edit_field(key, label, idea[key] if value is None else value)
+    fields = [("title", tr("Idea title", "Idea のタイトル")), ("detail", tr("Idea details", "Idea の詳細"))]
+    values = {key: idea[key] if getattr(args, key) is None else getattr(args, key) for key, _ in fields}
+
+    def edit(key, label, value):
+        if key == "title":
+            return validated_input(label, value, field, lambda text: single_line(
+                text, tr("Enter a single-line title.", "タイトルを1行で入力してください。"),
+            ))
+        return edit_field(key, label, value)
+
+    values = edit_options(fields, values, edit)
+    if values is None:
+        return None
+    for key, value in values.items():
         if value != idea[key]:
             command = option(command, f"--{key}", value)
     return confirmed(command, True) if len(command) > 2 else None
@@ -432,6 +632,8 @@ def fill_reply(db, argv):
         return ["reply", str(target), "--", answer or ""]
     label = "\n".join(filter(None, (attempt["reason"], tr("Answer", "回答"))))
     answer = edit_field("answer", label, answer or "")
+    if answer is None:
+        return None
     return confirmed(["reply", str(target), "--", answer], True)
 
 
@@ -445,8 +647,8 @@ def fill_project(db, argv):
         ("path", tr("Repository path", "リポジトリのパス")),
         ("name", tr("Project name", "プロジェクト名")),
         ("prompt", tr("Project instructions", "プロジェクトの共通指示")),
-        ("branch", tr("Branch mode (per-task/current)", "ブランチ運用（per-task/current）")),
-        ("base", tr("Base branch (inherit/unset/branch)", "開始元ブランチ（inherit/unset/ブランチ名）")),
+        ("branch", tr("Branch mode", "ブランチ運用")),
+        ("base", tr("Base branch", "開始元ブランチ")),
     )
     if action in (None, "add", "edit"):
         for key, _ in fields:
@@ -470,24 +672,56 @@ def fill_project(db, argv):
         row = db.execute("SELECT * FROM projects WHERE id=? AND retired=0", (target,)).fetchone()
         if row is None:
             return command
-    default_path = str(repo_here() or ".") if action == "add" else "."
-    defaults = dict(row) if row else {"path": default_path, "name": "", "prompt": "", "branch": ""}
+    defaults = dict(row) if row else {"path": ".", "name": "", "prompt": "", "branch": ""}
+    defaults["branch"] = defaults["branch"] or ""
     defaults.setdefault("nextcloud_sync", "on")
     for key in ("base", "planner_model", "implementation_model", "allowed_models"):
         if defaults.get(key) is None:
             defaults[key] = "inherit"
-    for key, label in fields:
-        current = defaults[key] or ""
-        supplied = getattr(args, key)
-        initial = current if supplied is None else supplied
-        value = edit_field(key, label, initial)
+    if defaults["base"] == "":
+        defaults["base"] = "unset"
+    labels = dict(fields)
+    if action == "add":
+        path = validated_input(
+            labels["path"], args.path if args.path is not None else str(repo_here() or "."),
+            lambda label, value: edit_field("path", label, value), repository_path,
+        )
+        if path is None:
+            return None
+        name = validated_input(
+            labels["name"], args.name if args.name is not None else path.name,
+            lambda label, value: edit_field("name", label, value), lambda value: single_line(
+                value, tr("Enter a single-line project name.", "プロジェクト名を1行で入力してください。"),
+            ),
+        )
+        if name is None:
+            return None
+        command = option(option(command, "--path", path), "--name", name)
+        fields = [(key, label) for key, label in fields if key not in ("path", "name")]
+    values = {key: getattr(args, key) if getattr(args, key) is not None else defaults[key] for key, _ in fields}
+    models = cache(lambda: codex_models(db))
+
+    def edit(key, label, value):
+        if key == "branch":
+            return branch_mode(label, value, project=True)
+        if key == "base":
+            return base_branch(label, value, path if action == "add" else values["path"], project=True)
+        if key in MODEL_SETTINGS:
+            return model_setting(key, label, value, models(), project=True)
         if key == "nextcloud_sync":
-            if not value.strip():
-                continue
-            if value not in ("on", "off"):
-                raise ValueError(tr("Enter on or off for Nextcloud board sync.",
-                                    "Nextcloud ボード同期には on または off を入力してください。"))
-        if value != current or (action == "add" and (key == "path" or supplied is not None)):
+            return choose_value(label, [("on", "on"), ("off", "off")], value)
+        if key == "path":
+            return validated_input(label, value, lambda heading, initial: edit_field(key, heading, initial),
+                                   lambda text: str(repository_path(text)))
+        return edit_field(key, label, value or "")
+
+    values = edit_options(fields, values, edit)
+    if values is None:
+        return None
+    for key, value in values.items():
+        if key == "branch" and value == "" and action != "edit":
+            continue
+        if value != defaults[key] or (action != "edit" and getattr(args, key) is not None):
             command = option(command, f"--{key.replace('_', '-')}", value)
     if action == "edit" and len(command) == 3:
         return None
@@ -526,18 +760,24 @@ def argument_choices(db, command, argument):
     return tr("Task", "タスク"), options
 
 
-def prompt_argument(db, command, argument, supplied, current=None):
+def argument_label(argument):
+    if argument.help and argument.help != argparse.SUPPRESS:
+        return argument.help
+    return tr(*POSITIONAL_LABELS.get(argument.dest, (argument.dest, argument.dest)))
+
+
+def prompt_argument(db, command, argument, supplied, current=None, heading=None):
     target = argument_choices(db, command, argument)
     if target is not None:
-        return choose_value(*target, supplied)
-    label = argument.help
-    if not label or label == argparse.SUPPRESS:
-        label = tr(*POSITIONAL_LABELS.get(argument.dest, (argument.dest, argument.dest)))
+        label, choices = target
+        return choose_value(heading or label, choices, supplied)
+    label = heading or argument_label(argument)
     initial = supplied if supplied is not None else current
     if argument.dest == "topic":
-        return tokens(field(label, " ".join(initial or [])))
+        value = field(label, " ".join(initial or []))
+        return None if value is None else tokens(value)
     if isinstance(argument, argparse._StoreTrueAction):
-        return choose_value(label, [(tr("No", "いいえ"), False), (tr("Yes", "はい"), True)], bool(initial))
+        return choose_yes_no(label, bool(initial))
     if argument.choices is not None:
         return choose_value(label, [(str(choice), str(choice)) for choice in argument.choices], initial)
     if argument.dest in MULTILINE_FIELDS or argument.dest == "context_file" or initial is not None:
@@ -553,38 +793,58 @@ def fill_arguments(db, parser, command, argv):
     )]
     groups = parser._mutually_exclusive_groups
     group_members = {argument for group in groups for argument in group._group_actions}
-    required = {argument for argument in arguments if argument.required}
+    required = {argument for argument in arguments if argument.required or (
+        command == ["nextcloud", "connect"] and argument.dest == "server"
+    )}
+    validation = {argument: (argument.type, argument.choices) for argument in required}
     for argument in arguments:
         argument.required = False
         if not argument.option_strings and argument.nargs is None:
             argument.nargs = "?"
+        if argument in required:
+            argument.type = argument.choices = None
     required_groups = {group for group in groups if group.required}
     for group in groups:
         group.required = False
     supplied = parser.parse_args(argv)
+    for argument, (convert, choices) in validation.items():
+        argument.type, argument.choices = convert, choices
     current = settings(db) if command[0] in ("config", "settings") else {}
     options, positionals = [], []
+    optional = {}
     for argument in arguments:
         if argument in group_members:
             continue
-        original = current.get(argument.dest)
         provided = getattr(supplied, argument.dest)
-        if isinstance(argument, argparse._AppendAction) and provided:
-            options.extend(f"{argument.option_strings[0]}={value}" for value in provided)
+        if argument.option_strings and argument not in required:
+            optional[argument.dest] = argument
             continue
-        value = prompt_argument(db, command, argument, provided, original)
+        target = argument_choices(db, command, argument)
+
+        def validate(value):
+            if argument in required and isinstance(value, str) and not value.strip():
+                raise ValueError(tr("A value is required.", "値を入力してください。"))
+            if argument.type and isinstance(value, str):
+                value = argument.type(value)
+            if target is not None and all(value != key for _, key in target[1]):
+                raise ValueError(tr("Select an available item.", "一覧にある項目を選んでください。"))
+            return value
+
+        value = validated_input(
+            target[0] if target else argument_label(argument),
+            provided,
+            lambda label, initial: prompt_argument(
+                db, command, argument,
+                int(initial) if target and str(initial).isdecimal() else initial,
+                heading=label,
+            ),
+            validate,
+        )
         if value is None:
-            return None
-        needs_value = argument in required or (command == ["nextcloud", "connect"] and argument.dest == "server")
-        if needs_value and isinstance(value, str) and not value.strip():
-            print_wrapped(tr("A value is required.", "値を入力してください。"))
             return None
         if not argument.option_strings:
             positionals.extend(value if isinstance(value, list) else [str(value)])
-        elif isinstance(argument, argparse._StoreTrueAction):
-            if value:
-                options.append(argument.option_strings[0])
-        elif value != original and (value != "" or original is not None or getattr(supplied, argument.dest) == ""):
+        else:
             options.append(f"{argument.option_strings[0]}={value}")
     for group in groups:
         choices = [(argument.help, argument.option_strings[0]) for argument in group._group_actions]
@@ -597,6 +857,44 @@ def fill_arguments(db, parser, command, argv):
             return None
         if selected:
             options.append(selected)
+    values = {key: getattr(supplied, key) for key in optional}
+    fields = [(key, argument_label(argument)) for key, argument in optional.items()
+              if argument.help != argparse.SUPPRESS]
+    models = cache(lambda: codex_models(db))
+
+    def edit(key, label, value):
+        argument = optional[key]
+        initial = current.get(key) if value is None else value
+        if command[0] in ("config", "settings"):
+            if key == "branch":
+                return branch_mode(label, initial, project=False)
+            if key == "base":
+                return base_branch(label, initial, ".", project=False)
+            if key in MODEL_SETTINGS:
+                return model_setting(key, label, initial, models(), project=False)
+        if isinstance(argument, argparse._AppendAction):
+            return validated_input(
+                label + "\n" + tr("Separate values with spaces.", "値はスペースで区切ってください。"),
+                " ".join(map(str, value or ())), field,
+                lambda text: [(argument.type or str)(item) for item in tokens(text)],
+            )
+        return prompt_argument(db, command, argument, value, current.get(key))
+
+    values = edit_options(fields, values, edit)
+    if values is None:
+        return None
+    for key, value in values.items():
+        argument = optional[key]
+        flag = argument.option_strings[0]
+        if isinstance(argument, argparse._StoreTrueAction):
+            if value:
+                options.append(flag)
+        elif isinstance(argument, argparse._AppendAction):
+            options.extend(f"{flag}={item}" for item in value or ())
+        elif value is not None and value != current.get(key) and (
+            value != "" or key in current or getattr(supplied, key) == ""
+        ):
+            options.append(f"{flag}={value}")
     separator = ["--"] if positionals and command[0] != "help" else []
     result = [*command, *options, *separator, *positionals]
     return confirmed(result, bool(current and options))
@@ -829,6 +1127,8 @@ def read_prompt(parser, message, vt, show_queue=True, help_argv=None, complete=N
             elif key == "\x1b" and candidates:
                 candidates = []
                 redraw = True
+            elif key == "\x1b" and form:
+                return None
             elif key in ("up", "down") and candidates:
                 selected = (selected + (1 if key == "down" else -1)) % len(candidates)
                 redraw = True
