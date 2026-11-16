@@ -3,6 +3,7 @@ from getpass import getpass
 import json
 import sqlite3
 from subprocess import SubprocessError
+from threading import Lock, Thread
 import time
 from urllib.request import ProxyHandler, build_opener
 
@@ -10,8 +11,13 @@ from .actions import task_action, wake
 from .nextcloud import Client, RejectRedirects, connection
 from .planner import plan_idea, revise_task
 from .processes import process_lock
-from .store import write
+from .store import open_queue, write
 from .worker import latest_attempt
+
+
+PENDING_OUTCOME = "処理中です。"
+_running_lock = Lock()
+_running_requests = set()
 
 
 class LocalBoardClient(Client):
@@ -125,7 +131,36 @@ def save_outcome(db, key, outcome):
     db.execute("UPDATE board_receipts SET outcome = ? WHERE board = ? AND request_id = ?", (outcome, *key))
 
 
-def exchange(db, client, projects):
+def _run_request(key, request, project_ids):
+    try:
+        with open_queue() as worker_db:
+            projects = available_projects(worker_db, project_ids)
+            try:
+                outcome = request_action(worker_db, request, projects, key)
+            except (OSError, RuntimeError, sqlite3.Error, SubprocessError) as error:
+                outcome = f"処理できませんでした。{error}"
+            with write(worker_db):
+                save_outcome(worker_db, key, outcome[:1800])
+    finally:
+        with _running_lock:
+            _running_requests.discard(key)
+
+
+def _start_request(key, request, project_ids):
+    with _running_lock:
+        if key in _running_requests:
+            return False
+        _running_requests.add(key)
+    try:
+        Thread(target=_run_request, args=(key, request, project_ids), daemon=True).start()
+    except BaseException:
+        with _running_lock:
+            _running_requests.discard(key)
+        raise
+    return True
+
+
+def exchange(db, client, projects, watch=False):
     incoming = ocs(client, "GET")
     board = json.dumps([incoming["instance"], incoming["owner"]], ensure_ascii=False)
     results = []
@@ -135,9 +170,11 @@ def exchange(db, client, projects):
         with write(db):
             reserved = db.execute(
                 "INSERT OR IGNORE INTO board_receipts VALUES (?, ?, ?)",
-                (*key, "処理が中断されました。ボードの状態を確認してから、必要なら再度依頼してください。"),
+                (*key, PENDING_OUTCOME),
             ).rowcount
-        if reserved:
+        if reserved and watch and request["kind"] in ("plan", "revise"):
+            _start_request(key, request, set(projects))
+        elif reserved:
             try:
                 outcome = request_action(db, request, projects, key)
             except (OSError, RuntimeError, sqlite3.Error, SubprocessError) as error:
@@ -145,7 +182,15 @@ def exchange(db, client, projects):
             with write(db):
                 save_outcome(db, key, outcome[:1800])
         outcome = db.execute("SELECT outcome FROM board_receipts WHERE board = ? AND request_id = ?", key).fetchone()[0]
-        results.append({"id": request_id, "outcome": outcome})
+        if outcome == PENDING_OUTCOME:
+            with _running_lock:
+                running = key in _running_requests
+            if not running:
+                outcome = "処理が中断されました。ボードの状態を確認してから、必要なら再度依頼してください。"
+                with write(db):
+                    save_outcome(db, key, outcome)
+        if outcome != PENDING_OUTCOME:
+            results.append({"id": request_id, "outcome": outcome})
     ocs(client, "POST", {"snapshot": board_snapshot(db, projects), "results": results})
     if any(request["kind"] in ("add", "plan", "edit", "revise") for request in incoming["requests"]):
         wake(db)
@@ -167,7 +212,7 @@ def run_board(db, args):
         while True:
             try:
                 client = local_client if local_client is not None else connection(db)[0]
-                exchange(db, client, available_projects(db, project_ids))
+                exchange(db, client, available_projects(db, project_ids), watch=args.watch)
             except (OSError, RuntimeError) as error:
                 if not args.watch:
                     raise
