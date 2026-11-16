@@ -562,6 +562,36 @@ class SuggestionTest(unittest.TestCase):
 
 
 class QueueViewTest(unittest.TestCase):
+    def test_queue_folds_implemented_ideas_and_older_done_tasks(self):
+        with contextlib.closing(sqlite3.connect(":memory:")) as db:
+            db.row_factory = sqlite3.Row
+            db.executescript(SCHEMA)
+            db.execute("INSERT INTO projects(path, path_key, name) VALUES ('test', 'test', 'Notes')")
+            db.executemany("INSERT INTO ideas(project_id, title, planned_at) VALUES (1, ?, 'now')",
+                           [("Finished idea",), ("Aborted idea",), ("Empty plan",)])
+            db.executemany(
+                "INSERT INTO tasks(project_id, idea_id, name, status, completed_at, priority) VALUES (1, ?, ?, ?, ?, 1)",
+                [(1, "Newest task", "DONE", "2026-11-17")]
+                + [(1, f"Task {day:02}", "DONE", f"2026-11-{day:02}") for day in range(1, 17)]
+                + [(2, "Aborted task", "ABORTED", None), (1, "Replaced task", "SUPERSEDED", None)],
+            )
+            with patch("codex_queue.terminal.open_queue", return_value=contextlib.nullcontext(db)):
+                collapsed = queue_view()
+                self.assertIn("[F2]", collapsed)
+                self.assertIn("[F3]", collapsed)
+                self.assertNotIn("Finished idea", collapsed)
+                self.assertIn("Aborted idea", collapsed)
+                self.assertIn("Empty plan", collapsed)
+                self.assertLess(collapsed.index("Newest task"), collapsed.index("Task 16"))
+                self.assertIn("Task 03", collapsed)
+                self.assertNotIn("Task 02", collapsed)
+                expanded = queue_view({"f2", "f3"})
+                self.assertIn("Finished idea", expanded)
+                self.assertIn("Task 02", expanded)
+                db.execute("UPDATE tasks SET status = 'QUEUED' WHERE name = 'Newest task'")
+                self.assertIn("Finished idea", queue_view())
+                self.assertNotIn("[F2]", queue_view())
+
     def test_dashboard_lists_tasks_and_refreshes_progress_from_events(self):
         with contextlib.closing(sqlite3.connect(":memory:")) as db, TemporaryDirectory(dir=Path.cwd()) as folder:
             db.row_factory = sqlite3.Row

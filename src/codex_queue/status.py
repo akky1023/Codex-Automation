@@ -8,6 +8,7 @@ from .worker import attempt_folder, latest_attempt
 
 
 OUTCOMES = ("DONE", "ABORTED", "WAITING_FOR_INPUT")
+RECENT_DONE_LIMIT = 15
 
 
 def latest_progress(attempt):
@@ -42,7 +43,19 @@ def latest_progress(attempt):
     return ""
 
 
-def queue_status(db):
+def archive(lines, heading, items, expanded, key):
+    if not items:
+        return
+    if expanded is None:
+        lines.extend([f"{heading} ({len(items)})", *items])
+        return
+    is_open = key in expanded
+    lines.append(f"{'▼' if is_open else '▶'} {heading} ({len(items)})  [{key.upper()}]")
+    if is_open:
+        lines.extend(items)
+
+
+def queue_status(db, expanded=None):
     lines = ["Codex Queue", tr("Automatic execution enabled", "自動実行は有効です") if get_setting(db, "enabled") == "1" else tr("Automatic execution paused", "自動実行は一時停止中です")]
     rows = db.execute(
         """SELECT t.*, p.name AS project FROM tasks t JOIN projects p ON p.id=t.project_id
@@ -52,9 +65,17 @@ def queue_status(db):
     tasks = []
     results = {status: [] for status in OUTCOMES}
     counts = dict.fromkeys(OUTCOMES, 0)
+    completed_ideas = {}
+    done = []
     for row in rows:
         status = row["status"]
         label = f"{row['id']}  {row['project']}  {row['name']}"
+        idea_id = row["idea_id"]
+        if idea_id is not None:
+            completed_ideas[idea_id] = completed_ideas.get(idea_id, True) and status == "DONE"
+        if status == "DONE":
+            done.append((row["completed_at"] or "", row["id"], label))
+            continue
         if status == "RUNNING":
             running.append(f"{status_label(status)}  {label}")
             attempt = latest_attempt(db, row["id"])
@@ -77,7 +98,7 @@ def queue_status(db):
         else:
             destination = tasks
             destination.append(f"{status_label(status)}  {label}")
-        if status in ("QUEUED", "DONE"):
+        if status == "QUEUED":
             continue
         attempt = latest_attempt(db, row["id"])
         if attempt:
@@ -90,13 +111,14 @@ def queue_status(db):
             destination.append(f'  cq reply {row["id"]} "..."')
     ideas = []
     planned = []
+    implemented = []
     for row in db.execute(
         """SELECT i.*, p.name AS project FROM ideas i JOIN projects p ON p.id=i.project_id
            ORDER BY i.id"""
     ):
         label = f"{row['id']}  {row['project']}  {row['title']}"
         if row["planned_at"]:
-            planned.append(label)
+            (implemented if completed_ideas.get(row["id"]) else planned).append(label)
         else:
             ideas.append(label)
             if row["planning_error"]:
@@ -106,13 +128,19 @@ def queue_status(db):
     for status, heading in (("WAITING_FOR_INPUT", "Waiting response"), ("ABORTED", "Abort")):
         if counts[status]:
             lines.extend(["", f"{heading} ({counts[status]})", *results[status]])
-    lines.extend(["", "Idea", *(ideas or [tr("No ideas", "Idea はありません")])])
+    lines.extend(["", "Idea", *ideas])
+    if not (ideas or planned or implemented):
+        lines.append(tr("No ideas", "Idea はありません"))
     if planned:
         lines.extend(["Planned", *planned])
+    archive(lines, tr("Implemented Ideas", "実装済みのIdea"), implemented, expanded, "f2")
     todos = running + tasks
     lines.extend(["", "ToDo", *(todos or [tr("No ToDos", "ToDo はありません")])])
-    if results["DONE"]:
-        lines.extend(["", "Done", *results["DONE"]])
+    if done:
+        done_labels = [label for _, _, label in sorted(done, reverse=True)]
+        lines.extend(["", "Done", *(done_labels if expanded is None else done_labels[:RECENT_DONE_LIMIT])])
+        if expanded is not None:
+            archive(lines, tr("Earlier Done", "以前の Done"), done_labels[RECENT_DONE_LIMIT:], expanded, "f3")
     if error := get_setting(db, "nextcloud_error"):
         lines.append(error)
     return "\n".join(lines)

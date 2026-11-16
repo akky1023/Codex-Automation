@@ -37,6 +37,7 @@ document.addEventListener('DOMContentLoaded', () => {
     let loading = false;
     let editingIdea = null;
     let revisionTask = null;
+    const recentDoneLimit = 15;
 
     function taskColumn(task) {
         return ['DONE', 'ABORTED'].includes(task.status) ? 'Done' : 'To Do';
@@ -200,6 +201,17 @@ document.addEventListener('DOMContentLoaded', () => {
         card.append(section);
     }
 
+    function appendArchive(column, label, key, cards) {
+        if (!cards.length) return;
+        const archive = node('details');
+        archive.className = 'cq-column-archive';
+        archive.dataset.key = key;
+        const content = node('div');
+        content.append(...cards);
+        archive.append(node('summary', label + '（' + cards.length + '件）'), content);
+        column.append(archive);
+    }
+
     function render() {
         const ideas = find('#cq-ideas');
         const todos = find('#cq-todos');
@@ -207,13 +219,25 @@ document.addEventListener('DOMContentLoaded', () => {
         const expanded = new Set([...board.querySelectorAll('details[data-key][open]')].map(item => item.dataset.key));
         for (const column of [ideas, todos, done]) column.replaceChildren();
         const visible = row => !filter.value || String(row.project_id) === filter.value;
+        const tasks = (snapshot.tasks || []).filter(visible);
+        const completedIdeas = new Map();
+        for (const task of tasks) {
+            if (task.idea_id == null) continue;
+            completedIdeas.set(task.idea_id, completedIdeas.get(task.idea_id) !== false && task.status === 'DONE');
+        }
+        const implementedIdeas = [];
         for (const idea of (snapshot.ideas || []).filter(visible)) {
-            const {item, content} = card(idea, idea.title, idea.planned_at ? '計画済み' : '未計画', 'idea-');
+            const implemented = Boolean(idea.planned_at && completedIdeas.get(idea.id));
+            const status = implemented ? '実装済み' : (idea.planned_at ? '計画済み' : '未計画');
+            const {item, content} = card(idea, idea.title, status, 'idea-');
             if (idea.detail) content.append(node('p', idea.detail));
             if (idea.planning_error) content.append(node('p', idea.planning_error));
-            ideas.append(cardWithActions(item, ideaActions(idea)));
+            if (implemented) implementedIdeas.push(item);
+            else ideas.append(cardWithActions(item, ideaActions(idea)));
         }
-        for (const task of (snapshot.tasks || []).filter(visible)) {
+        appendArchive(ideas, '実装済みのIdea', 'implemented-ideas', implementedIdeas);
+        const doneCards = [];
+        for (const task of tasks) {
             const {item, content} = card(task, task.name, states[task.status] || task.status, 'task-');
             if (task.abstract) content.append(node('p', task.abstract));
             cardSection(content, '詳細', task.prompt, item.dataset.key + '-detail');
@@ -250,8 +274,12 @@ document.addEventListener('DOMContentLoaded', () => {
                 action(actions, 'abort', task.id);
             }
             const taskCard = actions.childElementCount ? cardWithActions(item, actions) : item;
-            (taskColumn(task) === 'Done' ? done : todos).append(taskCard);
+            if (taskColumn(task) === 'Done') doneCards.push({task, taskCard});
+            else todos.append(taskCard);
         }
+        doneCards.sort((a, b) => (b.task.completed_at || '').localeCompare(a.task.completed_at || '') || b.task.id - a.task.id);
+        done.append(...doneCards.slice(0, recentDoneLimit).map(({taskCard}) => taskCard));
+        appendArchive(done, '以前の Done', 'older-done', doneCards.slice(recentDoneLimit).map(({taskCard}) => taskCard));
         for (const item of board.querySelectorAll('details[data-key]')) item.open = expanded.has(item.dataset.key);
         for (const column of [ideas, todos, done]) {
             if (!column.childElementCount) column.append(node('p', 'カードはありません。'));

@@ -57,12 +57,13 @@ class PosixInput:
                     if not following:
                         break
                     suffix += following
-                    if suffix[0] != ord("[") or (len(suffix) > 1 and 0x40 <= suffix[-1] <= 0x7E):
+                    if suffix[0] not in b"[O" or (len(suffix) > 1 and 0x40 <= suffix[-1] <= 0x7E):
                         break
                 return {
                     b"": "\x1b", b"[A": "up", b"[B": "down", b"[C": "right", b"[D": "left",
                     b"[H": "home", b"[F": "end", b"[3~": "delete",
                     b"[5~": "pageup", b"[6~": "pagedown",
+                    b"OQ": "f2", b"OR": "f3", b"[12~": "f2", b"[13~": "f3",
                     b"[13;5u": "ctrl+enter", b"[27;5;13~": "ctrl+enter",
                 }.get(suffix, "")
             return self.decoder.decode(byte) or None
@@ -967,9 +968,9 @@ def prepare(argv):
         return fill_arguments(db, parser, command, remaining)
 
 
-def queue_view():
+def queue_view(expanded=None):
     with open_queue() as db:
-        return queue_status(db)
+        return queue_status(db, expanded if expanded is not None else set())
 
 
 def command_output(argv):
@@ -993,10 +994,12 @@ def run_screen():
     message = ""
     showing_output = False
     help_argv = None
+    expanded = set()
     try:
         while True:
             language.set(saved_language())
-            line = prompt_input(make_parser(), message, show_queue=not showing_output, help_argv=help_argv)
+            line = prompt_input(make_parser(), message, show_queue=not showing_output, help_argv=help_argv,
+                                expanded=expanded)
             line = command_text(line)
             if line.strip() in ("q", "quit", "exit"):
                 return 0
@@ -1110,19 +1113,22 @@ def draw_prompt(view, message, line, candidates, selected, size, offset, vt, for
     return page, offset, max_offset
 
 
-def windows_input(parser, message, show_queue=True, help_argv=None, complete=None, initial=None, editor=None):
+def windows_input(parser, message, show_queue=True, help_argv=None, complete=None, initial=None, editor=None,
+                  expanded=None):
     with virtual_terminal() as vt:
-        return read_prompt(parser, message, vt, show_queue, help_argv, complete, initial, editor)
+        return read_prompt(parser, message, vt, show_queue, help_argv, complete, initial, editor, expanded=expanded)
 
 
 def read_prompt(parser, message, vt, show_queue=True, help_argv=None, complete=None, initial=None,
-                editor=None, console=None):
+                editor=None, console=None, expanded=None):
     if console is None:
         console = ConsoleInput()
     line = initial or ""
     form = complete is not None
     suggest = complete if form else partial(completion, parser)
-    view = queue_view() if show_queue else ""
+    if expanded is None:
+        expanded = set()
+    view = queue_view(expanded) if show_queue else ""
     selected = 0
     start, candidates = len(line), []
     size = shutil.get_terminal_size()
@@ -1139,7 +1145,11 @@ def read_prompt(parser, message, vt, show_queue=True, help_argv=None, complete=N
                 raise KeyboardInterrupt
             if key in ("\x1a", "\x04"):
                 raise EOFError
-            if key == "\x05" and editor:
+            if key in ("f2", "f3") and show_queue and not form:
+                expanded.symmetric_difference_update((key,))
+                view = queue_view(expanded)
+                redraw = True
+            elif key == "\x05" and editor:
                 line = edit_text(console, editor, line, vt)
                 start, candidates = len(line), []
                 selected = 0
@@ -1183,7 +1193,7 @@ def read_prompt(parser, message, vt, show_queue=True, help_argv=None, complete=N
         now = time.monotonic()
         if now >= refresh_at:
             refresh_at = now + 0.2
-            current = queue_view() if show_queue else ""
+            current = queue_view(expanded) if show_queue else ""
             current_size = shutil.get_terminal_size()
             if current != view or current_size != size:
                 if help_argv and current_size.columns != size.columns:
