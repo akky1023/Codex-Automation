@@ -208,6 +208,44 @@ class BoardProjectTest(unittest.TestCase):
         self.assertEqual({1: "One"}, available_projects(db))
 
 
+    def test_board_retries_idea_writes_and_publish_without_duplicate_mutations(self):
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        db.row_factory = sqlite3.Row
+        db.executescript(SCHEMA)
+        with db:
+            db.execute("INSERT INTO projects(path,path_key,name) VALUES ('one','one','One')")
+        projects = available_projects(db)
+        requests = [
+            {"id": 1, "kind": "add", "target_id": 1, "title": "First", "body": ""},
+            {"id": 2, "kind": "edit", "target_id": 1, "title": "Latest", "body": "Updated"},
+        ]
+        published = []
+
+        def sync(_client, method, data=None):
+            if method == "GET":
+                return {"owner": "test", "instance": "test", "requests": requests}
+            published.append(data)
+            if len(published) == 2:
+                raise OSError("connection dropped")
+
+        with patch("codex_queue.nextcloud_board.ocs", side_effect=sync), patch("codex_queue.nextcloud_board.wake"):
+            with patch("codex_queue.nextcloud_board.request_action", side_effect=sqlite3.OperationalError("database locked")):
+                with self.assertRaisesRegex(RuntimeError, "database locked"):
+                    exchange(db, None, projects)
+            self.assertEqual([], published[0]["results"])
+            self.assertEqual([], published[0]["snapshot"]["ideas"])
+            with self.assertRaisesRegex(OSError, "connection dropped"):
+                exchange(db, None, projects)
+            exchange(db, None, projects)
+
+        self.assertEqual(published[1], published[2])
+        self.assertEqual([1, 2], [result["id"] for result in published[2]["results"]])
+        self.assertEqual([(1, "Latest", "Updated")], [
+            tuple(row) for row in db.execute("SELECT id, title, detail FROM ideas")
+        ])
+
+
 class CalDAVTest(unittest.TestCase):
     def setUp(self):
         self.db = sqlite3.connect(":memory:")

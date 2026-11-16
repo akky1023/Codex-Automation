@@ -28,7 +28,7 @@ final class BridgeController extends OCSController {
         return new DataResponse([
             'owner' => $owner,
             'instance' => hash('sha256', $this->config->getSystemValueString('instanceid')),
-            'requests' => $this->board->requests($owner, true),
+            'requests' => $this->board->pending($owner, true),
         ]);
     }
 

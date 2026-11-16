@@ -19,15 +19,30 @@ final class BoardController extends OCSController {
     #[NoAdminRequired]
     public function read(): DataResponse {
         $owner = $this->session->getUser()->getUID();
-        return new DataResponse([
-            'snapshot' => $this->board->snapshot($owner),
-            'requests' => $this->board->requests($owner, false),
-        ]);
+        return new DataResponse($this->state($owner));
+    }
+
+    private function state(string $owner): array {
+        // Read the snapshot between two pending reads to avoid showing an Idea twice
+        // if the bridge publishes its result while the board is being read.
+        do {
+            $before = $this->board->pending($owner);
+            $snapshot = $this->board->snapshot($owner);
+            $pending = $this->board->pending($owner);
+        } while ($before !== $pending);
+        return ['snapshot' => $snapshot, 'pending' => $pending, 'requests' => $this->board->history($owner)];
     }
 
     #[NoAdminRequired]
     public function request(string $kind, int $target = 0, string $title = '', string $body = '',
-        string $sessionId = '', int $round = 0, string $branchMode = ''): DataResponse {
+        string $sessionId = '', int $round = 0, string $branchMode = '', int $cancelId = 0): DataResponse {
+        $owner = $this->session->getUser()->getUID();
+        if ($cancelId > 0 && in_array($kind, ['remove', 'plan', 'revise', 'reply', 'retry', 'done', 'abort', 'sync'], true)) {
+            if (!$this->board->cancel($owner, $cancelId, $kind, $target)) {
+                return new DataResponse(['message' => 'この予約はすでに同期処理に渡されたか、取り消されています。'], 409);
+            }
+            return new DataResponse($this->state($owner) + ['message' => '予約を取り消しました。']);
+        }
         $title = trim($title);
         $body = trim($body);
         $valid = match ($kind) {
@@ -52,8 +67,8 @@ final class BoardController extends OCSController {
             || $round < 0 || mb_strlen($branchMode) > 16) {
             return new DataResponse(['message' => '入力内容を確認してください。'], 400);
         }
-        $this->board->submit($this->session->getUser()->getUID(), $kind, $target, $title, $body,
+        $this->board->submit($owner, $kind, $target, $title, $body,
             $sessionId ?: null, $round ?: null, $branchMode ?: null);
-        return new DataResponse(['message' => '依頼を受け付けました。'], 202);
+        return new DataResponse($this->state($owner) + ['message' => '依頼を受け付けました。'], 202);
     }
 }

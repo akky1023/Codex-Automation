@@ -193,10 +193,15 @@ def _run_request(key, request, project_ids):
             _running_requests.discard(key)
 
 
-def _start_request(key, request, project_ids):
+def _start_request(db, key, request, project_ids, marker):
     with _running_lock:
         if key in _running_requests:
-            return False
+            return
+        outcome = db.execute(
+            "SELECT outcome FROM board_receipts WHERE board = ? AND request_id = ?", key,
+        ).fetchone()[0]
+        if outcome != marker:
+            return
         _running_requests.add(key)
     try:
         Thread(target=_run_request, args=(key, request, project_ids), daemon=True).start()
@@ -204,51 +209,67 @@ def _start_request(key, request, project_ids):
         with _running_lock:
             _running_requests.discard(key)
         raise
-    return True
 
 
 def exchange(db, client, projects, watch=False):
     incoming = ocs(client, "GET")
     board = json.dumps([incoming["instance"], incoming["owner"]], ensure_ascii=False)
     results = []
+    deferred = None
+    interrupted = "処理が中断されました。ボードの状態を確認してから、必要なら再度依頼してください。"
     for request in incoming["requests"]:
         request_id = int(request["id"])
         key = (board, request_id)
-        with write(db):
-            reserved = db.execute(
-                "INSERT OR IGNORE INTO board_receipts VALUES (?, ?, ?)",
-                (*key, PENDING_OUTCOME),
-            ).rowcount
         kind = request["kind"]
+        atomic = kind in ("add", "edit", "remove")
         grilling = kind.startswith("grilling_") or kind == "approve_branch"
+        marker = interrupted
         if watch and grilling:
-            if reserved:
+            marker = _ASYNC_PENDING
+        elif watch and kind in ("plan", "revise"):
+            marker = PENDING_OUTCOME
+        try:
+            with write(db):
+                reserved = db.execute(
+                    "INSERT OR IGNORE INTO board_receipts VALUES (?, ?, ?)", (*key, marker),
+                ).rowcount
+                outcome = db.execute(
+                    "SELECT outcome FROM board_receipts WHERE board = ? AND request_id = ?", key,
+                ).fetchone()[0]
+            if watch and grilling and outcome == _ASYNC_PENDING:
+                _start_request(db, key, request, set(projects), marker)
+            elif reserved and marker == PENDING_OUTCOME:
+                _start_request(db, key, request, set(projects), marker)
+            # Idea mutations commit their receipt in the same transaction.
+            elif reserved or (atomic and outcome == interrupted):
+                try:
+                    outcome = request_action(db, request, projects, key)
+                except (OSError, RuntimeError, sqlite3.Error, SubprocessError) as error:
+                    if atomic and isinstance(error, sqlite3.OperationalError):
+                        raise
+                    outcome = f"処理できませんでした。{error}"
                 with write(db):
-                    save_outcome(db, key, _ASYNC_PENDING)
-            outcome = db.execute("SELECT outcome FROM board_receipts WHERE board = ? AND request_id = ?", key).fetchone()[0]
-            if outcome == _ASYNC_PENDING:
-                _start_request(key, request, set(projects))
-        elif reserved and watch and kind in ("plan", "revise"):
-            _start_request(key, request, set(projects))
-        elif reserved:
-            try:
-                outcome = request_action(db, request, projects, key)
-            except (OSError, RuntimeError, sqlite3.Error, SubprocessError) as error:
-                outcome = f"処理できませんでした。{error}"
-            with write(db):
-                save_outcome(db, key, outcome[:1800])
-        with _running_lock:
-            running = key in _running_requests
-            outcome = db.execute("SELECT outcome FROM board_receipts WHERE board = ? AND request_id = ?", key).fetchone()[0]
-        if outcome == PENDING_OUTCOME and not running:
-            outcome = "処理が中断されました。ボードの状態を確認してから、必要なら再度依頼してください。"
-            with write(db):
-                save_outcome(db, key, outcome)
-        if outcome not in (PENDING_OUTCOME, _ASYNC_PENDING):
-            results.append({"id": request_id, "outcome": outcome})
+                    save_outcome(db, key, outcome[:1800])
+            with _running_lock:
+                running = key in _running_requests
+                outcome = db.execute(
+                    "SELECT outcome FROM board_receipts WHERE board = ? AND request_id = ?", key,
+                ).fetchone()[0]
+            if not running and (outcome == PENDING_OUTCOME or (outcome == _ASYNC_PENDING and not grilling)):
+                outcome = interrupted
+                with write(db):
+                    save_outcome(db, key, outcome)
+            if outcome not in (PENDING_OUTCOME, _ASYNC_PENDING):
+                results.append({"id": request_id, "outcome": outcome[:1800]})
+        except sqlite3.OperationalError as error:
+            # Publish completed requests before retrying this request in order.
+            deferred = error
+            break
     ocs(client, "POST", {"snapshot": board_snapshot(db, projects, board), "results": results})
     if any(request["kind"] in ("add", "plan", "edit", "revise", "grilling_start", "grilling_answer", "grilling_confirm", "approve_branch") for request in incoming["requests"]):
         wake(db)
+    if deferred is not None:
+        raise RuntimeError(f"ボードの同期を再試行します。{deferred}") from deferred
 
 
 def run_board(db, args):
