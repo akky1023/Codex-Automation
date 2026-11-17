@@ -68,12 +68,14 @@ script('codex_queue', 'board');
         </div>
         <p id="cq-revision-message" role="status"></p>
     </form>
-    <dialog id="cq-config-dialog" aria-labelledby="cq-config-title">
+    <dialog class="cq-dialog" id="cq-config-dialog" aria-labelledby="cq-config-title">
         <h2 id="cq-config-title">キュー設定</h2>
-        <label>対象 <select id="cq-config-scope"></select></label>
         <form id="cq-config-form">
-            <div id="cq-config-fields"></div>
-            <p id="cq-config-message" role="status"></p>
+            <div class="cq-dialog-body">
+                <label>対象 <select id="cq-config-scope" autofocus></select></label>
+                <div id="cq-config-fields"></div>
+                <p id="cq-config-message" role="status"></p>
+            </div>
             <div class="cq-dialog-actions">
                 <button id="cq-close-config" type="button">閉じる</button>
                 <button id="cq-reload-config" type="button">最新値を読み直す</button>
@@ -81,26 +83,32 @@ script('codex_queue', 'board');
             </div>
         </form>
     </dialog>
-    <dialog id="cq-add-dialog" aria-labelledby="cq-add-title">
+    <dialog class="cq-dialog" id="cq-add-dialog" aria-labelledby="cq-add-title">
         <h2 id="cq-add-title">Idea を追加</h2>
         <form id="cq-add">
-            <label id="cq-idea-project">プロジェクト <select name="target" required></select></label>
-            <label>タイトル <input name="title" maxlength="200" required autofocus></label>
-            <label>詳細 <textarea name="body" maxlength="12000" rows="4"></textarea></label>
-            <p id="cq-add-error" role="alert"></p>
+            <div class="cq-dialog-body">
+                <label id="cq-idea-project">プロジェクト <select name="target" required></select></label>
+                <label>タイトル <input name="title" maxlength="200" required autofocus></label>
+                <label>詳細 <textarea name="body" maxlength="12000" rows="4"></textarea></label>
+                <p id="cq-add-error" role="alert"></p>
+            </div>
             <div class="cq-dialog-actions">
                 <button id="cq-cancel-add" type="button">キャンセル</button>
                 <button type="submit" class="primary">追加</button>
             </div>
         </form>
     </dialog>
-    <dialog id="cq-grilling-dialog" aria-labelledby="cq-grilling-title">
+    <dialog class="cq-dialog" id="cq-grilling-dialog" aria-labelledby="cq-grilling-title">
         <h2 id="cq-grilling-title">Grilling</h2>
-        <div id="cq-grilling-content"></div>
         <form id="cq-grilling-form">
-            <label id="cq-grilling-answer-label" hidden>回答 <textarea name="answer" maxlength="12000" rows="5"></textarea></label>
-            <p id="cq-grilling-message" role="status"></p>
+            <div class="cq-dialog-body">
+                <div id="cq-grilling-content"></div>
+                <label id="cq-grilling-answer-label" hidden>回答 <textarea name="answer" maxlength="12000" rows="5"></textarea></label>
+                <p id="cq-grilling-message" role="status"></p>
+                <div class="cq-grilling-branch"></div>
+            </div>
             <div class="cq-dialog-actions">
+                <button id="cq-grilling-close" type="button" autofocus>閉じる</button>
                 <button id="cq-grilling-cancel" type="button">中止</button>
                 <button id="cq-grilling-confirm" type="submit" class="primary" hidden>この仕様で ToDo 化</button>
                 <button id="cq-grilling-send" type="submit" class="primary" hidden>回答を送信</button>
