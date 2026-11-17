@@ -47,6 +47,7 @@ document.addEventListener('DOMContentLoaded', () => {
     let loading = false;
     let boardVersion = 0;
     let pending = [];
+    const requestDrafts = new Map();
     const scheduled = '次回同期時に実行';
     let editingIdea = null;
     let revisionTask = null;
@@ -183,12 +184,16 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         const details = node('details');
         details.className = 'cq-card-request';
+        details.dataset.key = 'request-' + kind + '-' + id;
         const form = node('form');
         const label = node('label', labels[kind]);
         const body = node('textarea');
         body.maxLength = 12000;
         body.required = true;
         body.rows = 3;
+        body.value = requestDrafts.get(String(id)) || '';
+        if (body.value) details.open = true;
+        body.addEventListener('input', () => requestDrafts.set(String(id), body.value));
         label.append(body);
         const button = node('button', '送信');
         form.append(label, button);
@@ -197,6 +202,7 @@ document.addEventListener('DOMContentLoaded', () => {
             if (await submit(button, kind, id, '', body.value)) {
                 details.open = false;
                 body.value = '';
+                requestDrafts.delete(String(id));
             }
         });
         details.append(node('summary', labels[kind]), form);
@@ -256,10 +262,31 @@ document.addEventListener('DOMContentLoaded', () => {
         const ideas = find('#cq-ideas');
         const todos = find('#cq-todos');
         const done = find('#cq-done');
+        const waiting = find('#cq-waiting-response');
+        const waitingItems = find('#cq-waiting-response-items');
         const expanded = new Set([...board.querySelectorAll('details[data-key][open]')].map(item => item.dataset.key));
-        for (const column of [ideas, todos, done]) column.replaceChildren();
+        for (const column of [ideas, todos, done, waitingItems]) column.replaceChildren();
         const visible = row => !filter.value || String(row.project_id) === filter.value;
         const tasks = (snapshot.tasks || []).filter(visible);
+        for (const id of requestDrafts.keys()) {
+            const task = (snapshot.tasks || []).find(item => String(item.id) === id);
+            if (!task || task.status !== 'WAITING_FOR_INPUT') requestDrafts.delete(id);
+        }
+        const waitingTasks = tasks.filter(task => ['WAITING_FOR_INPUT', 'NEEDS_REVIEW', 'ABORTED'].includes(task.status));
+        for (const task of waitingTasks) {
+            const item = node('article');
+            item.className = 'cq-waiting-item';
+            item.append(node('h3', task.name));
+            const reason = String(task.reason || '').trim();
+            const message = task.status === 'WAITING_FOR_INPUT'
+                ? reason || '回答を入力してください。'
+                : task.status === 'ABORTED'
+                    ? reason || 'この ToDo は中止されました。'
+                    : reason || '停止理由を確認し、再開・完了・中止を選んでください。';
+            item.append(node('p', message));
+            waitingItems.append(item);
+        }
+        waiting.hidden = waitingTasks.length === 0;
         const completedIdeas = new Map();
         for (const task of tasks) {
             if (task.idea_id == null) continue;
@@ -358,7 +385,7 @@ document.addEventListener('DOMContentLoaded', () => {
             : '実行 PC との同期を待っています';
         const nextPending = payload.pending || [];
         const next = JSON.stringify([cards, nextPending]);
-        const editing = addDialog.open || find('.cq-card-request[open], .cq-idea-menu[open]');
+        const editing = addDialog.open || find('.cq-idea-menu[open]');
         if (next !== fingerprint && (force || !editing)) {
             const projects = cards.projects || {};
             cards.projects = projects;

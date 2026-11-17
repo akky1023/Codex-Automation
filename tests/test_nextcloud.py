@@ -207,6 +207,39 @@ class BoardProjectTest(unittest.TestCase):
         db.execute("UPDATE projects SET nextcloud_sync = 'on' WHERE id = 1")
         self.assertEqual({1: "One"}, available_projects(db))
 
+    def test_waiting_response_snapshot_and_board_reply_resume_task(self):
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        db.row_factory = sqlite3.Row
+        db.executescript(SCHEMA)
+        with db:
+            db.execute("INSERT INTO projects(path,path_key,name) VALUES ('one','one','One')")
+            db.execute("INSERT INTO settings VALUES ('enabled','1')")
+            db.execute("INSERT INTO tasks(project_id,name,priority,status) VALUES (1,'Question',1,'WAITING_FOR_INPUT')")
+            db.execute("INSERT INTO attempts(task_id,number,path,mode,prompt,session,phase,reason) "
+                       "VALUES (1,1,'one','current','','session','WAITING_FOR_INPUT','Which option?')")
+        projects = available_projects(db)
+        task = board_snapshot(db, projects)["tasks"][0]
+        self.assertEqual(("WAITING_FOR_INPUT", "Which option?"), (task["status"], task["reason"]))
+        with patch("codex_queue.actions.wake"):
+            request_action(db, {"kind": "reply", "target_id": 1, "title": "", "body": "Option A"}, projects, ("board", 1))
+        self.assertEqual("RESUME_QUEUED", db.execute("SELECT status FROM tasks WHERE id=1").fetchone()[0])
+
+    def test_board_snapshot_includes_stopped_task_reasons(self):
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        db.row_factory = sqlite3.Row
+        db.executescript(SCHEMA)
+        with db:
+            db.execute("INSERT INTO projects(path,path_key,name) VALUES ('one','one','One')")
+            db.execute("INSERT INTO tasks(project_id,name,priority,status) VALUES "
+                       "(1,'Review',1,'NEEDS_REVIEW'),(1,'Aborted',2,'ABORTED')")
+            db.executemany("INSERT INTO attempts(task_id,number,path,mode,prompt,reason) VALUES (?,1,'one','current','','?')",
+                           [(1,), (2,)])
+        tasks = board_snapshot(db, available_projects(db))["tasks"]
+        self.assertEqual([("NEEDS_REVIEW", "?"), ("ABORTED", "?")],
+                         [(task["status"], task["reason"]) for task in tasks])
+
 
     def test_board_retries_idea_writes_and_publish_without_duplicate_mutations(self):
         db = sqlite3.connect(":memory:")
