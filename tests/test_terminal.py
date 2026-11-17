@@ -17,6 +17,56 @@ from codex_queue.store import SCHEMA
 from codex_queue.terminal import APPLY_SELECTION, Suggestion, choose_options, command_text, completion, draw_prompt, edit_field, fill_project, fill_idea, prepare, prompt_frame, queue_view, screen, tokens, windows_input
 from codex_queue.text_layout import text_width, wrap_rows
 from codex_queue.windows_console import ConsoleInput, InputRecord, KeyEvent
+from codex_queue.progress import output_to, waiting
+from codex_queue.terminal import command_output, read_prompt
+
+
+class WaitingScreenTest(unittest.TestCase):
+    def test_only_running_tasks_animate_in_interactive_status(self):
+        from codex_queue.status import queue_status
+
+        with contextlib.closing(sqlite3.connect(':memory:')) as db:
+            db.row_factory = sqlite3.Row
+            db.executescript(SCHEMA)
+            db.execute("INSERT INTO projects(path,path_key,name) VALUES ('repo','repo','Repo')")
+            db.execute("INSERT INTO tasks(project_id,name,priority,status) VALUES (1,'Task',1,'RUNNING')")
+            with patch('codex_queue.status.spinner', side_effect=['|', '/']):
+                self.assertIn('| RUNNING', queue_status(db, animate=True))
+                self.assertIn('/ RUNNING', queue_status(db, animate=True))
+            with patch('codex_queue.status.spinner') as spinner:
+                self.assertIn('RUNNING', queue_status(db))
+                spinner.assert_not_called()
+                db.execute("UPDATE tasks SET status='QUEUED'")
+                self.assertNotIn('RUNNING', queue_status(db, animate=True))
+                spinner.assert_not_called()
+
+    def test_command_capture_keeps_results_and_routes_progress_to_screen(self):
+        display = io.StringIO()
+
+        def command(*args, **kwargs):
+            with waiting('Planning', '計画中'):
+                print('result')
+                print('diagnostic', file=sys.stderr)
+
+        with contextlib.redirect_stdout(display), patch('codex_queue.terminal.main', side_effect=command):
+            self.assertEqual('result\ndiagnostic', command_output(['idea', 'plan', '1']))
+        self.assertEqual('Planning...\nPlanning: done\n', display.getvalue())
+
+    def test_refresh_preserves_input_candidates_selection_and_scroll(self):
+        console = Mock()
+        console.read.side_effect = ['x', 'down', 'pagedown', None, '\r']
+        candidates = [Suggestion('xa'), Suggestion('xb')]
+        with patch('codex_queue.terminal.queue_view', side_effect=['| RUNNING', '/ RUNNING']), patch(
+            'codex_queue.terminal.time.monotonic', side_effect=[0, 0, 0, 0, 1],
+        ), patch('codex_queue.terminal.time.sleep'), patch(
+            'codex_queue.terminal.draw_prompt', return_value=(5, 4, 20),
+        ) as draw, contextlib.redirect_stdout(io.StringIO()):
+            result = read_prompt(None, '', True, console=console, complete=lambda line: (0, candidates))
+        self.assertEqual('x', result)
+        args = draw.call_args.args
+        self.assertEqual('/ RUNNING', args[0])
+        self.assertEqual(('x', candidates, 1), args[2:5])
+        self.assertEqual(4, args[6])
 
 
 class SuggestionTest(unittest.TestCase):

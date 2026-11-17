@@ -3,6 +3,7 @@ import json
 import os
 
 from .language import status_label, tr
+from .progress import spinner
 from .store import get_setting
 from .worker import attempt_folder, latest_attempt
 
@@ -55,7 +56,7 @@ def archive(lines, heading, items, expanded, key):
         lines.extend(items)
 
 
-def queue_status(db, expanded=None):
+def queue_status(db, expanded=None, *, animate=False):
     lines = ["Codex Queue", tr("Automatic execution enabled", "自動実行は有効です") if get_setting(db, "enabled") == "1" else tr("Automatic execution paused", "自動実行は一時停止中です")]
     rows = db.execute(
         """SELECT t.*, p.name AS project FROM tasks t JOIN projects p ON p.id=t.project_id
@@ -80,7 +81,8 @@ def queue_status(db, expanded=None):
             done.append((row["completed_at"] or "", row["id"], label))
             continue
         if status == "RUNNING":
-            running.append(f"{status_label(status)}  {label}")
+            marker = f"{spinner()} " if animate else ""
+            running.append(f"{marker}{status_label(status)}  {label}")
             attempt = latest_attempt(db, row["id"])
             if attempt:
                 progress = latest_progress(attempt)

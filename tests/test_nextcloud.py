@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import io
 from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -12,7 +13,59 @@ from codex_queue.cli import configure, make_parser, project_options
 from codex_queue.configuration import current_values, save_values
 from codex_queue.nextcloud import Client, apply_snapshot, completed_body, todo_fields, writeback
 from codex_queue.nextcloud_board import available_projects, board_snapshot, exchange, grilling_active, request_action
+from codex_queue.progress import output_to
 from codex_queue.store import DEFAULTS, SCHEMA, write
+
+
+class CommunicationProgressTest(unittest.TestCase):
+    def test_delayed_request_animates_and_preserves_response(self):
+        import threading
+        from codex_queue import progress
+
+        class Display(io.StringIO):
+            def isatty(self):
+                return True
+
+        display = Display()
+        updated = threading.Event()
+        response = unittest.mock.MagicMock()
+        response.__enter__.return_value = response
+        response.status, response.headers = 200, {'ETag': 'one'}
+
+        def read(limit):
+            self.assertTrue(updated.wait(2))
+            self.assertIn('Communicating with Nextcloud', display.getvalue())
+            return b'payload'
+
+        response.read.side_effect = read
+        original = progress._draw
+        count = 0
+
+        def draw():
+            nonlocal count
+            original()
+            count += 1
+            if count >= 2:
+                updated.set()
+
+        client = Client('https://example.test')
+        with patch.object(client.opener, 'open', return_value=response), output_to(display), patch.object(
+            progress, '_draw', side_effect=draw,
+        ):
+            self.assertEqual((200, {'ETag': 'one'}, b'payload'), client.request('GET', '/tasks'))
+        self.assertFalse(progress._active)
+
+    def test_request_failure_ends_plain_log_without_ansi(self):
+        from urllib.error import URLError
+
+        display = io.StringIO()
+        client = Client('https://example.test')
+        with output_to(display), patch.object(client.opener, 'open', side_effect=URLError('offline')):
+            with self.assertRaisesRegex(RuntimeError, 'connection failed'):
+                client.request('GET', '/tasks')
+        self.assertIn('interrupted or failed\n', display.getvalue())
+        self.assertNotIn('\r', display.getvalue())
+        self.assertNotIn('\x1b', display.getvalue())
 
 
 BODY = (
@@ -228,8 +281,10 @@ class BoardProjectTest(unittest.TestCase):
 
         db.execute("UPDATE projects SET nextcloud_sync = 'off' WHERE id = 1")
         self.assertEqual({}, available_projects(db, {1}))
-        self.assertEqual({"projects": {}, "ideas": [], "tasks": []},
-                         {key: value for key, value in board_snapshot(db, available_projects(db)).items() if key != "configuration"})
+        snapshot = board_snapshot(db, available_projects(db))
+        self.assertEqual({}, snapshot["projects"])
+        self.assertEqual([], snapshot["ideas"])
+        self.assertEqual([], snapshot["tasks"])
 
         db.execute("UPDATE projects SET nextcloud_sync = 'on' WHERE id = 1")
         self.assertEqual({1: "One"}, available_projects(db))

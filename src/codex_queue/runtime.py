@@ -10,6 +10,7 @@ from datetime import datetime
 from xml.etree import ElementTree as ET
 
 from .language import tr
+from .progress import progress, waiting, suspended
 from .store import get_setting, queue_folder, set_setting, write
 
 
@@ -83,6 +84,7 @@ def list_app_server_models(process, output):
         identifier += 1
 
 
+@progress("Loading Codex models", "Codex のモデルを取得中")
 def codex_models(db):
     try:
         command = [*codex_command(db), "app-server", "--listen", "stdio://"]
@@ -139,6 +141,7 @@ def task_name(db):
     return get_setting(db, "schedule_name", f"Codex Queue ({os.environ.get('USERNAME', 'user')})")
 
 
+@progress("Registering scheduled worker", "定期ワーカーを登録中")
 def register_schedule(db, minutes):
     if os.name != "nt":
         raise RuntimeError(tr("The scheduled worker requires Windows Task Scheduler.", "定期実行には Windows タスク スケジューラが必要です。"))
@@ -189,18 +192,22 @@ def setup(db):
     env = codex_env(db)
     if os.environ.get("CODEX_HOME"):
         env["CODEX_HOME"] = os.environ["CODEX_HOME"]
-    if subprocess.run([*command, "login", "status"], env=env).returncode:
-        subprocess.run([*command, "login"], env=env, check=True)
-        subprocess.run([*command, "login", "status"], env=env, check=True)
+    with waiting("Checking Codex login", "Codex のログイン状態を確認中"):
+        needs_login = subprocess.run([*command, "login", "status"], env=env).returncode
+    if needs_login:
+        with suspended():
+            subprocess.run([*command, "login"], env=env, check=True)
+            subprocess.run([*command, "login", "status"], env=env, check=True)
     with write(db):
         set_setting(db, "codex_command", json.dumps(command))
         set_setting(db, "codex_home", str(Path(env.get("CODEX_HOME") or Path.home() / ".codex").resolve()))
     register_schedule(db, int(get_setting(db, "schedule_minutes", "10")))
-    requested_at = time.time()
-    scheduler("Run", task_name(db))
-    deadline = time.monotonic() + 12
-    while float(get_setting(db, "scheduled_heartbeat", "0")) < requested_at:
-        if time.monotonic() >= deadline:
-            raise RuntimeError(tr("The scheduled task was registered, but its worker did not check in.", "定期タスクを登録しましたが、ワーカーの起動を確認できませんでした。"))
-        time.sleep(0.2)
+    with waiting("Waiting for scheduled worker", "定期ワーカーの起動を待機中"):
+        requested_at = time.time()
+        scheduler("Run", task_name(db))
+        deadline = time.monotonic() + 12
+        while float(get_setting(db, "scheduled_heartbeat", "0")) < requested_at:
+            if time.monotonic() >= deadline:
+                raise RuntimeError(tr("The scheduled task was registered, but its worker did not check in.", "定期タスクを登録しましたが、ワーカーの起動を確認できませんでした。"))
+            time.sleep(0.2)
     print(tr("Setup complete. Run cq start to enable automatic execution.", "セットアップが完了しました。cq start で自動実行を有効にできます。"))

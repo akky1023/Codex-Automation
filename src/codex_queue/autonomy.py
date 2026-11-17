@@ -7,6 +7,7 @@ from tempfile import TemporaryDirectory, mkdtemp
 import time
 
 from .processes import spawn, stop_tree
+from .progress import progress
 from .runtime import codex_command, codex_env
 from .store import get_setting, settings, update, write
 
@@ -47,6 +48,7 @@ def check_running(db, attempt, *, manual=False):
         raise RuntimeError("Stopped or moved before verification or merge finished.")
 
 
+@progress("Running verification command", "検証コマンドを実行中")
 def run_logged(db, attempt, command, path, log, *, env=None, source=None, manual=False):
     with log.open("wb") as output:
         process, job = spawn(
@@ -113,6 +115,7 @@ def run_tests(db, attempt, config, path, folder, label, *, manual=False):
     return outcome, str(folder / f"{label}.json")
 
 
+@progress("Waiting for Codex review", "Codex のレビューを待機中")
 def ask_model(db, attempt, model, path, folder, label, prompt, *, writable=False, session=None, manual=False):
     schema = {
         "type": "object",

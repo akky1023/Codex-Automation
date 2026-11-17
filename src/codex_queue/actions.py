@@ -2,6 +2,7 @@ import json
 import time
 
 from .language import status_label, tr
+from .progress import waiting
 from .autonomy import merge_task, verification_folder, workflow
 from .processes import process_lock
 
@@ -46,14 +47,15 @@ def queue_control(db, command):
         set_setting(db, "enabled", "0")
         if command == "stop":
             set_setting(db, "stop", "1")
-    while db.execute("SELECT 1 FROM tasks WHERE status = 'RUNNING'").fetchone():
-        from .processes import process_lock
-        from .worker import recover
-        with process_lock("worker.lock") as acquired:
-            if acquired:
-                recover(db)
-                break
-        time.sleep(0.2)
+    with waiting("Waiting for running tasks to stop", "実行中タスクの停止を待機中"):
+        while db.execute("SELECT 1 FROM tasks WHERE status = 'RUNNING'").fetchone():
+            from .processes import process_lock
+            from .worker import recover
+            with process_lock("worker.lock") as acquired:
+                if acquired:
+                    recover(db)
+                    break
+            time.sleep(0.2)
     print(tr("Queue stopped.", "キューを停止しました。") if command == "stop" else tr("Queue paused.", "キューを一時停止しました。"))
 
 
