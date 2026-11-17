@@ -72,7 +72,7 @@ final class BoardStore {
     }
 
     public function submit(string $owner, string $kind, int $target, string $title, string $body,
-        ?string $sessionId = null, ?int $round = null, ?string $branchMode = null): void {
+        ?string $sessionId = null, ?int $round = null, ?string $branchMode = null): int {
         $query = $this->db->getQueryBuilder();
         $query->insert('cq_requests')->values([
             'owner' => $query->createNamedParameter($owner),
@@ -84,6 +84,7 @@ final class BoardStore {
             'round_no' => $query->createNamedParameter($round, $round === null ? IQueryBuilder::PARAM_NULL : IQueryBuilder::PARAM_INT),
             'branch_mode' => $query->createNamedParameter($branchMode),
         ])->executeStatement();
+        return $this->db->lastInsertId('*PREFIX*cq_requests');
     }
 
     public function publish(string $owner, array $snapshot, array $results): void {

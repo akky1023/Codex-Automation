@@ -7,6 +7,7 @@ from threading import Lock, Thread
 import time
 from urllib.request import ProxyHandler, build_opener
 
+from .configuration import current_values, save_values
 from .actions import task_action, wake
 from .nextcloud import Client, RejectRedirects, connection
 from .planner import plan_idea, revise_task
@@ -94,12 +95,35 @@ def board_snapshot(db, projects, board_key=""):
             task["reason"] = attempt["reason"]
             task["report"] = attempt["report"]
         tasks.append(task)
-    return {"projects": projects, "ideas": ideas, "tasks": tasks}
+    return {"projects": projects, "ideas": ideas, "tasks": tasks,
+            "configuration": {"global": current_values(db),
+                              "projects": {pid: current_values(db, pid) for pid in projects}}}
 
 
 def request_action(db, request, projects, key):
     kind, target = request["kind"], int(request["target_id"])
     title, body = request["title"], request["body"]
+    if kind == "config":
+        try:
+            payload = json.loads(body)
+            values, expected = payload["changes"], payload["expected"]
+        except (ValueError, KeyError, TypeError) as error:
+            raise RuntimeError("設定依頼の形式が不正です。") from error
+        if not isinstance(values, dict) or not values or not isinstance(expected, dict) or values.keys() != expected.keys():
+            raise RuntimeError("変更項目と編集開始時の値を指定してください。")
+        with write(db):
+            if target < 0 or (target and target not in available_projects(db, set(projects))):
+                raise RuntimeError("同期対象の Project が見つかりません。")
+            current = current_values(db, target)
+            if not values.keys() <= current.keys():
+                raise RuntimeError("未知の設定項目です。")
+            if any(current[field] != expected[field] for field in values):
+                raise RuntimeError("競合しました。最新の値を読み直して編集してください。")
+            saved = save_values(db, values, target)
+            save_outcome(db, key, "設定を保存しました。")
+        if not target and saved.get("idea_planning") == "auto":
+            wake(db)
+        return "設定を保存しました。"
     if kind == "sync":
         return "同期しました。"
     if kind == "grilling_start":
@@ -221,7 +245,7 @@ def exchange(db, client, projects, watch=False):
         request_id = int(request["id"])
         key = (board, request_id)
         kind = request["kind"]
-        atomic = kind in ("add", "edit", "remove")
+        atomic = kind in ("add", "edit", "remove", "config")
         grilling = kind.startswith("grilling_") or kind == "approve_branch"
         marker = interrupted
         if watch and grilling:
@@ -265,6 +289,7 @@ def exchange(db, client, projects, watch=False):
             # Publish completed requests before retrying this request in order.
             deferred = error
             break
+    projects = available_projects(db, set(projects))
     ocs(client, "POST", {"snapshot": board_snapshot(db, projects, board), "results": results})
     if any(request["kind"] in ("add", "plan", "edit", "revise", "grilling_start", "grilling_answer", "grilling_confirm", "approve_branch") for request in incoming["requests"]):
         wake(db)

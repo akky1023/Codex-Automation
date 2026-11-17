@@ -6,6 +6,7 @@ from pathlib import Path
 import sqlite3
 import subprocess
 
+from .configuration import normalize, save_values
 from .actions import queue_control, task_action, wake
 from .autonomy import APPROVAL_MODES, MERGE_MODES, parse_test_commands
 from .arguments import ArgumentParser, parser_candidates
@@ -132,7 +133,7 @@ def project_options(args):
         values["branch"] = None
     if args.base in ("inherit", "unset"):
         values["base"] = None if args.base == "inherit" else ""
-    return values
+    return normalize(values, project=True)
 
 
 def show_project(db, row):
@@ -386,11 +387,7 @@ def configure(db, args):
     if args.base == "unset":
         values["base"] = ""
     with write(db):
-        db.executemany(
-            """INSERT INTO settings(key, value) VALUES (?, ?)
-               ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
-            values.items(),
-        )
+        save_values(db, values)
         current = settings(db)
     language.set(current["language"])
     for key, value in current.items():

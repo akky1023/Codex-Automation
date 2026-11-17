@@ -57,6 +57,7 @@ final class BoardController extends OCSController {
             'approve_branch' => $target > 0 && $sessionId !== ''
                 && in_array($branchMode, ['recommended', 'per-idea', 'per-task'], true),
             'retry', 'done', 'abort' => $target > 0,
+            'config' => $target >= 0 && $body !== '',
             'sync' => $target === 0,
             default => false,
         };
@@ -67,8 +68,8 @@ final class BoardController extends OCSController {
             || $round < 0 || mb_strlen($branchMode) > 16) {
             return new DataResponse(['message' => '入力内容を確認してください。'], 400);
         }
-        $this->board->submit($owner, $kind, $target, $title, $body,
+        $requestId = $this->board->submit($owner, $kind, $target, $title, $body,
             $sessionId ?: null, $round ?: null, $branchMode ?: null);
-        return new DataResponse($this->state($owner) + ['message' => '依頼を受け付けました。'], 202);
+        return new DataResponse($this->state($owner) + ['message' => '依頼を受け付けました。', 'request_id' => $requestId], 202);
     }
 }
