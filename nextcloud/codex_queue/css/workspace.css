@@ -585,3 +585,21 @@
     font-weight: 600;
     margin-block-end: 0.75rem;
 }
+/* Independent network, request and Codex activity indicators. */
+#codex-queue-workspace .cq-busy::before {
+    content: '';
+    display: inline-block;
+    width: .85em;
+    height: .85em;
+    margin-inline-end: .45em;
+    border: 2px solid currentColor;
+    border-inline-end-color: transparent;
+    border-radius: 50%;
+    vertical-align: -.1em;
+    animation: cq-spin .8s linear infinite;
+}
+#codex-queue-workspace .cq-waiting { font-size: .85em; }
+@keyframes cq-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+    #codex-queue-workspace .cq-busy::before { animation: none; }
+}

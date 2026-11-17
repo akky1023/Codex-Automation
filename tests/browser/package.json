@@ -1,4 +1,8 @@
 {
+  "private": true,
+  "scripts": {
+    "test": "node --test spinner.test.cjs"
+  },
   "dependencies": {
     "playwright": "1.65.1"
   }

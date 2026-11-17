@@ -9,6 +9,7 @@ script('codex_queue', 'board');
         <button id="cq-sync" type="button">今すぐ同期</button>
         <button id="cq-open-config" type="button" disabled>設定</button>
         <span id="cq-synced"></span>
+        <span id="cq-network" class="cq-busy" role="status" aria-busy="true">初回読み込み中</span>
     </header>
     <p id="cq-message" role="status"></p>
     <section id="cq-waiting-response" aria-labelledby="cq-waiting-response-title" hidden>

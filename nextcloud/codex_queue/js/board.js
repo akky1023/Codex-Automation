@@ -48,6 +48,9 @@ document.addEventListener('DOMContentLoaded', () => {
     let boardVersion = 0;
     let pending = [];
     const requestDrafts = new Map();
+    const sending = new Map();
+    let communications = 0;
+    let activityTasks = [];
     const scheduled = '次回同期時に実行';
     let editingIdea = null;
     let revisionTask = null;
@@ -182,15 +185,78 @@ document.addEventListener('DOMContentLoaded', () => {
         return item;
     }
 
+    function busy(element, active) {
+        element.classList.toggle('cq-busy', active);
+        element.setAttribute('aria-busy', String(active));
+    }
+
+    function targetKey(kind, target) {
+        const group = ['sync', 'add'].includes(kind) ? kind
+            : ['edit', 'remove', 'plan', 'approve_branch'].includes(kind) || kind.startsWith('grilling_') ? 'idea' : 'task';
+        return group + ':' + Number(target);
+    }
+
+    function waitingFor(kind, target) {
+        return [...pending, ...sending.values()].filter(request =>
+            targetKey(request.kind, request.target_id) === targetKey(kind, target));
+    }
+
+    function trackButton(button, kind, target) {
+        button.dataset.requestKind = kind;
+        button.dataset.requestTarget = target;
+    }
+
+    function updateBusy() {
+        const network = find('#cq-network');
+        busy(network, communications > 0);
+        network.textContent = communications ? (snapshot.projects ? 'Nextcloud と通信中' : '初回読み込み中') : '';
+        for (const button of board.querySelectorAll('button[data-request-kind]')) {
+            const kind = button.dataset.requestKind;
+            const target = button.dataset.requestTarget;
+            const requests = waitingFor(kind, target);
+            const own = reservation(kind, target);
+            busy(button, requests.length > 0);
+            button.disabled = button.dataset.blocked === 'true' || (requests.length > 0 && (!own || own.claimed || sending.has(targetKey(kind, target))));
+        }
+        for (const card of board.querySelectorAll('.cq-card')) {
+            const key = card.dataset.key;
+            const isTask = key.startsWith('task-');
+            const id = Number(key.replace(/^[^-]+-/, ''));
+            const requests = key.startsWith('idea-pending-')
+                ? pending.filter(request => request.kind === 'add' && Number(request.id) === Number(key.slice('idea-pending-'.length)))
+                : waitingFor(isTask ? 'revise' : 'plan', id);
+            const running = isTask && activityTasks.some(task => task.id === id && task.status === 'RUNNING');
+            let status = card.querySelector('.cq-waiting');
+            if (!status) {
+                status = node('span');
+                status.className = 'cq-waiting';
+                status.setAttribute('role', 'status');
+                card.querySelector('.cq-card-metadata').append(status);
+            }
+            status.textContent = requests.length ? [...new Set(requests.map(request => labels[request.kind]))].join('・') + ' 処理待ち'
+                : running ? 'Codex 実行中' : '';
+            status.hidden = !status.textContent;
+            busy(status, Boolean(status.textContent));
+            card.setAttribute('aria-busy', String(Boolean(status.textContent)));
+        }
+    }
+
     async function api(path, data) {
-        const response = await fetch(board.dataset.api + path + '?format=json', {
-            method: data ? 'POST' : 'GET',
-            headers: {'OCS-APIRequest': 'true', 'Content-Type': 'application/json', requesttoken: OC.requestToken},
-            body: data ? JSON.stringify(data) : undefined,
-        });
-        const result = (await response.json()).ocs;
-        if (!response.ok) throw new Error(result?.data?.message || 'Nextcloud との通信に失敗しました。');
-        return result.data;
+        communications++;
+        updateBusy();
+        try {
+            const response = await fetch(board.dataset.api + path + '?format=json', {
+                method: data ? 'POST' : 'GET',
+                headers: {'OCS-APIRequest': 'true', 'Content-Type': 'application/json', requesttoken: OC.requestToken},
+                body: data ? JSON.stringify(data) : undefined,
+            });
+            const result = (await response.json()).ocs;
+            if (!response.ok) throw new Error(result?.data?.message || 'Nextcloud との通信に失敗しました。');
+            return result.data;
+        } finally {
+            communications--;
+            updateBusy();
+        }
     }
 
     function reservation(kind, target) {
@@ -204,18 +270,30 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     async function submit(button, kind, target, title = '', body = '', errorTarget = find('#cq-message'), extra = {}) {
+        const key = targetKey(kind, target);
+        if (sending.has(key) || (waitingFor(kind, target).length && !extra.cancelId && kind !== 'grilling_cancel')) return false;
+        trackButton(button, kind, target);
+        sending.set(key, {kind, target_id: target});
         button.disabled = true;
+        updateBusy();
         try {
             const result = await api('/requests', {kind, target: Number(target), title, body, ...extra});
             boardVersion++;
-            updateBoard(result, true);
+            // Concurrent POST responses may contain snapshots taken before another acceptance.
+            const finished = new Set((result.requests || []).map(request => request.id));
+            const merged = new Map(pending.filter(request => !finished.has(request.id)).map(request => [request.id, request]));
+            for (const request of result.pending || []) merged.set(request.id, request);
+            updateBoard({...result, pending: [...merged.values()]}, true);
             find('#cq-message').textContent = result.message;
             return true;
         } catch (error) {
             errorTarget.textContent = error.message;
             return false;
         } finally {
-            if (button !== find('#cq-sync') || !reservation('sync', 0)?.claimed) button.disabled = false;
+            sending.delete(key);
+            button.disabled = false;
+            busy(button, false);
+            updateBusy();
         }
     }
 
@@ -235,6 +313,7 @@ document.addEventListener('DOMContentLoaded', () => {
     function action(card, kind, id, label = labels[kind]) {
         const button = node('button', label);
         button.type = 'button';
+        trackButton(button, kind, id);
         const request = reservation(kind, id);
         showReservation(button, request, label);
         button.addEventListener('click', () => {
@@ -251,6 +330,7 @@ document.addEventListener('DOMContentLoaded', () => {
         actions.className = 'cq-card-actions';
         const plan = action(actions, 'plan', idea.id, 'To Do 化');
         if (idea.planned_at) {
+            plan.dataset.blocked = 'true';
             plan.disabled = true;
             return actions;
         }
@@ -507,10 +587,12 @@ document.addEventListener('DOMContentLoaded', () => {
     function updateBoard(payload, force = false) {
         updateConfiguration(payload);
         const {synced_at: time, ...cards} = payload.snapshot || {};
+        activityTasks = cards.tasks || [];
         find('#cq-synced').textContent = time
             ? '最終同期 ' + new Date(time).toLocaleString()
             : '実行 PC との同期を待っています';
-        const nextPending = payload.pending || [];
+        const nextPending = payload.pending || (payload.requests || []).filter(request => !request.outcome || request.outcome === '@claimed');
+        pending = nextPending;
         const next = JSON.stringify([cards, nextPending]);
         const editing = addDialog.open || find('.cq-idea-menu[open]');
         if (next !== fingerprint && (force || !editing)) {
@@ -533,6 +615,10 @@ document.addEventListener('DOMContentLoaded', () => {
         find('#cq-history').replaceChildren(...history.map(request => node(
             'li', (labels[request.kind] || request.kind) + ' — ' + request.outcome,
         )));
+        [...find('#cq-history').children].forEach((item, index) => {
+            busy(item, nextPending.some(request => request.id === history[index].id));
+        });
+        updateBusy();
     }
 
     async function refresh() {
@@ -549,7 +635,8 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
-    filter.addEventListener('change', render);
+    trackButton(find('#cq-sync'), 'sync', 0);
+    filter.addEventListener('change', () => { render(); updateBusy(); });
     find('.cq-board').addEventListener('click', event => {
         if (event.defaultPrevented || event.target.closest('.cq-card-section, summary, button, a, form, input, select, textarea, label')) return;
         if (window.getSelection()?.type === 'Range') return;
@@ -565,6 +652,12 @@ document.addEventListener('DOMContentLoaded', () => {
         chip.dataset.column = task && taskColumn(task) === 'Done' ? 'done' : 'todo';
         find('#cq-revision-label').textContent = task ? `${taskColumn(task)} #${task.id} · ${task.name}` : '';
         revisionSubmit.disabled = !task;
+        if (task) trackButton(revisionSubmit, 'revise', task.id);
+        else {
+            delete revisionSubmit.dataset.requestKind;
+            delete revisionSubmit.dataset.requestTarget;
+            busy(revisionSubmit, false);
+        }
     }
 
     function renderRevisionOptions() {
@@ -725,6 +818,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const view = JSON.stringify([session, idea.draft_plan]);
         if (view === grillingView) return;
         grillingView = view;
+        busy(grillingContent, !session || ['GENERATING', 'PLAN_GENERATING'].includes(session.status));
         grillingContent.replaceChildren();
         const answerLabel = find('#cq-grilling-answer-label');
         answerLabel.hidden = true;
