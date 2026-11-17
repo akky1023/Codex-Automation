@@ -39,7 +39,8 @@ class BoardProjectTest(unittest.TestCase):
             request_action(db, fresh, projects, ("board", 1))
             self.assertEqual("QUEUED", db.execute("SELECT status FROM tasks WHERE id=1").fetchone()[0])
             self.assertEqual("old-session", db.execute("SELECT session FROM attempts WHERE id=1").fetchone()[0])
-            db.execute("UPDATE tasks SET status='NEEDS_REVIEW' WHERE id=1")
+            with db:
+                db.execute("UPDATE tasks SET status='NEEDS_REVIEW' WHERE id=1")
             request_action(db, regular, projects, ("board", 2))
         self.assertEqual("RESUME_QUEUED", db.execute("SELECT status FROM tasks WHERE id=1").fetchone()[0])
 
