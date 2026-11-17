@@ -33,6 +33,13 @@ async function configuration(page, fixture) {
     await page.locator('#cq-config-message').getByText('Saved').waitFor();
     await page.locator('#cq-config-scope').selectOption('1');
     await page.locator('#cq-config-base:disabled').waitFor();
+    await page.getByLabel('開始元ブランチの継承').selectOption('value');
+    await page.locator('#cq-config-base').fill('topic');
+    fixture.error = 'Configuration rejected';
+    await page.locator('#cq-save-config').click();
+    await page.locator('#cq-config-message').getByText('Configuration rejected').waitFor();
+    assert.equal(await page.locator('#cq-config-base').inputValue(), 'topic');
+    assert.equal(await page.locator('#cq-save-config').isEnabled(), true);
 }
 
 async function waiting(page) {
@@ -70,11 +77,120 @@ async function retry(page, fixture) {
     assert.equal(fixture.submissions[0].target, 2);
 }
 
-const scenarios = {configuration, waiting, retry};
+async function modals(page, fixture) {
+    const hidden = async () => {
+        for (const id of ['config', 'grilling', 'add']) {
+            assert.equal(await page.locator('#cq-' + id + '-dialog').isVisible(), false, id + ' must be hidden');
+        }
+    };
+    const geometry = async dialog => {
+        const box = await dialog.boundingBox(), size = page.viewportSize();
+        assert.ok(Math.abs(box.x + box.width / 2 - size.width / 2) < 2, 'horizontal center');
+        assert.ok(Math.abs(box.y + box.height / 2 - size.height / 2) < 2, 'vertical center');
+        assert.ok(box.x >= 15 && box.y >= 15 && box.y + box.height <= size.height - 15, 'viewport margins');
+        assert.equal(await dialog.evaluate(e => e.scrollWidth <= e.clientWidth), true, 'no horizontal overflow');
+        assert.equal(await dialog.evaluate(e => e.matches(':modal')), true);
+        await page.locator('#cq-sync').evaluate(e => e.focus());
+        assert.equal(await dialog.evaluate(e => e.contains(document.activeElement)), true, 'background cannot take focus');
+    };
+    await hidden();
+    snapshot.configuration.global.prompt = 'Long prompt '.repeat(250);
+    snapshot.ideas = [{id: 10, project_id: 1, title: 'Grilling example', grilling: {
+        session_id: 'fixture', round: 1, status: 'ACTIVE', questions: [{title: 'Question', body: 'Long question '.repeat(160), recommendation: 'Recommended answer '.repeat(40)}],
+    }}];
+    await page.reload();
+    await page.locator('[data-key="idea-10"]').waitFor();
+    const openGrilling = async () => {
+        await page.locator('.cq-idea-menu > summary').click();
+        await page.getByRole('button', {name: 'Grilling', exact: true}).click();
+    };
+    for (const size of [{width: 1280, height: 900}, {width: 390, height: 640}, {width: 320, height: 480}]) {
+        await page.setViewportSize(size);
+        for (const theme of ['light', 'dark']) {
+            await page.emulateMedia({colorScheme: theme});
+            await page.evaluate(dark => {
+                document.documentElement.style.setProperty('--color-main-background', dark ? '#181818' : '#fff');
+                document.documentElement.style.setProperty('--color-main-text', dark ? '#eee' : '#222');
+                document.documentElement.style.setProperty('--color-background-dark', dark ? '#303030' : '#f3f3f3');
+            }, theme === 'dark');
+            await page.locator('#cq-open-config').click();
+            const config = page.locator('#cq-config-dialog');
+            await geometry(config);
+            await page.locator('#cq-config-parallel').fill('7');
+            await page.waitForTimeout(1150);
+            assert.equal(await page.locator('#cq-config-parallel').inputValue(), '7');
+            await page.screenshot({path: join(__dirname, 'artifacts', 'config-' + size.width + '-' + theme + '.png')});
+            await page.locator('#cq-close-config').click();
+            assert.equal(await page.locator('#cq-open-config').evaluate(e => e === document.activeElement), true);
+            await hidden();
+            await openGrilling();
+            const grilling = page.locator('#cq-grilling-dialog');
+            await geometry(grilling);
+            const answer = grilling.locator('textarea');
+            await answer.fill('Draft answer');
+            await page.waitForTimeout(1150);
+            assert.equal(await answer.inputValue(), 'Draft answer');
+            await page.screenshot({path: join(__dirname, 'artifacts', 'grilling-' + size.width + '-' + theme + '.png')});
+            await page.keyboard.press('Escape');
+            await hidden();
+            assert.equal(await page.locator('.cq-idea-menu > summary').evaluate(e => e === document.activeElement), true);
+            await openGrilling();
+            assert.equal(await answer.inputValue(), 'Draft answer');
+            await page.locator('#cq-grilling-close').click();
+            assert.equal(fixture.submissions.length, 0, 'closing never cancels');
+            await page.locator('#cq-open-add').click();
+            await geometry(page.locator('#cq-add-dialog'));
+            assert.equal(await page.locator('#cq-add input[name="title"]').evaluate(e => e === document.activeElement), true);
+            await page.locator('#cq-cancel-add').click();
+            await hidden();
+        }
+    }
+    for (const status of ['GENERATING', 'CONFIRM', 'CONFIRMED', 'CANCELLED', 'PLAN_GENERATING']) {
+        snapshot.ideas[0].grilling.status = status;
+        snapshot.ideas[0].grilling.summary = 'Specification\n'.repeat(90);
+        await page.reload();
+        await page.locator('[data-key="idea-10"]').waitFor();
+        await openGrilling();
+        assert.equal(await page.locator('#cq-grilling-send').isVisible(), false);
+        assert.equal(await page.locator('#cq-grilling-confirm').isVisible(), status === 'CONFIRM');
+        await geometry(page.locator('#cq-grilling-dialog'));
+        if (status === 'CONFIRM') {
+            await page.locator('#cq-grilling-confirm').click();
+            assert.equal(fixture.submissions.at(-1).kind, 'grilling_confirm');
+        }
+        await page.locator('#cq-grilling-close').click();
+    }
+    snapshot.ideas[0].grilling.status = 'CONFIRMED';
+    snapshot.ideas[0].draft_plan = JSON.stringify({branch_mode: 'per-idea', reason: 'Recommended'});
+    fixture.pending = [];
+    await page.reload();
+    await page.locator('[data-key="idea-10"]').waitFor();
+    await openGrilling();
+    const approval = page.getByRole('button', {name: '推奨を承認'});
+    await approval.focus();
+    await page.waitForTimeout(1150);
+    assert.equal(await approval.evaluate(e => e === document.activeElement), true, 'polling preserves branch focus');
+    await approval.click();
+    assert.equal(fixture.submissions.at(-1).kind, 'approve_branch');
+    delete snapshot.ideas[0].draft_plan;
+    fixture.pending = [];
+    snapshot.ideas[0].grilling.status = 'ACTIVE';
+    await page.reload();
+    await page.locator('[data-key="idea-10"]').waitFor();
+    await openGrilling();
+    await page.locator('#cq-grilling-dialog textarea').fill('Answer');
+    await page.locator('#cq-grilling-send').click();
+    assert.equal(fixture.submissions.at(-1).kind, 'grilling_answer');
+    await page.locator('#cq-grilling-cancel').click();
+    assert.equal(fixture.submissions.at(-1).kind, 'grilling_cancel');
+    await hidden();
+}
+
+const scenarios = {configuration, waiting, retry, modals};
 
 async function main() {
     const [scenario, app = 'nextcloud/codex_queue'] = process.argv.slice(2);
-    assert.ok(Object.hasOwn(scenarios, scenario), 'Usage: node tests/browser/board.cjs configuration|waiting|retry [app-directory]');
+    assert.ok(Object.hasOwn(scenarios, scenario), 'Usage: node tests/browser/board.cjs configuration|waiting|retry|modals [app-directory]');
     const source = resolve(app);
     const read = file => readFileSync(join(source, file), 'utf8');
     const template = read('templates/index.php')
@@ -92,14 +208,23 @@ async function main() {
             const url = new URL(route.request().url());
             if (url.origin !== origin) return route.abort();
             const files = {'/board.js': 'js/board.js', '/workspace.css': 'css/workspace.css'};
+            if (url.pathname.startsWith('/core/css/')) {
+                return route.fulfill({contentType: 'text/css', body: readFileSync(join(__dirname, 'artifacts/nextcloud-css', url.pathname.split('/').pop()))});
+            }
             if (Object.hasOwn(files, url.pathname)) {
                 const contentType = url.pathname.endsWith('.js') ? 'text/javascript' : 'text/css';
                 return route.fulfill({contentType, body: read(files[url.pathname])});
             }
             if (url.pathname === '/') return route.fulfill({contentType: 'text/html; charset=utf-8', body:
                 '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">' +
+                (scenario === 'modals' ? '<link rel="stylesheet" href="/core/css/server.css"><link rel="stylesheet" href="/core/css/variables.css"><style>#codex-queue-workspace {height:100dvh;box-sizing:border-box}</style>' : '') +
                 '<link rel="stylesheet" href="/workspace.css"><script defer src="/board.js"></script>' + template});
             if (url.pathname === '/api/requests') {
+                if (fixture.error) {
+                    const message = fixture.error;
+                    fixture.error = null;
+                    return route.fulfill({status: 400, json: {ocs: {data: {message}}}});
+                }
                 const request = route.request().postDataJSON();
                 fixture.submissions.push(request);
                 fixture.pending.push({id: 1, kind: request.kind, target_id: request.target});

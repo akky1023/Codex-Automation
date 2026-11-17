@@ -282,6 +282,7 @@ document.addEventListener('DOMContentLoaded', () => {
         panel.prepend(edit);
         const grill = node('button', 'Grilling');
         grill.type = 'button';
+        grill.dataset.grillingIdea = idea.id;
         grill.addEventListener('click', () => {
             menu.open = false;
             openGrillingDialog(idea);
@@ -704,10 +705,13 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     let grillingIdea = null;
+    const grillingDrafts = new Map();
+    let grillingView = null;
     function openGrillingDialog(idea) {
         grillingIdea = idea;
+        grillingView = null;
         grillingMessage.textContent = '';
-        grillingAnswer.value = '';
+        grillingAnswer.value = grillingDrafts.get(idea.id) || '';
         grillingDialog.showModal();
         renderGrillingDialog();
         if (!idea.grilling) submit(grillingSend, 'grilling_start', idea.id, '', '', grillingMessage);
@@ -718,12 +722,16 @@ document.addEventListener('DOMContentLoaded', () => {
         const idea = (snapshot.ideas || []).find(item => item.id === grillingIdea.id) || grillingIdea;
         grillingIdea = idea;
         const session = idea.grilling;
+        const view = JSON.stringify([session, idea.draft_plan]);
+        if (view === grillingView) return;
+        grillingView = view;
         grillingContent.replaceChildren();
         const answerLabel = find('#cq-grilling-answer-label');
         answerLabel.hidden = true;
         grillingSend.hidden = true;
         grillingConfirm.hidden = true;
-        grillingForm.querySelector('.cq-grilling-branch')?.remove();
+        const branchChoices = grillingForm.querySelector('.cq-grilling-branch');
+        branchChoices.replaceChildren();
         if (!session) {
             grillingContent.append(node('p', 'Grilling セッションを開始しています。同期を待っています。'));
             grillingCancel.hidden = true;
@@ -754,7 +762,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     {sessionId: session.session_id, branchMode: value}));
                 choices.append(button);
             }
-            grillingForm.append(choices);
+            branchChoices.append(choices);
         } else if (session.status === 'CONFIRMED') {
             grillingContent.append(node('p', 'ToDo を作成しました。'));
         } else if (session.status === 'CANCELLED') {
@@ -784,7 +792,16 @@ document.addEventListener('DOMContentLoaded', () => {
             {sessionId: idea.grilling.session_id});
         grillingDialog.close();
     });
-    grillingDialog.addEventListener('close', () => { grillingIdea = null; });
+    find('#cq-grilling-close').addEventListener('click', () => grillingDialog.close());
+    grillingDialog.addEventListener('close', () => {
+        if (grillingIdea) {
+            grillingDrafts.set(grillingIdea.id, grillingAnswer.value);
+            const opener = [...board.querySelectorAll('[data-grilling-idea]')]
+                .find(button => Number(button.dataset.grillingIdea) === grillingIdea.id);
+            opener?.closest('details')?.querySelector('summary')?.focus();
+        }
+        grillingIdea = null;
+    });
 
     find('#cq-open-add').addEventListener('click', () => openIdeaDialog());
     addCancel.addEventListener('click', () => addDialog.close());
