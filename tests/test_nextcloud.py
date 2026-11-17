@@ -24,6 +24,29 @@ BODY = (
 
 
 class BoardProjectTest(unittest.TestCase):
+    def test_board_can_retry_with_a_fresh_session_or_resume_the_existing_one(self):
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        db.row_factory = sqlite3.Row
+        db.executescript(SCHEMA)
+        with db:
+            db.execute("INSERT INTO projects(path,path_key,name) VALUES ('one','one','One')")
+            db.execute("INSERT INTO settings VALUES ('enabled','1')")
+            db.execute("INSERT INTO tasks(project_id,name,priority,status) VALUES (1,'Task',1,'NEEDS_REVIEW')")
+            db.execute("INSERT INTO attempts(task_id,number,path,mode,prompt,session,phase) "
+                       "VALUES (1,1,'one','current','prompt','old-session','READY')")
+        projects = available_projects(db)
+        fresh = {"kind": "retry_fresh", "target_id": 1, "title": "", "body": ""}
+        regular = {**fresh, "kind": "retry"}
+        with patch("codex_queue.actions.wake"):
+            request_action(db, fresh, projects, ("board", 1))
+            self.assertEqual("QUEUED", db.execute("SELECT status FROM tasks WHERE id=1").fetchone()[0])
+            self.assertEqual("old-session", db.execute("SELECT session FROM attempts WHERE id=1").fetchone()[0])
+            with db:
+                db.execute("UPDATE tasks SET status='NEEDS_REVIEW' WHERE id=1")
+            request_action(db, regular, projects, ("board", 2))
+        self.assertEqual("RESUME_QUEUED", db.execute("SELECT status FROM tasks WHERE id=1").fetchone()[0])
+
     def test_grilling_short_poll_is_limited_to_active_sessions(self):
         db = sqlite3.connect(":memory:")
         self.addCleanup(db.close)
