@@ -7,6 +7,7 @@ script('codex_queue', 'board');
         <h1>Codex Queue</h1>
         <label>プロジェクト <select id="cq-filter"><option value="">すべて</option></select></label>
         <button id="cq-sync" type="button">今すぐ同期</button>
+        <button id="cq-open-config" type="button" disabled>設定</button>
         <span id="cq-synced"></span>
     </header>
     <p id="cq-message" role="status"></p>
@@ -67,6 +68,19 @@ script('codex_queue', 'board');
         </div>
         <p id="cq-revision-message" role="status"></p>
     </form>
+    <dialog id="cq-config-dialog" aria-labelledby="cq-config-title">
+        <h2 id="cq-config-title">キュー設定</h2>
+        <label>対象 <select id="cq-config-scope"></select></label>
+        <form id="cq-config-form">
+            <div id="cq-config-fields"></div>
+            <p id="cq-config-message" role="status"></p>
+            <div class="cq-dialog-actions">
+                <button id="cq-close-config" type="button">閉じる</button>
+                <button id="cq-reload-config" type="button">最新値を読み直す</button>
+                <button id="cq-save-config" type="submit" class="primary">保存を依頼</button>
+            </div>
+        </form>
+    </dialog>
     <dialog id="cq-add-dialog" aria-labelledby="cq-add-title">
         <h2 id="cq-add-title">Idea を追加</h2>
         <form id="cq-add">

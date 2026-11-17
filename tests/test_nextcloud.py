@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -7,9 +8,11 @@ import time
 import unittest
 from unittest.mock import patch
 
+from codex_queue.cli import configure, make_parser, project_options
+from codex_queue.configuration import current_values, save_values
 from codex_queue.nextcloud import Client, apply_snapshot, completed_body, todo_fields, writeback
 from codex_queue.nextcloud_board import available_projects, board_snapshot, exchange, grilling_active, request_action
-from codex_queue.store import SCHEMA
+from codex_queue.store import DEFAULTS, SCHEMA, write
 
 
 BODY = (
@@ -202,7 +205,8 @@ class BoardProjectTest(unittest.TestCase):
 
         db.execute("UPDATE projects SET nextcloud_sync = 'off' WHERE id = 1")
         self.assertEqual({}, available_projects(db, {1}))
-        self.assertEqual({"projects": {}, "ideas": [], "tasks": []}, board_snapshot(db, available_projects(db)))
+        self.assertEqual({"projects": {}, "ideas": [], "tasks": []},
+                         {key: value for key, value in board_snapshot(db, available_projects(db)).items() if key != "configuration"})
 
         db.execute("UPDATE projects SET nextcloud_sync = 'on' WHERE id = 1")
         self.assertEqual({1: "One"}, available_projects(db))
@@ -348,3 +352,141 @@ class CalDAVTest(unittest.TestCase):
             client.href("https://other.test/calendar")
         with self.assertRaises(RuntimeError):
             client.href("http://example.test/calendar")
+
+
+class BoardConfigurationTest(unittest.TestCase):
+    def setUp(self):
+        from codex_queue.language import language
+        self.addCleanup(language.set, 'en')
+        self.db = sqlite3.connect(':memory:')
+        self.addCleanup(self.db.close)
+        self.db.row_factory = sqlite3.Row
+        self.db.executescript(SCHEMA)
+        self.db.execute("INSERT INTO projects(path,path_key,name) VALUES ('private/path','private/path','One')")
+        self.db.execute("INSERT INTO projects(path,path_key,name,nextcloud_sync) VALUES ('hidden','hidden','Hidden','off')")
+        self.db.execute("INSERT INTO settings VALUES ('nextcloud_credential','secret')")
+        self.db.commit()
+        self.posts = []
+        self.incoming = {'instance': 'test', 'owner': 'one', 'requests': []}
+
+    def request(self, values, target=0, expected=None, request_id=1):
+        current = current_values(self.db, target)
+        return {'id': request_id, 'kind': 'config', 'target_id': target, 'title': '',
+                'body': json.dumps({'changes': values, 'expected': expected if expected is not None
+                                    else {key: current.get(key) for key in values}})}
+
+    def sync(self, requests, fail_post=False, watch=False):
+        self.incoming['requests'] = requests
+        def ocs(client, method, data=None):
+            if method == 'GET':
+                return self.incoming
+            if fail_post:
+                raise OSError('send failed')
+            self.posts.append(data)
+        with patch('codex_queue.nextcloud_board.ocs', side_effect=ocs), patch('codex_queue.nextcloud_board.wake') as wake:
+            exchange(self.db, object(), available_projects(self.db), watch=watch)
+            return wake.call_count
+
+    def test_snapshot_excludes_paths_credentials_and_disabled_projects(self):
+        snapshot = board_snapshot(self.db, available_projects(self.db))
+        self.assertEqual(set(DEFAULTS), set(snapshot['configuration']['global']))
+        self.assertEqual({1}, set(snapshot['configuration']['projects']))
+        encoded = json.dumps(snapshot)
+        for private in ('private/path', 'secret', 'nextcloud_credential', 'hidden'):
+            self.assertNotIn(private, encoded)
+
+    def test_all_global_settings_round_trip_and_cli_conflict(self):
+        values = dict(DEFAULTS, parallel='3', priority='9', base='main', language='ja',
+                      planner_model='planner', implementation_model='implementation', allowed_models='low,high',
+                      test_commands='[["node", "--version"]]', idea_planning='auto')
+        self.assertEqual(1, self.sync([self.request(values)]))
+        self.assertEqual(values, self.posts[-1]['snapshot']['configuration']['global'])
+        request = self.request({'parallel': '4'}, request_id=2)
+        with patch('builtins.print'):
+            configure(self.db, make_parser().parse_args(['config', '--parallel', '5']))
+        self.sync([request])
+        self.assertIn('競合', self.posts[-1]['results'][0]['outcome'])
+        self.assertEqual('5', current_values(self.db)['parallel'])
+
+    def test_project_round_trip_inherit_empty_and_order(self):
+        values = {'name': 'New', 'prompt': '  exact\ntext  ', 'branch': 'current', 'base': '',
+                  'planner_model': None, 'implementation_model': '', 'allowed_models': 'low,high',
+                  'merge_mode': 'off', 'test_commands': '', 'nextcloud_sync': 'on'}
+        self.sync([self.request(values, 1)], watch=True)
+        self.assertEqual(values, current_values(self.db, 1))
+        self.sync([self.request({'branch': None, 'base': None, 'allowed_models': None}, 1, request_id=2)])
+        self.assertIsNone(current_values(self.db, 1)['base'])
+        args = make_parser().parse_args(['project', 'edit', '1', '--base', 'unset', '--planner-model', 'inherit'])
+        self.assertEqual({'base': '', 'planner_model': None}, project_options(args))
+
+    def test_project_conflict_rejects_the_entire_change(self):
+        request = self.request({'base': 'main', 'prompt': 'new'}, 1)
+        with write(self.db):
+            save_values(self.db, {'prompt': 'changed locally'}, 1)
+        self.sync([request])
+        self.assertIn('競合', self.posts[-1]['results'][0]['outcome'])
+        self.assertIsNone(current_values(self.db, 1)['base'])
+        self.assertEqual('changed locally', current_values(self.db, 1)['prompt'])
+
+    def test_explicit_sync_scope_cannot_be_expanded_by_request(self):
+        with write(self.db):
+            self.db.execute("UPDATE projects SET nextcloud_sync='on' WHERE id=2")
+        request = self.request({'name': 'outside'}, 2)
+        incoming = {'instance': 'scope', 'owner': 'one', 'requests': [request]}
+        with patch('codex_queue.nextcloud_board.ocs', side_effect=[incoming, {}]) as ocs:
+            exchange(self.db, object(), available_projects(self.db, {1}))
+        published = ocs.call_args.args[2]
+        self.assertEqual({1}, set(published['snapshot']['configuration']['projects']))
+        self.assertIn('同期対象', published['results'][0]['outcome'])
+
+    def test_malformed_setting_payloads_return_errors(self):
+        for number, body in enumerate(('[]', 'null', '{}', '{',
+                                      '{"changes":{"base":"x"},"expected":{}}'), 1):
+            request = {'id': number, 'kind': 'config', 'target_id': 0, 'title': '', 'body': body}
+            self.sync([request])
+            self.assertIn('処理できません', self.posts[-1]['results'][0]['outcome'])
+
+    def test_invalid_changes_are_atomic(self):
+        invalid = [{'parallel': '0'}, {'parallel': True}, {'priority': '10'}, {'language': 'xx'},
+                   {'idea_planning': None}, {'allowed_models': 'a,a'}, {'test_commands': '["shell"]'},
+                   {'unknown': 'x'}, {'parallel': '2', 'priority': '-1'}, {'parallel': '9' * 5000},
+                   {'planner_model': 42}, {'branch': 'invalid'}]
+        for number, values in enumerate(invalid, 1):
+            with self.subTest(values=values):
+                self.sync([self.request(values, request_id=number)])
+                self.assertIn('処理できません', self.posts[-1]['results'][0]['outcome'])
+                self.assertEqual(DEFAULTS, current_values(self.db))
+
+    def test_stale_scope_and_sync_off_publish_receipt_together(self):
+        request = self.request({'name': 'Invalid'}, 2)
+        self.sync([request])
+        self.assertIn('同期対象', self.posts[-1]['results'][0]['outcome'])
+        self.sync([self.request({'nextcloud_sync': 'off'}, 1, request_id=2),
+                   self.request({'name': 'Stale'}, 1, request_id=3)])
+        self.assertEqual({}, self.posts[-1]['snapshot']['projects'])
+        self.assertEqual({}, self.posts[-1]['snapshot']['configuration']['projects'])
+        self.assertIn('保存しました', self.posts[-1]['results'][0]['outcome'])
+        self.assertIn('同期対象', self.posts[-1]['results'][1]['outcome'])
+        self.assertEqual('One', current_values(self.db, 1)['name'])
+
+    def test_retry_after_post_failure_does_not_reapply(self):
+        request = self.request({'base': 'first'})
+        with self.assertRaises(OSError):
+            self.sync([request], fail_post=True)
+        with write(self.db):
+            save_values(self.db, {'base': 'later'})
+        self.sync([request])
+        self.assertEqual('later', current_values(self.db)['base'])
+        self.assertIn('保存しました', self.posts[-1]['results'][0]['outcome'])
+
+    def test_setting_and_receipt_rollback_together(self):
+        with patch('codex_queue.nextcloud_board.save_outcome', side_effect=sqlite3.OperationalError('locked')):
+            with self.assertRaises(RuntimeError):
+                self.sync([self.request({'base': 'never'})])
+        self.assertEqual('', current_values(self.db)['base'])
+        self.sync([self.request({'base': 'never'})])
+        self.assertEqual('never', current_values(self.db)['base'])
+
+
+if __name__ == "__main__":
+    unittest.main()

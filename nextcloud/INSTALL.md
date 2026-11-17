@@ -34,6 +34,14 @@ cq nextcloud sync --watch
 
 ## 更新・停止
 
+ボード上部の「設定」から全体設定と同期対象 Project の個別設定を編集できる。個別設定では「全体設定を継承」と「個別指定」を選べる。個別指定の空欄は明示的な未設定として保存し、モデル候補は入力した順序を維持する。リポジトリのパスは実行 PC の `cq project edit ID --path PATH` で変更する。
+
+「保存を依頼」は Nextcloud に依頼を予約する。実行 PC の次回同期で検証・保存した結果を画面と依頼履歴に表示する。CLI や別タブが変更した項目と競合した場合は依頼全体を適用せず、「最新値を読み直す」から編集をやり直す。定期取得中も入力内容は保持する。
+
+Project のボード同期を `off` にすると、その保存結果と同時に Project がボードから消える。再開は実行 PC で `cq project edit ID --nextcloud-sync on` を実行して同期する。
+
+更新時は実行 PC の `cq` と Nextcloud の `codex_queue` アプリを両方更新し、単発の `cq nextcloud sync` または起動し直した `cq nextcloud sync --watch` で同期する。設定情報を送らない旧版の実行 PC ではボードの設定ボタンが無効になる。CLI の設定変更がボードの最新値に届くこと、ボードでの保存結果が CLI の `cq config` / `cq project edit ID` のプロジェクト表示で確認できることを確認する。
+
 更新時はデータベースをバックアップし、配布元と同じ版のアプリソースを配置してから `php occ upgrade` を実行する。停止するときは Windows の同期コマンドを終了し、Nextcloud で `php occ app:disable codex_queue` を実行する。
 
 [Nextcloud のアプリ管理](https://docs.nextcloud.com/server/stable/admin_manual/occ_apps.html)
