@@ -165,8 +165,9 @@ def request_action(db, request, projects, key):
     if kind == "revise":
         task_id, question = revise_task(db, target, body)
         return question or f"To Do {task_id} を更新しました。"
-    if kind in ("reply", "retry"):
-        task_action(db, Namespace(command=kind, id=target, answer=body, fresh=False))
+    if kind in ("reply", "retry", "retry_fresh"):
+        task_action(db, Namespace(command="retry" if kind == "retry_fresh" else kind,
+                                  id=target, answer=body, fresh=kind == "retry_fresh"))
         return "依頼を処理しました。"
     if kind in ("done", "abort"):
         task_action(db, Namespace(command=kind, id=target, note=body or None), expected_status="NEEDS_REVIEW")

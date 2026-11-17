@@ -32,7 +32,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const collator = new Intl.Collator('ja', {numeric: true, sensitivity: 'base'});
     const labels = {
         add: 'Idea 追加', edit: 'Idea 編集', remove: 'Idea 削除', plan: '計画',
-        revise: '修正依頼', reply: '回答', retry: '再試行', done: '完了', abort: '中止', sync: '同期',
+        revise: '修正依頼', reply: '回答', retry: '再試行', retry_fresh: '新しいセッションで再試行', done: '完了', abort: '中止', sync: '同期',
         grilling_start: 'Grilling', grilling_answer: 'Grilling 回答', grilling_confirm: 'Grilling 仕様確認',
         grilling_cancel: 'Grilling 中止', approve_branch: 'ブランチ方式承認',
     };
@@ -326,6 +326,16 @@ document.addEventListener('DOMContentLoaded', () => {
             if (task.status === 'WAITING_FOR_INPUT') requestForm(content, 'reply', task.id);
             if (['NEEDS_REVIEW', 'INTERRUPTED', 'AUTH_REQUIRED', 'RETRY_WAIT', 'ABORTED'].includes(task.status)) {
                 action(actions, 'retry', task.id);
+                const fresh = node('button', labels.retry_fresh);
+                fresh.type = 'button';
+                showReservation(fresh, reservation('retry_fresh', task.id), labels.retry_fresh);
+                fresh.addEventListener('click', () => {
+                    if (!reservation('retry_fresh', task.id)
+                        && window.confirm('なにか変なエラーが出てる場合のみ実行してください')) {
+                        submit(fresh, 'retry_fresh', task.id);
+                    }
+                });
+                actions.append(fresh);
             }
             if (task.status === 'NEEDS_REVIEW') {
                 action(actions, 'done', task.id);

@@ -37,7 +37,7 @@ final class BoardController extends OCSController {
     public function request(string $kind, int $target = 0, string $title = '', string $body = '',
         string $sessionId = '', int $round = 0, string $branchMode = '', int $cancelId = 0): DataResponse {
         $owner = $this->session->getUser()->getUID();
-        if ($cancelId > 0 && in_array($kind, ['remove', 'plan', 'revise', 'reply', 'retry', 'done', 'abort', 'sync'], true)) {
+        if ($cancelId > 0 && in_array($kind, ['remove', 'plan', 'revise', 'reply', 'retry', 'retry_fresh', 'done', 'abort', 'sync'], true)) {
             if (!$this->board->cancel($owner, $cancelId, $kind, $target)) {
                 return new DataResponse(['message' => 'この予約はすでに同期処理に渡されたか、取り消されています。'], 409);
             }
@@ -56,7 +56,7 @@ final class BoardController extends OCSController {
             'grilling_confirm' => $target > 0 && $sessionId !== '' && $round > 0,
             'approve_branch' => $target > 0 && $sessionId !== ''
                 && in_array($branchMode, ['recommended', 'per-idea', 'per-task'], true),
-            'retry', 'done', 'abort' => $target > 0,
+            'retry', 'retry_fresh', 'done', 'abort' => $target > 0,
             'sync' => $target === 0,
             default => false,
         };
