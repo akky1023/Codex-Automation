@@ -21,6 +21,7 @@ from codex_queue.windows_console import ConsoleInput, InputRecord, KeyEvent
 
 class SuggestionTest(unittest.TestCase):
     def setUp(self):
+        self.addCleanup(language.reset, language.set("en"))
         self.parser = make_parser()
 
     def test_idea_plan_accepts_grilling_mode(self):
