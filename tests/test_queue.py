@@ -328,7 +328,7 @@ class QueueTest(unittest.TestCase):
         self.git("commit", "--allow-empty", "-qm", "Previous idea")
         previous = self.git("rev-parse", "HEAD")
 
-        self.cq("start")
+        self.run_queue()
         self.wait(["DONE", "ABORTED"])
 
         self.assertEqual([(base, "main")], self.sql(
