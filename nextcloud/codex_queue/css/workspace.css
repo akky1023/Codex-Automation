@@ -18,6 +18,21 @@
 
 .cq-toolbar h1 { margin-inline-end: auto; }
 
+#cq-waiting-response {
+    margin-block: 1rem;
+    padding: 1rem;
+    border: 2px solid var(--color-warning, #d89b18);
+    border-radius: var(--border-radius-large);
+    background: var(--color-background-dark);
+}
+
+#cq-waiting-response[hidden] { display: none; }
+#cq-waiting-response h2 { margin: 0 0 0.75rem; }
+.cq-waiting-item { padding: 0.75rem; background: var(--color-main-background); border-radius: var(--border-radius-large); }
+.cq-waiting-item + .cq-waiting-item { margin-block-start: 0.5rem; }
+.cq-waiting-item h3 { margin: 0 0 0.35rem; font-size: 1rem; }
+.cq-waiting-item p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+
 .cq-board {
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));

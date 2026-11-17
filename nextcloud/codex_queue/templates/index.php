@@ -10,6 +10,10 @@ script('codex_queue', 'board');
         <span id="cq-synced"></span>
     </header>
     <p id="cq-message" role="status"></p>
+    <section id="cq-waiting-response" aria-labelledby="cq-waiting-response-title" hidden>
+        <h2 id="cq-waiting-response-title">Waiting Response</h2>
+        <div id="cq-waiting-response-items"></div>
+    </section>
     <div class="cq-board">
         <section>
             <div class="cq-column-header">
