@@ -31,7 +31,7 @@ document.addEventListener('DOMContentLoaded', () => {
     let revisionAscending = true;
     const collator = new Intl.Collator('ja', {numeric: true, sensitivity: 'base'});
     const labels = {
-        add: 'Idea 追加', edit: 'Idea 編集', remove: 'Idea 削除', plan: '計画',
+        config: '設定変更', add: 'Idea 追加', edit: 'Idea 編集', remove: 'Idea 削除', plan: '計画',
         revise: '修正依頼', reply: '回答', retry: '再試行', done: '完了', abort: '中止', sync: '同期',
         grilling_start: 'Grilling', grilling_answer: 'Grilling 回答', grilling_confirm: 'Grilling 仕様確認',
         grilling_cancel: 'Grilling 中止', approve_branch: 'ブランチ方式承認',
@@ -51,6 +51,121 @@ document.addEventListener('DOMContentLoaded', () => {
     let editingIdea = null;
     let revisionTask = null;
     const recentDoneLimit = 15;
+
+    const configDialog = find('#cq-config-dialog');
+    const configScope = find('#cq-config-scope');
+    const configFields = find('#cq-config-fields');
+    const configMessage = find('#cq-config-message');
+    const configSave = find('#cq-save-config');
+    let configuration;
+    let configPending = [];
+    let configBase = {};
+    let configRequest = null;
+    let configSending = false;
+    const configLabels = {
+        parallel: '同時実行数', priority: '既定の優先度', branch: 'ブランチ運用', base: '開始元ブランチ',
+        on_abort: '中止後の動作', completion_approval: '完了承認', merge_mode: 'マージ方式',
+        on_conflict: 'マージ競合時', test_retries: 'テスト修正回数', test_commands: 'テストコマンド（JSON 引数配列）',
+        sync: 'Nextcloud 同期方式', language: '表示言語', planner_model: '計画モデル',
+        implementation_model: '実装モデル', allowed_models: 'モデル候補（性能の低い順、カンマ区切り）',
+        idea_planning: 'Idea の計画', name: '名前', prompt: '共通指示', nextcloud_sync: 'ボード同期',
+    };
+    const configChoices = {
+        branch: ['per-idea', 'per-task', 'auto', 'current'], on_abort: ['pause', 'continue', 'next-idea'],
+        completion_approval: ['planner', 'tests', 'manual', 'report'], merge_mode: ['auto', 'clean-only', 'approval', 'off'],
+        on_conflict: ['resolve', 'hold'], sync: ['auto', 'manual'], language: ['en', 'ja'],
+        idea_planning: ['auto', 'manual'], nextcloud_sync: ['on', 'off'],
+    };
+
+    function updateConfiguration(payload) {
+        configuration = payload.snapshot?.configuration;
+        configPending = (payload.pending || []).filter(request => request.kind === 'config');
+        find('#cq-open-config').disabled = !configuration;
+        find('#cq-open-config').title = configuration ? '' : "実行 PC を更新して同期してください。";
+        if (configDialog.open) {
+            const finished = (payload.requests || []).find(request => Number(request.id) === configRequest);
+            if (finished) {
+                configRequest = null;
+                configMessage.textContent = finished.outcome;
+            }
+            const waiting = configSending || configRequest !== null || configPending.some(request => Number(request.target_id) === Number(configScope.value));
+            const inScope = configScope.value === '0' || Boolean(configuration?.projects?.[configScope.value]);
+            configSave.disabled = !configuration || !inScope || waiting || !Object.keys(configBase).length;
+            if (waiting) configMessage.textContent = "実行 PC の次回同期による応答待ちです。";
+        }
+    }
+
+    function loadConfiguration() {
+        const target = configScope.value;
+        configBase = {...(target === '0' ? configuration?.global : configuration?.projects?.[target])};
+        configFields.replaceChildren();
+        for (const [key, value] of Object.entries(configBase)) {
+            const row = node('div');
+            row.className = 'cq-config-field';
+            row.dataset.field = key;
+            const label = node('label', configLabels[key] || key);
+            const input = node(configChoices[key] ? 'select' : ['prompt', 'test_commands'].includes(key) ? 'textarea' : 'input');
+            input.dataset.value = key;
+            input.id = 'cq-config-' + key;
+            label.htmlFor = input.id;
+            if (configChoices[key]) for (const choice of configChoices[key]) {
+                const option = node('option', choice); option.value = choice; input.append(option);
+            }
+            input.value = value ?? configuration.global[key] ?? '';
+            if (input.tagName !== 'SELECT') input.maxLength = 12000;
+            if (['parallel', 'priority', 'test_retries'].includes(key)) {
+                input.type = 'number'; input.min = key === 'test_retries' ? '0' : '1'; input.step = '1';
+                if (key === 'priority') input.max = '9';
+                input.required = true;
+            }
+            row.append(label);
+            if (target !== '0' && !['name', 'prompt', 'nextcloud_sync'].includes(key)) {
+                const mode = node('select'); mode.dataset.mode = key; mode.setAttribute('aria-label', configLabels[key] + "の継承");
+                for (const [id, text] of [['inherit', "全体設定を継承"], ['value', "個別指定（空欄は未設定）"]]) {
+                    const option = node('option', text); option.value = id; mode.append(option);
+                }
+                mode.value = value === null ? 'inherit' : 'value';
+                input.disabled = value === null;
+                mode.addEventListener('change', () => { input.disabled = mode.value === 'inherit'; });
+                row.append(mode);
+            }
+            row.append(input, node('small', "編集開始時: " + (value === null
+                ? "継承（" + (configuration.global[key] || "未設定") + "）" : value || "未設定")));
+            configFields.append(row);
+        }
+        configSave.disabled = configSending || configRequest !== null || !Object.keys(configBase).length || configPending.some(request => Number(request.target_id) === Number(target));
+        configMessage.textContent = configSave.disabled ? "対象が同期範囲外か、実行 PC の応答待ちです。" : '';
+    }
+
+    find('#cq-open-config').addEventListener('click', () => {
+        configScope.replaceChildren();
+        for (const [id, name] of [['0', "全体設定"], ...Object.entries(snapshot.projects || {})]) {
+            const option = node('option', name); option.value = id; configScope.append(option);
+        }
+        loadConfiguration(); configDialog.showModal();
+    });
+    configScope.addEventListener('change', loadConfiguration);
+    find('#cq-reload-config').addEventListener('click', loadConfiguration);
+    find('#cq-close-config').addEventListener('click', () => configDialog.close());
+    find('#cq-config-form').addEventListener('submit', async event => {
+        event.preventDefault();
+        if (configSave.disabled) return;
+        const changes = {}, expected = {};
+        for (const row of configFields.children) {
+            const key = row.dataset.field;
+            const value = row.querySelector('[data-mode]')?.value === 'inherit' ? null : row.querySelector('[data-value]').value;
+            if (value !== configBase[key]) { changes[key] = value; expected[key] = configBase[key]; }
+        }
+        if (!Object.keys(changes).length) { configMessage.textContent = "変更はありません。"; return; }
+        configSave.disabled = true;
+        configSending = true;
+        try {
+            const result = await api('/requests', {kind: 'config', target: Number(configScope.value), body: JSON.stringify({changes, expected})});
+            configRequest = Number(result.request_id);
+            configSending = false;
+            boardVersion++; updateBoard(result, true);
+        } catch (error) { configSending = false; configMessage.textContent = error.message; configSave.disabled = false; }
+    });
 
     function taskColumn(task) {
         return ['DONE', 'ABORTED'].includes(task.status) ? 'Done' : 'To Do';
@@ -352,6 +467,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function updateBoard(payload, force = false) {
+        updateConfiguration(payload);
         const {synced_at: time, ...cards} = payload.snapshot || {};
         find('#cq-synced').textContent = time
             ? '最終同期 ' + new Date(time).toLocaleString()
