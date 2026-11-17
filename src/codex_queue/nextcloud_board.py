@@ -12,6 +12,7 @@ from .nextcloud import Client, RejectRedirects, connection
 from .planner import plan_idea, revise_task
 from .grilling import answer_grilling, cancel_grilling, confirm_grilling, start_grilling
 from .processes import process_lock
+from .progress import progress, waiting
 from .store import open_queue, write
 from .worker import latest_attempt
 
@@ -211,6 +212,7 @@ def _start_request(db, key, request, project_ids, marker):
         raise
 
 
+@progress("Synchronizing Nextcloud board", "Nextcloud ボードを同期中")
 def exchange(db, client, projects, watch=False):
     incoming = ocs(client, "GET")
     board = json.dumps([incoming["instance"], incoming["owner"]], ensure_ascii=False)
@@ -296,7 +298,8 @@ def run_board(db, args):
             if not args.watch:
                 return
             try:
-                time.sleep(GRILLING_POLL_SECONDS if grilling_active(db, project_ids) else BOARD_POLL_SECONDS)
+                with waiting("Waiting for next synchronization", "次回の同期を待機中"):
+                    time.sleep(GRILLING_POLL_SECONDS if grilling_active(db, project_ids) else BOARD_POLL_SECONDS)
             except KeyboardInterrupt:
                 return
 

@@ -10,6 +10,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 from typing import NamedTuple
 import unicodedata
@@ -19,6 +20,7 @@ from .cli import BRANCH_MODES, MODEL_SETTINGS, QueueError, allowed_models, git_r
 from .editor import edit_text
 from .language import language, status_label, tr
 from .runtime import codex_models
+from .progress import output_to, suspended
 from .status import queue_status
 from .store import DEFAULTS, get_setting, open_queue, saved_language, settings
 from .text_layout import fit, print_wrapped, terminal_width, wrap_rows
@@ -71,6 +73,7 @@ class PosixInput:
             termios.tcsetattr(fd, termios.TCSANOW, saved)
 
 
+@suspended()
 def prompt_input(parser, message, **kwargs):
     if os.name == "nt":
         return windows_input(parser, message, **kwargs)
@@ -84,6 +87,7 @@ def clear():
         print("\033[2J\033[H", end="")
 
 
+@suspended()
 def choose(title, options, default=0, *, ordered=None):
     if not options:
         print(tr("No available choices.", "選択できる項目がありません。"))
@@ -416,6 +420,7 @@ def confirmed(argv, prompted):
     return argv
 
 
+@suspended()
 def screen_input(prompt):
     rows = list(wrap_rows(prompt, max(1, terminal_width() - 1)))
     if not rows:
@@ -1020,12 +1025,12 @@ def prepare(argv):
 
 def queue_view(expanded=None):
     with open_queue() as db:
-        return queue_status(db, expanded if expanded is not None else set())
+        return queue_status(db, expanded if expanded is not None else set(), animate=True)
 
 
 def command_output(argv):
     output = StringIO()
-    with redirect_stdout(output), redirect_stderr(output):
+    with output_to(sys.stdout), redirect_stdout(output), redirect_stderr(output):
         try:
             main(argv, interactive=False)
         except SystemExit:
@@ -1034,10 +1039,15 @@ def command_output(argv):
 
 
 def screen():
-    if os.name == "nt":
-        with virtual_terminal(alternate=True):
+    token = language.set(language.get())
+    try:
+        with output_to(sys.stdout):
+            if os.name == "nt":
+                with virtual_terminal(alternate=True):
+                    return run_screen()
             return run_screen()
-    return run_screen()
+    finally:
+        language.reset(token)
 
 
 def run_screen():

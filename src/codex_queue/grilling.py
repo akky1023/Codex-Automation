@@ -5,6 +5,7 @@ import uuid
 
 from .planner import generate_plan, idea_record, planning_config, plan_context
 from .processes import process_lock
+from .progress import progress
 from .runtime import NO_WINDOW, codex_command, codex_env
 from .store import get_setting, settings, write
 
@@ -49,6 +50,7 @@ def grilling_prompt(idea, session):
     )
 
 
+@progress("Waiting for Codex questions", "Codex の質問を待機中")
 def generate_round(db, path, prompt, config):
     schema = {"type": "object", "properties": {
         "questions": {"type": "array", "items": {"type": "object", "properties": {

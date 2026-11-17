@@ -4,6 +4,7 @@ import subprocess
 from tempfile import TemporaryDirectory
 
 from .processes import process_lock
+from .progress import progress
 from .runtime import NO_WINDOW, codex_command, codex_env
 from .store import queue_folder, settings, write
 
@@ -52,6 +53,7 @@ def planning_prompt(idea, models, default_model):
     )
 
 
+@progress("Waiting for Codex plan", "Codex の計画を待機中")
 def generate_plan(db, path, prompt, config, models, *, review_branch=False, sessions=None):
     options = models or [config["implementation_model"]]
     fields = {key: {"type": "string"} for key in ("title", "abstract", "plan")}

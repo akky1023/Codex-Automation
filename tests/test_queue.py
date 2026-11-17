@@ -16,6 +16,77 @@ from codex_queue.store import SCHEMA, open_queue
 from codex_queue.worker import classify, run_worker
 
 
+class PlannerProgressTest(unittest.TestCase):
+    def test_interrupting_stop_wait_keeps_stop_request_and_cleans_display(self):
+        import io
+        from contextlib import closing, nullcontext
+        from codex_queue import progress
+        from codex_queue.actions import queue_control
+        from codex_queue.store import get_setting
+
+        with closing(sqlite3.connect(':memory:')) as db:
+            db.row_factory = sqlite3.Row
+            db.executescript(SCHEMA)
+            db.execute("INSERT INTO projects(path,path_key,name) VALUES ('repo','repo','Repo')")
+            db.execute("INSERT INTO tasks(project_id,name,priority,status) VALUES (1,'Task',1,'RUNNING')")
+            db.commit()
+            display = io.StringIO()
+            with progress.output_to(display), patch(
+                'codex_queue.processes.process_lock', return_value=nullcontext(False),
+            ), patch('codex_queue.actions.time.sleep', side_effect=KeyboardInterrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    queue_control(db, 'stop')
+            self.assertEqual('0', get_setting(db, 'enabled'))
+            self.assertEqual('1', get_setting(db, 'stop'))
+            self.assertEqual('RUNNING', db.execute('SELECT status FROM tasks').fetchone()[0])
+            self.assertIn('interrupted or failed', display.getvalue())
+            self.assertFalse(progress._active)
+
+    def test_delayed_plan_updates_on_display_thread_and_keeps_caller_thread(self):
+        import io
+        import threading
+        from codex_queue import progress
+        from codex_queue.planner import generate_plan
+
+        class Display(io.StringIO):
+            def isatty(self):
+                return True
+
+        display = Display()
+        refreshed = threading.Event()
+        caller = threading.get_ident()
+        original = progress._draw
+        frames = []
+
+        def draw():
+            original()
+            frames.append(display.getvalue())
+            if len(frames) >= 2:
+                refreshed.set()
+
+        def codex(command, **kwargs):
+            self.assertEqual(caller, threading.get_ident())
+            self.assertTrue(refreshed.wait(2))
+            Path(command[command.index('-o') + 1]).write_text(json.dumps({
+                'question': '', 'todos': [{'title': 'feat: test', 'abstract': 'test', 'plan': 'test', 'model': 'test'}],
+            }), encoding='utf-8')
+            return subprocess.CompletedProcess(command, 0, '', '')
+
+        with TemporaryDirectory() as folder, progress.output_to(display), patch(
+            'codex_queue.planner.queue_folder', return_value=folder,
+        ), patch('codex_queue.planner.codex_command', return_value=['codex']), patch(
+            'codex_queue.planner.codex_env', return_value={},
+        ), patch('codex_queue.planner.subprocess.run', side_effect=codex), patch.object(
+            progress, '_draw', side_effect=draw,
+        ):
+            question, todos = generate_plan(None, folder, 'test', {
+                'implementation_model': 'test', 'planner_model': '',
+            }, [])
+        self.assertEqual('', question)
+        self.assertEqual('feat: test', todos[0]['title'])
+        self.assertFalse(progress._active)
+
+
 FAKE_CODEX = """
 import json
 from pathlib import Path

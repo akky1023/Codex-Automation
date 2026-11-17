@@ -15,6 +15,7 @@ from xml.etree import ElementTree as ET
 from . import credentials
 from .language import tr
 from .processes import process_lock
+from .progress import progress, waiting
 from .store import get_setting, set_setting, settings, update, write
 
 
@@ -48,6 +49,7 @@ class Client:
             raise RuntimeError("Nextcloud returned a URL outside its configured origin.")
         return url
 
+    @progress("Communicating with Nextcloud", "Nextcloud と通信中")
     def request(self, method, url, body=None, headers=None, acceptable=()):
         url = self.href(url)
         headers = {"User-Agent": "Codex Queue", **(headers or {})}
@@ -203,17 +205,18 @@ def connect(db, server=None):
     data = urlencode({"token": flow["poll"]["token"]}).encode()
     print(tr("Authorize Codex Queue in the browser.", "ブラウザーで Codex Queue の接続を許可してください。"))
     webbrowser.open(login)
-    deadline = time.monotonic() + 20 * 60
-    while time.monotonic() < deadline:
-        status, _, response = client.request(
-            "POST", endpoint, data,
-            {"Content-Type": "application/x-www-form-urlencoded"}, acceptable=(404,),
-        )
-        if status != 404:
-            break
-        time.sleep(5)
-    else:
-        raise RuntimeError(tr("Nextcloud login expired.", "Nextcloud のログイン受付が期限切れになりました。"))
+    with waiting("Waiting for Nextcloud authorization", "Nextcloud の接続許可を待機中"):
+        deadline = time.monotonic() + 20 * 60
+        while time.monotonic() < deadline:
+            status, _, response = client.request(
+                "POST", endpoint, data,
+                {"Content-Type": "application/x-www-form-urlencoded"}, acceptable=(404,),
+            )
+            if status != 404:
+                break
+            time.sleep(5)
+        else:
+            raise RuntimeError(tr("Nextcloud login expired.", "Nextcloud のログイン受付が期限切れになりました。"))
     result = json.loads(response)
     server = client.href(result["server"]).rstrip("/")
     old_target = get_setting(db, "nextcloud_credential")
@@ -353,6 +356,7 @@ def writeback(db, client, row, force=False):
     return outcome
 
 
+@progress("Synchronizing Nextcloud tasks", "Nextcloud タスクを同期中")
 def sync(db):
     if not get_setting(db, "nextcloud_credential"):
         return True
