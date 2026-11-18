@@ -17,6 +17,19 @@ from codex_queue.worker import classify, run_worker
 
 
 class PlannerProgressTest(unittest.TestCase):
+    def test_grilling_keeps_questions_when_codex_also_returns_a_summary(self):
+        from codex_queue.grilling import generate_round
+
+        question = {"title": "Scope", "body": "Which?", "recommendation": "Admins."}
+        report = json.dumps({"questions": [question], "summary": "Preliminary findings"})
+        script = "import sys; from pathlib import Path; sys.stdin.read(); Path(sys.argv[sys.argv.index('-o')+1]).write_text(" + repr(report) + ", encoding='utf-8')"
+        with TemporaryDirectory() as folder, patch("codex_queue.store.queue_folder", return_value=Path(folder)), patch(
+            "codex_queue.processes.queue_folder", return_value=Path(folder),
+        ), patch("codex_queue.grilling.codex_command", return_value=[sys.executable, "-c", script]), patch(
+            "codex_queue.grilling.codex_env", return_value=os.environ.copy(),
+        ):
+            self.assertEqual(([question], ""), generate_round(None, folder, "Ask a question", {"planner_model": ""}))
+
     def test_interrupting_stop_wait_keeps_stop_request_and_cleans_display(self):
         import io
         from contextlib import closing, nullcontext

@@ -1,13 +1,18 @@
 """Persistent, read-only discovery rounds for turning an Idea into a ToDo plan."""
+from contextlib import ExitStack
 import json
 import subprocess
 import uuid
 
+from .language import tr
 from .planner import generate_plan, idea_record, planning_config, plan_context
-from .processes import process_lock
+from .processes import process_lock, spawn, stop_tree
 from .progress import progress
-from .runtime import NO_WINDOW, codex_command, codex_env
+from .runtime import codex_command, codex_env
 from .store import get_setting, settings, write
+
+
+ROUND_TIMEOUT_SECONDS = 180
 
 
 def _snapshot(db, idea):
@@ -42,7 +47,7 @@ def grilling_prompt(idea, session):
         "Ask the whole currently answerable frontier in one round, number questions, and include a recommended answer. "
         "Word each question so yes accepts the recommendation. Defer dependent questions until later rounds. "
         "Use prior answers and repository facts; never ask the user for facts discoverable in the repository. "
-        "When every branch is settled, return no questions and provide a concise agreed specification. "
+        "While questions remain, leave summary empty. Once settled, return no questions and put the agreed specification in summary. "
         "Do not implement or create ToDos. Return Japanese if the Idea is Japanese, otherwise use its language.\n\n"
         f"# Project instructions\n{idea['project_prompt']}\n\n"
         f"# Idea\n{idea['title']}\n\n{idea['detail']}\n\n"
@@ -67,11 +72,25 @@ def generate_round(db, path, prompt, config):
     with TemporaryDirectory(prefix="grill-", dir=queue_folder()) as directory:
         schema_path, output = Path(directory) / "schema.json", Path(directory) / "round.json"
         schema_path.write_text(json.dumps(schema), encoding="utf-8")
-        result = subprocess.run([*command, "--output-schema", str(schema_path), "-o", str(output), "-"],
-            input=prompt, cwd=path, env=codex_env(db), encoding="utf-8", errors="replace",
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, creationflags=NO_WINDOW)
-        if result.returncode:
-            raise RuntimeError(result.stderr.strip() or f"Grilling exited with code {result.returncode}.")
+        process, close_job = spawn(
+            [*command, "--output-schema", str(schema_path), "-o", str(output), "-"],
+            f"grill-{uuid.uuid4()}", cwd=path, env=codex_env(db), encoding="utf-8", errors="replace",
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        )
+        try:
+            _, stderr = process.communicate(prompt, timeout=ROUND_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError(tr(
+                "Codex did not respond in time. Run idea plan --grilling again to resume this round.",
+                "Codex の応答が時間内にありませんでした。idea plan --grilling を再実行すると、このラウンドから再開できます。",
+            )) from error
+        finally:
+            stop_tree(process, close_job)
+            process.wait()
+            process.stdin.close()
+            process.stderr.close()
+        if process.returncode:
+            raise RuntimeError(stderr.strip() or f"Grilling exited with code {process.returncode}.")
         try:
             report = json.loads(output.read_text(encoding="utf-8"))
             questions, summary = report["questions"], report["summary"].strip()
@@ -81,9 +100,8 @@ def generate_round(db, path, prompt, config):
                 if any(not isinstance(item[key], str) or not item[key].strip()
                        for key in ("title", "body", "recommendation")):
                     raise ValueError
-            if questions and summary:
-                raise ValueError
-            return questions, summary
+            # A preliminary summary must not prevent the user from answering valid questions.
+            return questions, "" if questions else summary
         except (AttributeError, KeyError, TypeError, ValueError) as error:
             raise RuntimeError("Invalid Grilling response.") from error
 
@@ -98,12 +116,19 @@ def _render(session):
 
 
 def start_grilling(db, idea_id, board_key=""):
-    with write(db):
+    with ExitStack() as locks, write(db):
         idea = idea_record(db, idea_id)
         if idea["planned_at"]:
             raise RuntimeError(f"Idea {idea_id} already has a plan.")
         existing = db.execute("SELECT * FROM grilling_sessions WHERE idea_id = ? AND status != 'CANCELLED' ORDER BY rowid DESC LIMIT 1",
                               (idea_id,)).fetchone()
+        # An abandoned CLI attempt that produced no questions or answers can be restarted on the board.
+        if (board_key and existing and not existing["board_key"] and existing["status"] == "GENERATING"
+                and existing["round_no"] == 0
+                and locks.enter_context(process_lock(f"grilling-{idea_id}.lock"))):
+            db.execute("UPDATE grilling_sessions SET status = 'CANCELLED', updated_at = CURRENT_TIMESTAMP WHERE session_id = ?",
+                       (existing["session_id"],))
+            existing = None
         created = False
         if existing and existing["status"] != "CANCELLED":
             if existing["board_key"] != board_key:

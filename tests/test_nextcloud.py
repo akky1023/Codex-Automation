@@ -77,6 +77,37 @@ BODY = (
 
 
 class BoardProjectTest(unittest.TestCase):
+    def test_board_can_restart_stalled_first_cli_round(self):
+        from codex_queue.grilling import start_grilling
+        from codex_queue.processes import process_lock
+
+        with sqlite3.connect(":memory:") as db, TemporaryDirectory() as folder, patch(
+            "codex_queue.processes.queue_folder", return_value=Path(folder),
+        ), patch("codex_queue.grilling.generate_round") as generate:
+            self.addCleanup(db.close)
+            db.row_factory = sqlite3.Row
+            db.executescript(SCHEMA)
+            db.execute("INSERT INTO projects(path,path_key,name) VALUES ('one','one','One')")
+            db.execute("INSERT INTO ideas(project_id,title,detail) VALUES (1,'Idea','')")
+            db.commit()
+            generate.side_effect = RuntimeError("Invalid Grilling response.")
+            with self.assertRaisesRegex(RuntimeError, "Invalid Grilling response"):
+                start_grilling(db, 1)
+            request = {"kind": "grilling_start", "target_id": 1, "title": "", "body": ""}
+            projects = available_projects(db)
+            with process_lock("grilling-1.lock") as acquired:
+                self.assertTrue(acquired)
+                with self.assertRaisesRegex(RuntimeError, "already has a Grilling session"):
+                    request_action(db, request, projects, ("board-owner", 1))
+            generate.side_effect = None
+            generate.return_value = ([{"title": "Scope", "body": "Which?", "recommendation": "Admins."}], "")
+            self.assertEqual("Grilling ACTIVE / round 1", request_action(db, request, projects, ("board-owner", 2)))
+            self.assertEqual([("", "CANCELLED"), ("board-owner", "ACTIVE")], [
+                tuple(row) for row in db.execute("SELECT board_key,status FROM grilling_sessions ORDER BY rowid")
+            ])
+            with self.assertRaisesRegex(RuntimeError, "already has a Grilling session"):
+                request_action(db, request, projects, ("other-owner", 3))
+
     def test_board_can_retry_with_a_fresh_session_or_resume_the_existing_one(self):
         db = sqlite3.connect(":memory:")
         self.addCleanup(db.close)
